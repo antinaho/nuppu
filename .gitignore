@@ -1,0 +1,13 @@
+*
+
+!.gitignore
+
+!examples/
+!examples/1_Window/
+!examples/1_Window/window.odin
+
+!app.odin
+
+!platform.odin
+!platform_choser.odin
+!platform_glfw.odin
