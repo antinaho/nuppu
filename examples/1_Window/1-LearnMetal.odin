@@ -52,6 +52,7 @@ init :: proc() {
     cmds := nuppu.begin_commands()
     nuppu.cmd_mem_copy(cmds, window_app.positions_gpu, positions, size_of([3]f32) * 3)
     nuppu.cmd_mem_copy(cmds, window_app.colors_gpu, colors, size_of([3]f32) * 3)
+    nuppu.cmd_barrier(cmds, .Transfer, .All)
     nuppu.end_commands(cmds, {})
 }
 

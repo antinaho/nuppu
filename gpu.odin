@@ -53,6 +53,16 @@ Render_Stage :: enum u64 {
 }
 Render_Stages :: distinct bit_set[Render_Stage; u64]
 
+Stage :: enum u64 {
+	Transfer         = 0,
+	Compute          = 1,
+	Raster_Color_Out = 2,
+	Fragment_Shader  = 3,
+	Vertex_Shader    = 4,
+	Build_BVH        = 5,
+	All              = 6,
+}
+
 @(private="file")
 state: ^Renderer
 
@@ -79,6 +89,7 @@ Renderer_API :: struct #all_or_none {
     cmd_begin_render_pass: proc(command_buffer: Command_Buffer, color_attachments: []Color_Attachment),
     cmd_end_render_pass: proc(command_buffer: Command_Buffer),
     cmd_mem_copy: proc(command_buffer: Command_Buffer, dst, src: ptr, size: u64),
+    cmd_barrier: proc(command_buffer: Command_Buffer, before: Stage, after: Stage),
 
     shader_init: proc(code: []u8, entry_point: string, stage: Graphics_Stage) -> Shader,
     shader_deinit: proc(shader: Shader),
@@ -406,6 +417,10 @@ cmd_present :: proc(command_buffer: Command_Buffer, texture: Texture) {
 
 cmd_mem_copy :: proc(command_buffer: Command_Buffer, dst, src: ptr, size: u64) {
     state.api.cmd_mem_copy(command_buffer, dst, src, size)
+}
+
+cmd_barrier :: proc(command_buffer: Command_Buffer, before: Stage, after: Stage) {
+    state.api.cmd_barrier(command_buffer, before, after)
 }
 
 acquire_next_swapchain :: proc(cmd_buffer: Command_Buffer) -> Texture {

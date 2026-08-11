@@ -61,6 +61,7 @@ init :: proc() {
     cmds := nuppu.begin_commands()
     nuppu.cmd_mem_copy(cmds, window_app.vertex_gpu, verts, size_of([3]f32) * VERT_COUNT)
     nuppu.cmd_mem_copy(cmds, window_app.index_gpu, indices, size_of(u32) * INDEX_COUNT)
+    nuppu.cmd_barrier(cmds, .Transfer, .All)
     nuppu.end_commands(cmds, {})
 }
 
@@ -105,7 +106,7 @@ render :: proc(prev, curr: Window, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
     cmds := nuppu.begin_commands()
 
     nuppu.cmd_mem_copy(cmds, curr.instance_gpu, instances, size_of(Instance_Data) * INSTANCE_COUNT)
-    nuppu.commit_blit(cmds)
+    nuppu.cmd_barrier(cmds, .Transfer, .All)
 
     swapchain := nuppu.acquire_next_swapchain(cmds)
 

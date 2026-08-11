@@ -37,6 +37,7 @@ MTL_RENDERER_API :: Renderer_API {
     cmd_begin_render_pass = MTL_cmd_begin_render_pass,
     cmd_end_render_pass = MTL_cmd_end_render_pass,
     cmd_mem_copy = MTL_cmd_mem_copy,
+    cmd_barrier = MTL_cmd_barrier,
 
     shader_init = MTL_shader_init,
     shader_deinit = MTL_shader_deinit,
@@ -345,6 +346,11 @@ MTL_cmd_begin_render_pass :: proc(command_buffer: Command_Buffer, color_attachme
 
     buffer_info := resource_library_get(&state.command_buffers, command_buffer)
 
+    when ODIN_DEBUG {
+        assert(buffer_info.blit_command_encoder == nil,
+            "cmd_begin_render_pass: blit encoder still active; call cmd_barrier(.Transfer, .All) first")
+    }
+
     pass_descriptor := MTL.RenderPassDescriptor.renderPassDescriptor()
        
     for attachment, I in color_attachments {
@@ -411,8 +417,6 @@ MTL_depth_stencil_state_deinit :: proc(depth: Depth_Stencil_State) {
 
 MTL_cmd_end_render_pass :: proc(command_buffer: Command_Buffer) {
     buffer_info := resource_library_get(&state.command_buffers, command_buffer)
-    buffer_info.render_command_encoder->endEncoding()
-    buffer_info.render_command_encoder = nil
 }
 
 MTL_cmd_present :: proc(command_buffer: Command_Buffer, texture: Texture) {
@@ -425,30 +429,14 @@ Frame_Pass :: struct {
     value: u64,
 }
 
-commit_blit :: proc(command_buffer: Command_Buffer) {
-    buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
-
-    if buffer_impl.blit_command_encoder != nil {
-        buffer_impl.blit_command_encoder->endEncoding()
-        buffer_impl.blit_command_encoder = nil
-    }
-}
-
 MTL_end_commands :: proc(command_buffer: Command_Buffer, frame_pass: Frame_Pass) {
     command_buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
     defer {
         command_buffer_impl.pool->drain()
         command_buffer_impl^ = {}
-    } 
+    }
 
-    if command_buffer_impl.blit_command_encoder != nil {
-        command_buffer_impl.blit_command_encoder->endEncoding()
-        command_buffer_impl.blit_command_encoder = nil
-    }
-    else if command_buffer_impl.render_command_encoder != nil {
-        command_buffer_impl.render_command_encoder->endEncoding()
-        command_buffer_impl.render_command_encoder = nil
-    }
+    MTL_cmd_barrier(command_buffer, .All, .All)
 
     if command_buffer_impl.presentable != {} {
         texture_impl := resource_library_get(&state.textures, command_buffer_impl.presentable)
@@ -521,6 +509,41 @@ MTL_cmd_mem_copy :: proc(command_buffer: Command_Buffer, dst, src: ptr, size: u6
         dst_buffer, dst_offset,
         NS.UInteger(size),
     )
+}
+
+MTL_cmd_barrier :: proc(command_buffer: Command_Buffer, before: Stage, after: Stage) {
+    buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
+
+    switch before {
+    case .Transfer:
+        if buffer_impl.blit_command_encoder != nil {
+            buffer_impl.blit_command_encoder->endEncoding()
+            buffer_impl.blit_command_encoder = nil
+        }
+
+    case .Vertex_Shader, .Fragment_Shader, .Raster_Color_Out:
+        if buffer_impl.render_command_encoder != nil {
+            buffer_impl.render_command_encoder->endEncoding()
+            buffer_impl.render_command_encoder = nil
+        }
+
+    case .All:
+        if buffer_impl.blit_command_encoder != nil {
+            buffer_impl.blit_command_encoder->endEncoding()
+            buffer_impl.blit_command_encoder = nil
+        }
+        if buffer_impl.render_command_encoder != nil {
+            buffer_impl.render_command_encoder->endEncoding()
+            buffer_impl.render_command_encoder = nil
+        }
+
+    case .Compute:
+        // Compute encoder not yet implemented in nuppu.
+    case .Build_BVH:
+        // No-op on Metal.
+    }
+
+    _ = after
 }
 
 // ---------------------------------------------------------------------------
