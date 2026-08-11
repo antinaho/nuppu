@@ -31,7 +31,7 @@ glfw_state_size :: proc() -> int {
     return size_of(GLFW_Platform_State)
 }
 
-glfw_init :: proc(window_size: [2]i32, window_title: string) -> API_State {
+glfw_init :: proc(window_size: [2]i32, window_title: string) -> Platform_API_State {
     state = new(GLFW_Platform_State)
     
     if !glfw.Init() {
@@ -56,7 +56,7 @@ glfw_init :: proc(window_size: [2]i32, window_title: string) -> API_State {
     
 	glfw_center_window()
 
-    return API_State(state)
+    return Platform_API_State(state)
 }
 
 glfw_deinit :: proc() {

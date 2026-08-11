@@ -10,24 +10,25 @@ Platform :: struct {
     ctx: runtime.Context,
 
     api: Platform_API,
-    api_state: API_State,
+    api_state: Platform_API_State,
 
 	flags: Window_Flags,
 
     using input: Input,
 	start_tick: time.Tick,
 	runtime_duration: time.Duration,
+	sim_time:         time.Duration,
 	previous_time: time.Tick,
 	frame_counter: int,
 
 	debug_shutdown_key: Keyboard_Key,
 }
 
-API_State :: distinct rawptr
+Platform_API_State :: distinct rawptr
 
 Platform_API :: struct #all_or_none {
     state_size: proc() -> int,
-    init: proc(window_size: [2]i32, window_title: string) -> API_State,
+    init: proc(window_size: [2]i32, window_title: string) -> Platform_API_State,
 	deinit: proc(),
 	poll_events: proc(),
 	native_window: proc() -> rawptr,
@@ -40,7 +41,7 @@ Platform_API :: struct #all_or_none {
 }
 
 Force_Shutdown_Proc :: #type proc() -> bool
-Resize_Proc :: #type proc()
+Resize_Window_Proc :: #type proc()
 
 Window_Flag :: enum {
 	Iconified,
@@ -160,7 +161,7 @@ platform: ^Platform
 
 on_resize_proc: proc()
 
-set_resize_callback :: proc(p: Resize_Proc) {
+set_resize_callback :: proc(p: Resize_Window_Proc) {
 	on_resize_proc = p
 }
 
@@ -182,18 +183,22 @@ is_focused :: proc "contextless" () -> bool { return .Focused in platform.flags 
 // ---------------------------------------------------------------------------
 // Timers
 
-total_runtime :: proc "contextless" () -> time.Duration {
-	return platform.runtime_duration
-}
-
 fps :: proc "contextless" () -> f64 {
 	return 1.0 / delta_time()
 }
 
 // Measured in seconds
 delta_time :: proc "contextless" () -> f64 {
-    return {}
-	//return time.duration_seconds(platform.delta_time_duration)
+    return DT_TARGET_S_F64
+}
+
+delta_time_f32 :: proc "contextless" () -> f32 {
+    return f32(DT_TARGET_S_F64)
+}
+
+// Measured in seconds
+sim_time :: proc "contextless" () -> f32 {
+    return f32(time.duration_seconds(platform.sim_time))
 }
 
 // ---------------------------------------------------------------------------
@@ -257,12 +262,10 @@ platform_proceed :: proc() -> bool {
 	platform_reset_frame_input()
 	poll_events()
 
-when ODIN_DEBUG {
-	if platform.input.keys_press_started[platform.debug_shutdown_key] {
+	if platform.debug_shutdown_key != .UNKNOWN && input_key_pressed(platform.debug_shutdown_key) {
 		request_shutdown()
 		return false
 	}
-}
 
     platform.runtime_duration = time.tick_since(platform.start_tick)
     platform.frame_counter += 1
