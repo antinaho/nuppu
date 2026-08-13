@@ -3,11 +3,18 @@
 !.gitignore
 
 !examples/
-!examples/1_Window/
-!examples/1_Window/window.odin
+!examples/**
 
 !app.odin
 
 !platform.odin
 !platform_choser.odin
 !platform_glfw.odin
+
+!default_renderer.odin
+!built_in.odin
+
+!gpu.odin
+!gpu_chooser.odin
+!gpu_MTL.odin
+!loader.odin
