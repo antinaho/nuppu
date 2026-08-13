@@ -25,8 +25,6 @@ FPS :: 240
 DT_TARGET_S_F64 :: 1.0 / f64(FPS)
 DT_TARGET_NS_F64 :: DT_TARGET_S_F64 * f64(time.Second)
 
-
-
 app_init :: proc(
     desc: App_Desc($T),
     app_state: ^^T,

@@ -224,6 +224,11 @@ native_window :: proc() -> rawptr {
     return platform.api.native_window()
 }
 
+aspect_ratio :: proc() -> f32 {
+	window_size := window_size_logical()
+	return f32(window_size.x) / f32(window_size.y)
+}
+
 // ---------------------------------------------------------------------------
 // API
 
