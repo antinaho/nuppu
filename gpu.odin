@@ -101,6 +101,9 @@ GPU_API :: struct #all_or_none {
     mem_copy_to_texture: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32),
     free: proc(ptr: ptr),
 
+    texture_size: proc(texture: Texture) -> [3]i32,
+    remake_texture: proc(texture: Texture, descriptor: Texture_Descriptor),
+
     signal_init: proc(value: u64) -> Signal,
     signal_deinit: proc(signal: Signal),
     signal_wait_for: proc(signal: Signal, value: u64, timeout_milliseconds: time.Duration) -> bool,
@@ -529,6 +532,9 @@ cmd_present :: proc(command_buffer: Command_Buffer, texture: Texture) {
 }
 
 cmd_mem_copy :: proc(command_buffer: Command_Buffer, dst, src: ptr, size: u64) {
+    if size == 0 {
+        return
+    }
     state.api.cmd_mem_copy(command_buffer, dst, src, size)
 }
 
@@ -630,4 +636,24 @@ cmd_set_front_face_winding :: proc(command_buffer: Command_Buffer, front_face_wi
 
 max_total_threads_per_threadgroup :: proc(kernel: Shader) -> int {
     return state.api.max_total_threads_per_threadgroup(kernel)
+}
+
+
+texture_size :: proc(texture: Texture) -> [3]i32 {
+    return state.api.texture_size(texture)
+}
+
+remake_texture :: proc(texture: Texture, descriptor: Texture_Descriptor) {
+    state.api.remake_texture(texture, descriptor)
+}
+
+remake_depth_texture :: proc(texture: Texture, dimensions: [2]int, format: Pixel_Format) {
+    desc := Texture_Descriptor {
+        dimensions = dimensions,
+        format = format,
+        usage = {.RenderTarget},
+        storage_mode = .Private,
+        texture_type = .Type2D,
+    }
+    remake_texture(texture, desc)
 }

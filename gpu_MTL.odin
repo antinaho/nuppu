@@ -60,6 +60,9 @@ MTL_RENDERER_API :: GPU_API {
 
     cmd_set_buffer = MTL_cmd_set_buffer,
     cmd_set_buffers = MTL_cmd_set_buffers,
+
+    texture_size = MTL_texture_size,
+    remake_texture = MTL_remake_texture,
 }
 
 MTL_State :: struct {
@@ -97,7 +100,7 @@ MTL_init :: proc() -> GPU_API_State {
     state = new(MTL_State)
     
     native_window := cast(^NS.Window)(native_window())
-    scale  := pixel_scale()
+    scale := pixel_scale()
 
     state.device = MTL.CreateSystemDefaultDevice()
 
@@ -243,6 +246,39 @@ MTL_free :: proc(ptr: ptr) {
 // ---------------------------------------------------------------------------
 // 
 
+MTL_texture_size :: proc(texture: Texture) -> [3]i32 {
+    texture_impl := resource_library_get(&state.textures, texture)
+    return {i32(texture_impl.texture->width()), i32(texture_impl.texture->height()), i32(texture_impl.texture->depth())}
+}
+
+MTL_remake_texture :: proc(texture: Texture, descriptor: Texture_Descriptor) {
+    texture_impl := resource_library_get(&state.textures, texture)
+    
+    if texture_impl.texture != nil {
+        texture_impl.texture->release()
+    }
+
+    if texture_impl.drawable != nil {
+        texture_impl.drawable->release()
+    }
+
+    desc := MTL.TextureDescriptor.alloc()->init()
+    defer desc->release()
+
+    desc->setWidth(NS.UInteger(descriptor.dimensions.x))
+    desc->setHeight(NS.UInteger(descriptor.dimensions.y))
+    desc->setPixelFormat(mtl_pixel_format_interop[descriptor.format])
+    desc->setUsage(bit_set_to_another(descriptor.usage, MTL.TextureUsage, mtl_texture_usage_interop))
+    desc->setStorageMode(mtl_storage_mode_interop[descriptor.storage_mode])
+    desc->setTextureType(mtl_texture_type_interop[descriptor.texture_type])
+
+    texture := state.device->newTextureWithDescriptor(desc)
+    if texture == nil {
+        log.panic("gpu_MTL.odin: MTL_texture_init: failed to create texture")
+    }
+
+    texture_impl.texture = texture
+}
 
 MTL_acquire_next_swapchain :: proc(cmd_buffer: Command_Buffer) -> Texture {
     drawable := state.metal_layer->nextDrawable()
@@ -670,6 +706,10 @@ MTL_cmd_set_buffers :: proc(command_buffer: Command_Buffer, buffers: []ptr, offs
 }
 
 MTL_cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, instance_count: u32) {
+    if instance_count == 0 {
+        return
+    }
+
     buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
 
     index_buffer := (^MTL.Buffer)(index_buffer._data)

@@ -33,6 +33,7 @@ Platform_API :: struct #all_or_none {
 	poll_events: proc(),
 	native_window: proc() -> rawptr,
 
+	monitor_size_logical: proc() -> [2]i32,
     window_size_logical: proc() -> [2]i32,
 	window_size_pixel:   proc() -> [2]i32,
 	pixel_scale: proc() -> [2]f32,
@@ -46,6 +47,7 @@ Resize_Window_Proc :: #type proc()
 Window_Flag :: enum {
 	Iconified,
 	Focused,
+	Visible,
 }
 Window_Flags :: bit_set[Window_Flag]
 
@@ -177,8 +179,9 @@ fire_resize_event :: proc() {
 
 is_flag_set :: proc "contextless" (flag: Window_Flag) -> bool { return flag in platform.flags }
 
-is_iconified :: proc "contextless" () -> bool { return .Iconified in platform.flags }
-is_focused :: proc "contextless" () -> bool { return .Focused in platform.flags }
+window_is_iconified :: proc "contextless" () -> bool { return .Iconified in platform.flags }
+window_is_focused :: proc "contextless" () -> bool { return .Focused in platform.flags }
+window_is_visible :: proc "contextless" () -> bool { return .Visible in platform.flags }
 
 // ---------------------------------------------------------------------------
 // Timers
@@ -227,6 +230,10 @@ native_window :: proc() -> rawptr {
 aspect_ratio :: proc() -> f32 {
 	window_size := window_size_logical()
 	return f32(window_size.x) / f32(window_size.y)
+}
+
+monitor_size_logical :: proc() -> [2]i32 {
+	return platform.api.monitor_size_logical()
 }
 
 // ---------------------------------------------------------------------------

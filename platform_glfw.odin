@@ -15,6 +15,7 @@ GLFW_PLATFORM_API :: Platform_API {
 	window_size_pixel   = glfw_get_window_size_pixel,
 	pixel_scale = glfw_get_pixel_scale,
 	set_window_title = glfw_set_window_title,
+	monitor_size_logical = glfw_monitor_size_logical,
 }
 
 @(private="file")
@@ -38,11 +39,16 @@ glfw_init :: proc(window_size: [2]i32, window_title: string) -> Platform_API_Sta
         panic("Failed to initialize GLFW")
     }
 
+	// If user asked for size that doesnt fit, clamp to monitor size
+    monitor_size := monitor_size_logical()
+    window_x, window_y := min(window_size.x, monitor_size.x), min(window_size.y, monitor_size.y) 
+    log.info("*")
+
     glfw.WindowHint(glfw.DECORATED, true)
 	glfw.WindowHint(glfw.RESIZABLE, true)
     glfw.WindowHint(glfw.CLIENT_API, glfw.NO_API)
 
-    state.window = glfw.CreateWindow(window_size.x, window_size.y, cstring(raw_data(window_title[:])), nil, nil)
+    state.window = glfw.CreateWindow(window_x, window_y, cstring(raw_data(window_title[:])), nil, nil)
     assert(state.window != nil, "In platform_glfw: glfw_platform_api_init: Failed to create GLFW window")
 
     glfw.SetFramebufferSizeCallback(state.window, glfw_resize_callback)
@@ -55,6 +61,9 @@ glfw_init :: proc(window_size: [2]i32, window_title: string) -> Platform_API_Sta
 	glfw.SetWindowIconifyCallback(state.window, glfw_window_iconify_callback)
     
 	glfw_center_window()
+
+	// GLFW doesnt expose this so we assume its always true
+	platform.flags += {.Visible}
 
     return Platform_API_State(state)
 }
@@ -105,10 +114,16 @@ glfw_set_window_title :: proc(title: string) {
 glfw_center_window :: proc() {
 	monitor := glfw.GetPrimaryMonitor()
 	wx, wy, ww, wh := glfw.GetMonitorWorkarea(monitor)
-	win_w, win_h := glfw.GetWindowSize(state.window)
-	x := wx + (ww - win_w) / 2
-	y := wy + (wh - win_h) / 2
+	win := glfw_get_window_size_logical()
+	x := wx + (ww - win.x) / 2
+	y := wy + (wh - win.y) / 2
 	glfw.SetWindowPos(state.window, x, y)
+}
+
+glfw_monitor_size_logical :: proc() -> [2]i32 {
+	monitor := glfw.GetPrimaryMonitor()
+	wx, wy, ww, wh := glfw.GetMonitorWorkarea(monitor)
+	return {ww, wh}
 }
 
 // ---------------------------------------------------------------------------

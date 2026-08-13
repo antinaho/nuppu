@@ -17,13 +17,55 @@ struct v2f {
     half3 color;                  // vertex color
 };
 
-v2f vertex vertexMain( uint vertexID  [[vertex_id]],
-device const packed_float3* positions [[buffer(0)]],
-device const packed_float3* colors    [[buffer(1)]]
+struct Vertex {
+    packed_float3 position;
+};
+
+struct Instance {
+    float4x4 transform;
+    float4 color;
+    uint mesh_id;
+};
+
+struct Range {
+    uint location;
+    uint length;
+};
+
+struct Mesh {
+    Range vertex_range;
+    Range index_range;
+};
+
+struct Data {
+    const device Instance* instances;
+    const device Mesh* meshes;
+    const device Vertex* vertices;
+};
+
+struct CameraData
+{
+    float4x4 to_clip;
+    float4x4 to_view;
+};
+
+v2f vertex vertexMain(
+    uint vertexID  [[vertex_id]], 
+    uint instanceID [[instance_id]],
+    device const Data* data [[buffer(0)]],
+    device const CameraData& cameraData [[buffer(1)]]
 ) {
     v2f o;
-    o.position = float4(positions[vertexID], 1.0);
-    o.color = half3(colors[vertexID]);
+
+    const device Instance& instance = data->instances[instanceID];
+    const device Mesh& mesh = data->meshes[instance.mesh_id];
+    const device Vertex& vert = data->vertices[mesh.vertex_range.location + vertexID];
+
+    float4 pos = float4(vert.position, 1.0);
+    pos = instance.transform * pos;
+    pos = cameraData.to_clip * cameraData.to_view * pos;
+    o.position = pos;
+    o.color = half3(instance.color.rgb);
     return o;
 }
 

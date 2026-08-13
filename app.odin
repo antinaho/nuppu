@@ -18,12 +18,13 @@ App_Desc :: struct($T: typeid) {
 App_Config :: struct {
     window_size: [2]i32,
     window_title: string,
-    render_frames_in_flight: u64,
 }
 
 FPS :: 240
 DT_TARGET_S_F64 :: 1.0 / f64(FPS)
 DT_TARGET_NS_F64 :: DT_TARGET_S_F64 * f64(time.Second)
+
+RENDER_FRAMES_IN_FLIGHT :: 3
 
 app_init :: proc(
     desc: App_Desc($T),
@@ -47,7 +48,6 @@ when ODIN_DEBUG && ODIN_OS == .Darwin {
     logger := log.create_console_logger()
     defer log.destroy_console_logger(logger)
     context.logger = logger
-
     apps := new([2]T)
     app := &apps[0]
     app_state^ = app
@@ -58,12 +58,10 @@ when ODIN_DEBUG && ODIN_OS == .Darwin {
     platform_init(config.window_size, config.window_title)
     defer platform_deinit()
 
-    window_size := config.window_size
     gpu_init()
     defer gpu_deinit()
 
-    render_frames_in_flight := max(config.render_frames_in_flight, 1)
-    frame_arenas := make([]GPU_Arena, len=render_frames_in_flight)
+    frame_arenas := make([]GPU_Arena, len=RENDER_FRAMES_IN_FLIGHT)
     defer delete(frame_arenas)
     for &A in frame_arenas { A = gpu_arena_init() }
     defer for &A in frame_arenas { gpu_arena_deinit(&A) }
@@ -103,20 +101,14 @@ when ODIN_DEBUG && ODIN_OS == .Darwin {
 
         // Skip render if window isn't visible
         current_window_size := window_size_logical()
-        if current_window_size.x <= 0 || current_window_size.y <= 0 || is_iconified() {
+        if current_window_size.x <= 0 || current_window_size.y <= 0 || window_is_iconified() || !window_is_visible() {
             continue
         }
 
-        if current_window_size.x != window_size.x || current_window_size.y != window_size.y {
-            gpu_resize_swapchain()
-            window_size = current_window_size
+        if next_frame > RENDER_FRAMES_IN_FLIGHT {
+            gpu_signal_wait_for(signal, next_frame - RENDER_FRAMES_IN_FLIGHT)
         }
-
-        // Enable this once the signaling is fixed so we don't wait indefinitely
-        if next_frame > render_frames_in_flight {
-            gpu_signal_wait_for(signal, next_frame - render_frames_in_flight)
-        }
-        frame_arena := &frame_arenas[next_frame % render_frames_in_flight]
+        frame_arena := &frame_arenas[next_frame % RENDER_FRAMES_IN_FLIGHT]
         gpu_arena_free_all(frame_arena)
 
         alpha := f64(accumulator) / f64(actual_ns_target)
