@@ -1,61 +1,81 @@
 package nuppu
 
+import "core:log"
+import "core:math/rand"
+import "core:math"
+
 Default_Renderer :: struct {
     mesh_data: GPU_Arena,
-    vertex_data: GPU_Arena,
-    index_data: GPU_Arena,
+    vertex_positions_data: GPU_Arena,
+    vertex_uvs_data: GPU_Arena,
+    
+    instance_arena: GPU_Arena,
     instances_gpu: []ptr,
+    
+    index_data: GPU_Arena,
 }
 
 dr: ^Default_Renderer
-MAX_INSTANCES :: 100
+MAX_INSTANCES :: 10_000
 
-dr_init :: proc(frames_in_flight: int = 3) {
+dr_init :: proc() {
     dr = new(Default_Renderer)
 
     // Later take in T and count instead of bytes + align, but currently not API for that
     dr.mesh_data = gpu_arena_init(align=align_of(Mesh), mem=Memory.GPU_Only)
-    dr.vertex_data = gpu_arena_init(mem=Memory.GPU_Only)
+    
+    dr.vertex_positions_data = gpu_arena_init(mem=Memory.GPU_Only)
+    dr.vertex_uvs_data = gpu_arena_init(mem=Memory.GPU_Only)
     dr.index_data = gpu_arena_init(mem=Memory.GPU_Only)
 
-    dr.instances_gpu = make([]ptr, len=frames_in_flight)
-    for I in 0 ..< frames_in_flight {
-        dr.instances_gpu[I] = gpu_malloc(size_of(Instance), MAX_INSTANCES, Memory.GPU_Only)
+    dr.instance_arena = gpu_arena_init(align=align_of(Instance), mem=Memory.GPU_Only)
+    dr.instances_gpu = make([]ptr, len=RENDER_FRAMES_IN_FLIGHT)
+    for I in 0 ..< RENDER_FRAMES_IN_FLIGHT {
+        dr.instances_gpu[I] = gpu_arena_alloc(&dr.instance_arena, Instance, MAX_INSTANCES) 
     }
 }
 
 dr_deinit :: proc() {
     gpu_arena_deinit(&dr.mesh_data)
-    gpu_arena_deinit(&dr.vertex_data)
+    
+    gpu_arena_deinit(&dr.vertex_positions_data)
+    gpu_arena_deinit(&dr.vertex_uvs_data)
     gpu_arena_deinit(&dr.index_data)
-    for inst_buf in dr.instances_gpu {
-        gpu_free(inst_buf)
-    }
+    
+
+    gpu_arena_deinit(&dr.instance_arena)
+    
     delete(dr.instances_gpu)
     free(dr)
 }
 
-dr_push_mesh :: proc(verts: [][3]f32, indices: []u32) -> uint {
-    vertex_gpu := gpu_arena_alloc(&dr.vertex_data, [3]f32, len(verts))
+dr_push_mesh :: proc(verts: []Vertex_Position, indices: []u32, uvs: []Vertex_UV) -> u32 {
+    vertex_pos_gpu := gpu_arena_alloc(&dr.vertex_positions_data, Vertex_Position, len(verts))
+    vertex_uv_gpu := gpu_arena_alloc(&dr.vertex_uvs_data, Vertex_UV, len(uvs))
     index_gpu := gpu_arena_alloc(&dr.index_data, u32, len(indices))
-
-    vertex_upload := gpu_malloc([3]f32, len(verts), Memory.CPU_GPU)
-    index_upload := gpu_malloc(u32, len(indices), Memory.CPU_GPU)
     
-    gpu_ptr_fill_slice(vertex_upload, verts)
+    vertex_pos_upload := gpu_malloc(Vertex_Position, len(verts), Memory.CPU_GPU)
+    vertex_uv_upload := gpu_malloc(Vertex_UV, len(uvs), Memory.CPU_GPU)
+    index_upload := gpu_malloc(u32, len(indices), Memory.CPU_GPU)
+
+    gpu_ptr_fill_slice(vertex_pos_upload, verts)
+    gpu_ptr_fill_slice(vertex_uv_upload, uvs)
     gpu_ptr_fill_slice(index_upload, indices)
 
     cmds := begin_commands()
-    cmd_mem_copy(cmds, vertex_gpu, vertex_upload, u64(size_of([3]f32) * len(verts)))
+    cmd_mem_copy(cmds, vertex_pos_gpu, vertex_pos_upload, u64(size_of(Vertex_Position) * len(verts)))
+    cmd_mem_copy(cmds, vertex_uv_gpu, vertex_uv_upload, u64(size_of(Vertex_UV) * len(uvs)))
     cmd_mem_copy(cmds, index_gpu, index_upload, u64(size_of(u32) * len(indices)))
     cmd_barrier(cmds, .Transfer, .All)
     end_commands(cmds, {})
 
-    vertex_delta := vertex_gpu._buffer_offset - dr.vertex_data._buffer_offset
+    vertex_pos_delta := vertex_pos_gpu._buffer_offset - dr.vertex_positions_data._buffer_offset
+    vertex_uv_delta := vertex_uv_gpu._buffer_offset - dr.vertex_uvs_data._buffer_offset
     index_delta := index_gpu._buffer_offset - dr.index_data._buffer_offset
 
     result := Mesh {
-        vertex_range = {vertex_delta / size_of([3]f32), len(verts)},
+        vertex_position_range = {vertex_pos_delta / size_of(Vertex_Position), len(verts)},
+        vertex_uv_range = {vertex_uv_delta / size_of(Vertex_UV), len(uvs)},
         index_range = {index_delta / size_of(u32), len(indices)},
     }
 
@@ -69,23 +89,62 @@ dr_push_mesh :: proc(verts: [][3]f32, indices: []u32) -> uint {
     cmd_barrier(cmds, .Transfer, .All)
     end_commands(cmds, {})
     
-    return mesh_idx
+    return u32(mesh_idx)
 }
 
+random_array :: proc(N: int, rng: proc() -> $T, allocator := context.temp_allocator) -> []T {
+    arr := make([]T, len=N, allocator=allocator)
+    for i in 0..<N {
+        arr[i] = rng()
+    }
+    return arr
+}
 
-Shader_Data :: struct {
+_pack_color :: proc(c: Color) -> u32 {
+    return u32(c.r) << 24 | u32(c.g) << 16 | u32(c.b) << 8 | u32(c.a)
+}
+
+pack_color :: proc(r, g, b, a: f32) -> u32 {
+    return u32(f32(r) * 255) << 24 | u32(f32(g) * 255) << 16 | u32(f32(b) * 255) << 8 | u32(f32(a) * 255)
+}
+
+_depack_color :: proc(c: u32) -> Color {
+    return Color {
+        u8(c >> 24 & 0xFF),
+        u8(c >> 16 & 0xFF),
+        u8(c >> 8 & 0xFF),
+        u8(c & 0xFF),
+    }
+}
+
+depack_color :: proc(c: u32) -> [4]f32 {
+    return [4]f32 {
+        f32(c >> 24 & 0xFF) / 255,
+        f32(c >> 16 & 0xFF) / 255,
+        f32(c >> 8 & 0xFF) / 255,
+        f32(c & 0xFF) / 255,
+    }
+}
+
+Vertex_Position :: [3]f32
+Vertex_UV :: [2]f32
+
+Shader_Data :: struct #align(16) #all_or_none {
     instances: ^Instance,
     meshes: ^Mesh,
-    vertices: ^[3]f32,
+    vertex_positions: ^Vertex_Position,
+    vertex_uvs: ^Vertex_UV,
 }
 
-Instance :: struct {
+Instance :: struct #align(16) {
     transform: matrix[4, 4]f32,
-    color: [4]f32,
+    uv_: [4]f32,
     mesh_id: u32,
+
 }
 
-Mesh :: struct {
-    vertex_range: Range,
+Mesh :: struct #align(16) {
+    vertex_position_range: Range,
+    vertex_uv_range: Range,
     index_range: Range,
 }

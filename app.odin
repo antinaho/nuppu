@@ -12,7 +12,7 @@ App_Desc :: struct($T: typeid) {
     init: proc(),
     deinit: proc(),
 	update: proc(),
-	render: proc(previous: T, current: T, alpha: f32, frame_arena: ^GPU_Arena, frame_pass: Frame_Pass),
+	render: proc(previous, current: ^T, alpha: f32, frame_arena: ^GPU_Arena, frame_pass: Frame_Pass),
 }
 
 App_Config :: struct {
@@ -117,7 +117,7 @@ when ODIN_DEBUG && ODIN_OS == .Darwin {
             value = next_frame,
         }
         if desc.render != nil {
-            desc.render((^T)(prev_app)^, (^T)(app)^, f32(alpha), frame_arena, pass) // something here has to signal the next frame, not sure whats the best way to do that yet? Maybe need to get render_buffer as return and use that to signal?
+            desc.render((^T)(prev_app), (^T)(app), f32(alpha), frame_arena, pass) // something here has to signal the next frame, not sure whats the best way to do that yet? Maybe need to get render_buffer as return and use that to signal?
             next_frame += 1
         }
     }

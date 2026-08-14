@@ -41,6 +41,7 @@ struct Data {
     const device Instance* instances;
     const device Mesh* meshes;
     const device Vertex* vertices;
+    const device uint* vertex_colors;
 };
 
 struct CameraData

@@ -42,7 +42,6 @@ glfw_init :: proc(window_size: [2]i32, window_title: string) -> Platform_API_Sta
 	// If user asked for size that doesnt fit, clamp to monitor size
     monitor_size := monitor_size_logical()
     window_x, window_y := min(window_size.x, monitor_size.x), min(window_size.y, monitor_size.y) 
-    log.info("*")
 
     glfw.WindowHint(glfw.DECORATED, true)
 	glfw.WindowHint(glfw.RESIZABLE, true)
@@ -63,6 +62,7 @@ glfw_init :: proc(window_size: [2]i32, window_title: string) -> Platform_API_Sta
 	glfw_center_window()
 
 	// GLFW doesnt expose this so we assume its always true
+	// Just need to make sure we don't zero out the flags at some point..
 	platform.flags += {.Visible}
 
     return Platform_API_State(state)

@@ -29,6 +29,7 @@ MTL_RENDERER_API :: GPU_API {
     cmd_end_render_pass = MTL_cmd_end_render_pass,
     cmd_mem_copy = MTL_cmd_mem_copy,
     cmd_barrier = MTL_cmd_barrier,
+    cmd_blit_texture = MTL_cmd_blit_texture,
 
     shader_init = MTL_shader_init,
     kernel_init = MTL_kernel_init,
@@ -40,6 +41,7 @@ MTL_RENDERER_API :: GPU_API {
 
     cmd_draw_indiced_primitives = MTL_cmd_draw_indiced_primitives,
     cmd_draw_primitives = MTL_cmd_draw_primitives,
+    cmd_set_scissor_rect = MTL_cmd_set_scissor_rect,
     cmd_use_resources = MTL_use_resources,
 
     depth_stencil_state_init = MTL_depth_stencil_state_init,
@@ -62,6 +64,8 @@ MTL_RENDERER_API :: GPU_API {
     cmd_set_buffers = MTL_cmd_set_buffers,
 
     texture_size = MTL_texture_size,
+    texture_format = MTL_texture_format,
+    texture_type = MTL_texture_type,
     remake_texture = MTL_remake_texture,
 }
 
@@ -108,7 +112,12 @@ MTL_init :: proc() -> GPU_API_State {
     
     metal_layer->setDevice(state.device)
     metal_layer->setPixelFormat(.BGRA8Unorm_sRGB)
-    metal_layer->setFramebufferOnly(true)
+    // framebufferOnly = false: the swapchain drawable must be usable as a blit
+    // destination (e.g. when displaying an offscreen render target via
+    // `cmd_blit_texture`). Apple's recommended value is `true` for slightly
+    // better tile compression when the swapchain is only used as a render
+    // target, but that disables the documented render-to-texture workflow.
+    metal_layer->setFramebufferOnly(false)
     metal_layer->setFrame(native_window->frame())
     metal_layer->setContentsScale(NS.Float(scale.x))
     state.metal_layer = metal_layer
@@ -156,7 +165,7 @@ MTL_texture_init :: proc(texture_descriptor: Texture_Descriptor) -> Texture {
     }
 
     handle := resource_library_add(&state.textures, MTL_Texture_Impl {
-        texture = texture,
+        texture      = texture,
     }, {})
 
     return handle
@@ -251,9 +260,22 @@ MTL_texture_size :: proc(texture: Texture) -> [3]i32 {
     return {i32(texture_impl.texture->width()), i32(texture_impl.texture->height()), i32(texture_impl.texture->depth())}
 }
 
+
+MTL_texture_format :: proc(texture: Texture) -> Pixel_Format {
+    texture_impl := resource_library_get(&state.textures, texture)
+    px_format := texture_impl.texture->pixelFormat()
+    return mtl_texture_format_interop_reverse[px_format]
+}
+
+MTL_texture_type :: proc(texture: Texture) -> Texture_Type {
+    texture_impl := resource_library_get(&state.textures, texture)
+    tex_type := texture_impl.texture->textureType()
+    return mtl_texture_type_interop_reverse[tex_type]
+}
+
 MTL_remake_texture :: proc(texture: Texture, descriptor: Texture_Descriptor) {
     texture_impl := resource_library_get(&state.textures, texture)
-    
+
     if texture_impl.texture != nil {
         texture_impl.texture->release()
     }
@@ -277,7 +299,7 @@ MTL_remake_texture :: proc(texture: Texture, descriptor: Texture_Descriptor) {
         log.panic("gpu_MTL.odin: MTL_texture_init: failed to create texture")
     }
 
-    texture_impl.texture = texture
+    texture_impl.texture      = texture
 }
 
 MTL_acquire_next_swapchain :: proc(cmd_buffer: Command_Buffer) -> Texture {
@@ -289,8 +311,10 @@ MTL_acquire_next_swapchain :: proc(cmd_buffer: Command_Buffer) -> Texture {
     drawable_texture := drawable->texture()
 
     handle := resource_library_add(&state.textures, MTL_Texture_Impl {
-        texture = drawable_texture,
-        drawable = drawable,
+        texture      = drawable_texture,
+        drawable     = drawable,
+        // format       = .BGRA8Unorm_sRGB,
+        // texture_type = .Type2D,
     }, {})
         
     return handle
@@ -331,6 +355,8 @@ MTL_cmd_begin_render_pass :: proc(command_buffer: Command_Buffer, color_attachme
     buffer_info := resource_library_get(&state.command_buffers, command_buffer)
 
     when ODIN_DEBUG {
+        assert(buffer_info.render_command_encoder == nil,
+            "cmd_begin_render_pass: a render pass is already active; call cmd_end_render_pass first")
         assert(buffer_info.blit_command_encoder == nil,
             "cmd_begin_render_pass: blit encoder still active; call cmd_barrier(.Transfer, .All) first")
     }
@@ -344,6 +370,24 @@ MTL_cmd_begin_render_pass :: proc(command_buffer: Command_Buffer, color_attachme
         color_attachment->setLoadAction(mtl_load_action_interop[attachment.load_action])
         color_attachment->setStoreAction(mtl_store_action_interop[attachment.store_action])
         color_attachment->setTexture(texture_impl.texture)
+
+        // Optional resolve texture: when set, Metal will perform an automatic
+        // multisample resolve from `attachment.texture` into `attachment.resolve_texture`
+        // at the end of the render pass.
+        if attachment.resolve_texture != Texture_nil {
+            when ODIN_DEBUG {
+                assert(attachment.store_action == .MultisampleResolve ||
+                       attachment.store_action == .StoreAndMultisampleResolve,
+                       "cmd_begin_render_pass: resolve_texture set but store_action is not a resolve action")
+                assert(attachment.resolve_texture != attachment.texture,
+                    "cmd_begin_render_pass: resolve_texture must differ from texture")
+                assert(texture_type(attachment.resolve_texture) != .Type2DMultisample &&
+                       texture_type(attachment.resolve_texture) != .Type2DMultisampleArray,
+                    "cmd_begin_render_pass: resolve_texture must be a single-sample texture")
+            }
+            resolve_impl := resource_library_get(&state.textures, attachment.resolve_texture)
+            color_attachment->setResolveTexture(resolve_impl.texture)
+        }
     }
 
     if depth_attachment.texture != Texture_nil {
@@ -355,6 +399,22 @@ MTL_cmd_begin_render_pass :: proc(command_buffer: Command_Buffer, color_attachme
 
         texture_impl := resource_library_get(&state.textures, depth_attachment.texture)
         pass_depth->setTexture(texture_impl.texture)
+
+        // Optional depth resolve texture.
+        if depth_attachment.resolve_texture != Texture_nil {
+            when ODIN_DEBUG {
+                assert(depth_attachment.store_action == .MultisampleResolve ||
+                       depth_attachment.store_action == .StoreAndMultisampleResolve,
+                       "cmd_begin_render_pass: depth resolve_texture set but store_action is not a resolve action")
+                assert(depth_attachment.resolve_texture != depth_attachment.texture,
+                    "cmd_begin_render_pass: depth resolve_texture must differ from depth texture")
+                assert(texture_type(depth_attachment.resolve_texture) != .Type2DMultisample &&
+                       texture_type(depth_attachment.resolve_texture) != .Type2DMultisampleArray,
+                    "cmd_begin_render_pass: depth resolve_texture must be a single-sample texture")
+            }
+            resolve_impl := resource_library_get(&state.textures, depth_attachment.resolve_texture)
+            pass_depth->setResolveTexture(resolve_impl.texture)
+        }
     }
 
     buffer_info.pass_descriptor = pass_descriptor
@@ -395,6 +455,16 @@ MTL_depth_stencil_state_deinit :: proc(depth: Depth_Stencil_State) {
 
 MTL_cmd_end_render_pass :: proc(command_buffer: Command_Buffer) {
     buffer_info := resource_library_get(&state.command_buffers, command_buffer)
+
+    when ODIN_DEBUG {
+        assert(buffer_info.render_command_encoder != nil,
+            "cmd_end_render_pass: no render pass is active")
+    }
+
+    if buffer_info.render_command_encoder != nil {
+        buffer_info.render_command_encoder->endEncoding()
+        buffer_info.render_command_encoder = nil
+    }
 }
 
 MTL_cmd_present :: proc(command_buffer: Command_Buffer, texture: Texture) {
@@ -419,6 +489,10 @@ MTL_end_commands :: proc(command_buffer: Command_Buffer, frame_pass: Frame_Pass)
     if command_buffer_impl.presentable != {} {
         texture_impl := resource_library_get(&state.textures, command_buffer_impl.presentable)
         command_buffer_impl.command_buffer->presentDrawable(texture_impl.drawable)
+        // Drop the swapchain texture from the resource library so the handle slot
+        // can be reused next frame. The drawable itself is autoreleased when the
+        // command buffer is committed below.
+        resource_library_remove(&state.textures, command_buffer_impl.presentable)
     }
 
     if frame_pass.signal != nil {
@@ -482,6 +556,44 @@ MTL_cmd_mem_copy :: proc(command_buffer: Command_Buffer, dst, src: ptr, size: u6
         src_buffer, NS.UInteger(src._buffer_offset),
         dst_buffer, NS.UInteger(dst._buffer_offset),
         NS.UInteger(size),
+    )
+}
+
+MTL_cmd_blit_texture :: proc(command_buffer: Command_Buffer, src, dst: Texture) {
+    buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
+
+    when ODIN_DEBUG {
+        assert(buffer_impl.render_command_encoder == nil,
+            "cmd_blit_texture: render encoder still active; call cmd_end_render_pass (and cmd_barrier(.Raster_Color_Out, .Transfer) if needed) first")
+        assert(src != dst, "cmd_blit_texture: src and dst must be different textures")
+    }
+
+    if buffer_impl.blit_command_encoder == nil {
+        buffer_impl.blit_command_encoder = buffer_impl.command_buffer->blitCommandEncoder()
+    }
+
+    src_impl := resource_library_get(&state.textures, src)
+    dst_impl := resource_library_get(&state.textures, dst)
+
+    when ODIN_DEBUG {
+        assert(src_impl.texture != nil, "cmd_blit_texture: src texture is nil")
+        assert(dst_impl.texture != nil, "cmd_blit_texture: dst texture is nil")
+    }
+
+    src_size := MTL.Size {
+        width  = NS.Integer(src_impl.texture->width()),
+        height = NS.Integer(src_impl.texture->height()),
+        depth  = NS.Integer(1),
+    }
+
+    buffer_impl.blit_command_encoder->copyFromTextureWithDestinationOrigin(
+        src_impl.texture,
+        0, 0,
+        MTL.Origin{0, 0, 0},
+        src_size,
+        dst_impl.texture,
+        0, 0,
+        MTL.Origin{0, 0, 0},
     )
 }
 
@@ -721,6 +833,26 @@ MTL_cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitiv
     )
 }
 
+MTL_cmd_set_scissor_rect :: proc(command_buffer: Command_Buffer, x, y, width, height: u32) {
+    buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
+
+    when ODIN_DEBUG {
+        assert(buffer_impl.render_command_encoder != nil,
+            "cmd_set_scissor_rect: no render pass is active")
+        assert(width > 0 && height > 0,
+            "cmd_set_scissor_rect: width and height must be > 0 (zero-area scissor renders nothing)")
+    }
+
+    buffer_impl.render_command_encoder->setScissorRect(
+        MTL.ScissorRect {
+            x      = NS.Integer(x),
+            y      = NS.Integer(y),
+            width  = NS.Integer(width),
+            height = NS.Integer(height),
+        },
+    )
+}
+
 // Prefer passing by pointer instead of using argument buffers
 @(deprecated="Use pointer approach")
 __MTL_argument_buffer_init :: proc(shader: Shader, index: u32, buffers: []ptr, offsets: []uint, range: Range) -> ptr {
@@ -856,8 +988,10 @@ mtl_load_action_interop := [Load_Action]MTL.LoadAction {
 
 @(rodata)
 mtl_store_action_interop := [Store_Action]MTL.StoreAction {
-    .Dont_Care = .DontCare,
-    .Store     = .Store,
+    .Dont_Care                  = .DontCare,
+    .Store                      = .Store,
+    .MultisampleResolve         = .MultisampleResolve,
+    .StoreAndMultisampleResolve = .StoreAndMultisampleResolve,
 }
 
 @(rodata)
@@ -942,4 +1076,27 @@ mtl_render_stage_interop := [Render_Stage]MTL.RenderStage {
     .Tile     = .Tile,
     .Object   = .Object,
     .Mesh     = .Mesh,
+}
+
+// Add more to this if we happen to use something we don't have binded yet
+@(rodata)
+mtl_texture_format_interop_reverse := #partial #sparse [MTL.PixelFormat]Pixel_Format {
+    .Invalid         = .Invalid,
+    .BGRA8Unorm_sRGB = .BGRA8Unorm_sRGB,
+    .RGBA8Unorm      = .RGBA8Unorm,
+    .Depth32Float    = .Depth32Float,
+}
+
+@(rodata)
+mtl_texture_type_interop_reverse := #partial #sparse [MTL.TextureType]Texture_Type {
+    .Type1D                 = .Type1D,
+    .Type1DArray            = .Type1DArray,
+    .Type2D                 = .Type2D,
+    .Type2DArray            = .Type2DArray,
+    .Type2DMultisample      = .Type2DMultisample,
+    .TypeCube               = .TypeCube,
+    .TypeCubeArray          = .TypeCubeArray,
+    .Type3D                 = .Type3D,
+    .Type2DMultisampleArray = .Type2DMultisampleArray,
+    .TypeTextureBuffer      = .TypeTextureBuffer,
 }

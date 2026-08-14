@@ -14,6 +14,15 @@ Color_Attachment :: struct {
     load_action: Load_Action,
     store_action: Store_Action,
     texture: Texture,
+    // Optional: when non-nil, the rendering engine will resolve the multisample
+    // data from `texture` into `resolve_texture` at the end of the render pass.
+    // Useful for MSAA-to-non-MSAA or render-to-texture pipelines. The matching
+    // `store_action` must be `.MultisampleResolve` or `.StoreAndMultisampleResolve`.
+    //
+    // IMPORTANT: `resolve_texture` must be a SINGLE-SAMPLE texture (i.e. its
+    // `texture_type` is not `Type2DMultisample`). It must also differ from
+    // `texture`.
+    resolve_texture: Texture,
 }
 
 GPU_Arena :: struct {
@@ -102,6 +111,8 @@ GPU_API :: struct #all_or_none {
     free: proc(ptr: ptr),
 
     texture_size: proc(texture: Texture) -> [3]i32,
+    texture_format: proc(texture: Texture) -> Pixel_Format,
+    texture_type: proc(texture: Texture) -> Texture_Type,
     remake_texture: proc(texture: Texture, descriptor: Texture_Descriptor),
 
     signal_init: proc(value: u64) -> Signal,
@@ -117,6 +128,8 @@ GPU_API :: struct #all_or_none {
     cmd_mem_copy: proc(command_buffer: Command_Buffer, dst, src: ptr, size: u64),
     cmd_barrier: proc(command_buffer: Command_Buffer, before: Stage, after: Stage),
 
+    cmd_blit_texture: proc(command_buffer: Command_Buffer, src, dst: Texture),
+
     shader_init: proc(code: []u8, entry_point: string, stage: Graphics_Stage) -> Shader,
     shader_deinit: proc(shader: Shader),
     kernel_init: proc(code: []u8, entry_point: string) -> Shader,
@@ -129,6 +142,8 @@ GPU_API :: struct #all_or_none {
     cmd_use_resources: proc(command_buffer: Command_Buffer, resource_list: []Shader_Resource),
     cmd_draw_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32),
     cmd_draw_indiced_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, instance_count: u32),
+
+    cmd_set_scissor_rect: proc(command_buffer: Command_Buffer, x, y, width, height: u32),
 
     depth_stencil_state_init: proc(desc: Depth_Stencil_State_Descriptor) -> Depth_Stencil_State,
     depth_stencil_state_deinit: proc(depth_stencil_state: Depth_Stencil_State),
@@ -208,6 +223,8 @@ Sampler_Address_Mode :: enum u64 {
 Store_Action :: enum {
     Dont_Care,
     Store,
+    MultisampleResolve,
+    StoreAndMultisampleResolve,
 }
 
 Depth_Stencil_State :: distinct rawptr
@@ -294,6 +311,15 @@ Depth_Attachment :: struct {
     load_action: Load_Action,
     store_action: Store_Action,
     texture: Texture,
+    // Optional: when non-nil, the rendering engine will resolve the multisample
+    // depth data from `texture` into `resolve_texture` at the end of the render pass.
+    // Useful for MSAA-to-non-MSAA pipelines. The matching `store_action` must be
+    // `.MultisampleResolve` or `.StoreAndMultisampleResolve`.
+    //
+    // IMPORTANT: `resolve_texture` must be a SINGLE-SAMPLE texture (i.e. its
+    // `texture_type` is not `Type2DMultisample`). It must also differ from
+    // `texture`.
+    resolve_texture: Texture,
 }
 
 bit_set_to_another :: proc(input: $T/bit_set[$TT; $TI], $Out: typeid, interop: [TT]$O) -> (result: Out) {
@@ -367,7 +393,7 @@ resource_library_deinit :: proc(library: ^Resource_Library($N, $T, $Handle_T)) {
 // Arena
 
 gpu_arena_init :: proc(size: uint = 4 * 1024 * 1024, align: uint = 16, mem: Memory = .CPU_GPU) -> GPU_Arena {
-    ptr := _gpu_malloc_bytes(size, align, mem)
+    ptr := __gpu_malloc_bytes(size, align, mem)
     return GPU_Arena {
         ptr = ptr,
         size = size,
@@ -438,19 +464,18 @@ gpu_ptr_fill_slice :: proc(dst: ptr, src: []$T) {
 gpu_malloc :: proc {
     gpu_malloc_typed,
     gpu_malloc_raw,
-    _gpu_malloc_bytes,
 }
 
 gpu_malloc_typed :: proc($T: typeid, #any_int count: uint = 1, mem_access: Memory = .CPU_GPU) -> ptr {
-    return _gpu_malloc_bytes(size_of(T) * count, align_of(T), mem_access)
+    return __gpu_malloc_bytes(size_of(T) * count, align_of(T), mem_access)
 }
 
 gpu_malloc_raw :: proc(#any_int size, count, align: uint, mem_access: Memory = .CPU_GPU) -> ptr {
-    return _gpu_malloc_bytes(size * count, align, mem_access)
+    return __gpu_malloc_bytes(size * count, align, mem_access)
 }
 
 // Allocates a buffer of 'size' bytes on the GPU.
-_gpu_malloc_bytes :: proc(bytes: uint, align: uint = 16, mem_access: Memory = .CPU_GPU) -> ptr {
+__gpu_malloc_bytes :: proc(bytes: uint, align: uint = 16, mem_access: Memory = .CPU_GPU) -> ptr {
     return state.api.malloc(bytes, align, mem_access)
 }
 
@@ -546,6 +571,29 @@ cmd_barrier :: proc(command_buffer: Command_Buffer, before: Stage, after: Stage)
     state.api.cmd_barrier(command_buffer, before, after)
 }
 
+// Blits (copies) the entire contents of `src` into `dst`. Commonly used to
+// display a render-target texture on the swapchain (e.g. render scene to a
+// 200x200 offscreen target, then blit it to the swapchain to present).
+//
+// Size mismatches: Metal silently clamps the blit to the overlapping region.
+//
+// Pixel-format mismatches: the blit still executes but raw bytes are copied
+// without any sRGB conversion or channel reordering. For example, blitting
+// a `.RGBA8Unorm` source into a `.BGRA8Unorm_sRGB` destination (the typical
+// swapchain format) will produce visibly wrong colors. In these cases create
+// a texture view If you need format conversion, render the offscreen target
+// with the SAME pixel format as the destination.
+//
+// Caller must ensure no render encoder is active for `command_buffer`. If a
+// render pass just ended, call `cmd_barrier(cmd, .Raster_Color_Out, .Transfer)`
+// before this blit. `src` and `dst` must be different textures.
+//
+// The swapchain drawable is NOT `framebufferOnly`, so it can be used as the
+// destination (this is the canonical render-target-to-display path).
+cmd_blit_texture :: proc(command_buffer: Command_Buffer, src, dst: Texture) {
+    state.api.cmd_blit_texture(command_buffer, src, dst)
+}
+
 acquire_next_swapchain :: proc(cmd_buffer: Command_Buffer) -> Texture {
     return state.api.acquire_next_swapchain(cmd_buffer)
 }
@@ -595,6 +643,19 @@ cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: P
     state.api.cmd_draw_indiced_primitives(command_buffer, primitive, index_buffer, instance_count)
 }
 
+// Sets the GPU scissor rectangle for subsequent draw calls on this command
+// buffer. Fragments outside the scissor are clipped before the fragment
+// shader runs, which is the canonical way to constrain rendering to a
+// sub-region of the render target (e.g. letterbox bars around an offscreen
+// render target, partial updates, UI overlays).
+//
+// Coordinates are in PIXELS with the origin at the top-left of the render
+// target, matching Metal's `setScissorRect:` convention. Must be issued
+// while a render command encoder is active.
+cmd_set_scissor_rect :: proc(command_buffer: Command_Buffer, x, y, width, height: u32) {
+    state.api.cmd_set_scissor_rect(command_buffer, x, y, width, height)
+}
+
 cmd_use_resources :: proc(command_buffer: Command_Buffer, resource_list: []Shader_Resource) {
     state.api.cmd_use_resources(command_buffer, resource_list)
 }
@@ -641,6 +702,14 @@ max_total_threads_per_threadgroup :: proc(kernel: Shader) -> int {
 
 texture_size :: proc(texture: Texture) -> [3]i32 {
     return state.api.texture_size(texture)
+}
+
+texture_format :: proc(texture: Texture) -> Pixel_Format {
+    return state.api.texture_format(texture)
+}
+
+texture_type :: proc(texture: Texture) -> Texture_Type {
+    return state.api.texture_type(texture)
 }
 
 remake_texture :: proc(texture: Texture, descriptor: Texture_Descriptor) {

@@ -123,7 +123,7 @@ render :: proc(prev, curr: Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nup
 
     nuppu.cmd_use_resources(cmds, {
         {nuppu.dr.mesh_data, {.Read}, {.Vertex}},
-        {nuppu.dr.vertex_data, {.Read}, {.Vertex}},
+        {nuppu.dr.vertex_positions_data, {.Read}, {.Vertex}},
         {current_frames_instance_ptr, {.Read}, {.Vertex}},
     })
 
@@ -145,7 +145,7 @@ render :: proc(prev, curr: Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nup
     shader_data := nuppu.Shader_Data {
         instances = (^nuppu.Instance)(current_frames_instance_ptr.gpu),
         meshes = (^nuppu.Mesh)(nuppu.dr.mesh_data.gpu),
-        vertices = (^[3]f32)(nuppu.dr.vertex_data.gpu),
+        vertex_positions = (^[3]f32)(nuppu.dr.vertex_data.gpu),
     }
     nuppu.gpu_temp_malloc(cmds, slice.bytes_from_ptr(&shader_data, size_of(nuppu.Shader_Data)), 0, .Vertex)
     

@@ -56,9 +56,9 @@ init :: proc() {
     indices_array[4] = 3
     indices_array[5] = 0
 
-    window_app.vertex_gpu = nuppu._gpu_malloc_bytes(size_of(Vertex) * VERT_COUNT, align_of(Vertex), .GPU_Only)
-    window_app.index_gpu = nuppu._gpu_malloc_bytes(size_of(u32) * INDEX_COUNT, align_of(u32), .GPU_Only)
-    window_app.instance_gpu = nuppu._gpu_malloc_bytes(INSTANCE_COUNT * size_of(Instance_Data), align_of(Instance_Data), .GPU_Only)
+    window_app.vertex_gpu = nuppu.__gpu_malloc_bytes(size_of(Vertex) * VERT_COUNT, align_of(Vertex), .GPU_Only)
+    window_app.index_gpu = nuppu.__gpu_malloc_bytes(size_of(u32) * INDEX_COUNT, align_of(u32), .GPU_Only)
+    window_app.instance_gpu = nuppu.__gpu_malloc_bytes(INSTANCE_COUNT * size_of(Instance_Data), align_of(Instance_Data), .GPU_Only)
 
     cmds := nuppu.begin_commands()
     nuppu.cmd_mem_copy(cmds, window_app.vertex_gpu, verts, size_of(Vertex) * VERT_COUNT)
@@ -146,7 +146,6 @@ render :: proc(prev, curr: Window, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
 config :: nuppu.App_Config {
     window_size = [2]i32{1280, 720},
     window_title = "Window",
-    render_frames_in_flight = 3,
 }
 
 main :: proc() {

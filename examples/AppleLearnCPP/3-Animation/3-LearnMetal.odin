@@ -49,8 +49,8 @@ init :: proc() {
     colors_array[1] = {  0, 1, 0 }
     colors_array[2] = {  0, 0, 1 }
 
-    window_app.positions_gpu = nuppu._gpu_malloc_bytes(size_of(Position) * NUM_VERTICES, align_of(Position), .GPU_Only)
-    window_app.colors_gpu = nuppu._gpu_malloc_bytes(size_of(Color) * NUM_VERTICES, align_of(Color), .GPU_Only)
+    window_app.positions_gpu = nuppu.__gpu_malloc_bytes(size_of(Position) * NUM_VERTICES, align_of(Position), .GPU_Only)
+    window_app.colors_gpu = nuppu.__gpu_malloc_bytes(size_of(Color) * NUM_VERTICES, align_of(Color), .GPU_Only)
 
     cmds := nuppu.begin_commands()
     nuppu.cmd_mem_copy(cmds, window_app.positions_gpu, positions, size_of(Position) * NUM_VERTICES)
@@ -58,7 +58,7 @@ init :: proc() {
     nuppu.cmd_barrier(cmds, .Transfer, .All)
     nuppu.end_commands(cmds, {})
 
-    window_app.argument_buffer = nuppu._gpu_malloc_bytes(size_of(Buffer_Data), align_of(Buffer_Data), .CPU_GPU)
+    window_app.argument_buffer = nuppu.__gpu_malloc_bytes(size_of(Buffer_Data), align_of(Buffer_Data), .CPU_GPU)
     (^Buffer_Data)(window_app.argument_buffer.cpu)^ = Buffer_Data {
         positions = (^Position)(window_app.positions_gpu.gpu),
         colors = (^Color)(window_app.colors_gpu.gpu),
@@ -136,7 +136,6 @@ render :: proc(prev, curr: Window, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
 config :: nuppu.App_Config {
     window_size = [2]i32{1280, 720},
     window_title = "Window",
-    render_frames_in_flight = 3,
 }
 
 main :: proc() {
