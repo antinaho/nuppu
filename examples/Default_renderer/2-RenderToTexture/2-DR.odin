@@ -3,12 +3,12 @@ package main
 import nuppu "../../../"
 import "core:math"
 import "core:slice"
-import "core:log"
 import "core:container/handle_map"
 import "core:mem"
 import glm "core:math/linalg/glsl"
 import "core:fmt"
 import "core:sort"
+import "core:log"
 
 // 2-RenderToTexture
 //
@@ -66,8 +66,6 @@ Basic :: struct {
     scene_color: nuppu.Texture,
     scene_depth: nuppu.Texture,
 
-    instances_in_use: u32,
-
     things: handle_map.Static_Handle_Map(nuppu.MAX_INSTANCES, Thing, Thing_Handle),
 
     camera: nuppu.Camera,
@@ -78,13 +76,12 @@ Thing :: struct {
     handle: Thing_Handle,
     position: [3]f32,
     rotation_eular: [3]f32,
+    scale: [3]f32,
 
     mesh: nuppu.Mesh_Handle,
-    
+
     is_alive: bool,
 }
-
-player: Thing_Handle
 
 
 SCENE_WIDTH  :: 512 * 2 + 200
@@ -102,8 +99,6 @@ Screen_Bounds :: struct #align(16) {
 }
 
 init :: proc() {
-    basic_app.instances_in_use = 32
-
     basic_app.camera = nuppu.Camera {
         position = {0, 0, CAMERA_Z},
         near = 0.01,
@@ -112,37 +107,44 @@ init :: proc() {
         aspect_ratio = f32(SCENE_WIDTH) / f32(SCENE_HEIGHT),
     }
 
-    // Default_Renderer owns the mesh / vertex / index arenas. We just push the
-    // single cube mesh that the offscreen scene will instance.
+    // Default_Renderer owns the mesh / vertex / index arenas. We push two
+    // meshes: a high-poly bunny (loaded from OBJ) and a unit cube, both of
+    // which get their own slot in the GPU's Mesh array. The offscreen scene
+    // only instances the cube — the bunny upload is here purely to prove the
+    // multi-mesh upload path works (i.e. mesh_id=1 reads cube data and not
+    // the bunny's).
     nuppu.dr_init()
-    
+
     bunny_mesh_obj, _ := nuppu.mesh_load_from_obj(fmt.tprintf("%v%v", #directory, "bunny.obj"), context.temp_allocator)
     defer nuppu.mesh_destroy(&bunny_mesh_obj, context.temp_allocator)
-    bunny_mesh := nuppu.dr_push_mesh(bunny_mesh_obj.positions, bunny_mesh_obj.indices, bunny_mesh_obj.uvs)
-    
-    cube_mesh := nuppu.dr_push_mesh(nuppu.UNIT_CUBE_VERTICES, nuppu.UNIT_CUBE_INDICES, nuppu.UNIT_CUBE_TEXCOORDS)
+    bunny_mesh := nuppu.dr_push_mesh(bunny_mesh_obj.positions, bunny_mesh_obj.indices, bunny_mesh_obj.uvs, bunny_mesh_obj.normals)
 
+    cube_mesh := nuppu.dr_push_mesh(nuppu.UNIT_CUBE_VERTICES, nuppu.UNIT_CUBE_INDICES, nuppu.UNIT_CUBE_TEXCOORDS, nuppu.UNIT_CUBE_NORMALS)
 
-    b_impl := nuppu.resource_library_get(&nuppu.dr.meshes, bunny_mesh)
-    c_impl := nuppu.resource_library_get(&nuppu.dr.meshes, cube_mesh)
+    _ = handle_map.static_add(&basic_app.things, Thing{
+        position = {2, 0, 0},
+        rotation_eular = {0, 0, 180},
+        scale = {1, 1, 1} * 5,
+        is_alive = true,
+        mesh = bunny_mesh,
+    })
 
-    log.info("FROM INIT")
-    log.info("BUNNY SLOT: ", b_impl.slot_in_buffer, " MESH: ",  b_impl.mesh)
-    log.info("CUBE SLOT: ", c_impl.slot_in_buffer, " MESH: ",  c_impl.mesh)
-
-    player = handle_map.static_add(&basic_app.things, Thing{
-        position = {0, 0, 0},
+    _ = handle_map.static_add(&basic_app.things, Thing{
+        position = {-2, 0, 0},
         rotation_eular = {0, 0, 0},
+        scale = {1, 1, 1},
         is_alive = true,
         mesh = cube_mesh,
     })
 
-    a := handle_map.static_add(&basic_app.things, Thing{
-        position = {2, 0, 0},
+    _ = handle_map.static_add(&basic_app.things, Thing{
+        position = {4, 0, 0},
         rotation_eular = {0, 0, 0},
-        is_alive = false,
-        mesh = cube_mesh,
+        scale = {1, 1, 1} * 5,
+        is_alive = true,
+        mesh = bunny_mesh,
     })
+
 
     // Shaders for the offscreen scene.
     basic_app.scene_v_shader = nuppu.shader_init(#load("2-primitive.metal", []u8), "vertexMain", .Vertex)
@@ -230,11 +232,9 @@ update :: proc() {
     angle += nuppu.delta_time_f32() * 2
 
     iter := handle_map.static_iterator_make(&basic_app.things)
-    for thing, handle in handle_map.iterate(&iter) {
+    for thing, _ in handle_map.iterate(&iter) {
         thing.rotation_eular.y = angle
-        thing.position.y = math.sin(angle * 0.4) * 3
     }
-    //player_thing.position.x += 0.01 * nuppu.delta_time_f32()
 }
 
 // Compute everything the screen pass needs to draw a letterboxed, aspect-
@@ -259,24 +259,27 @@ compute_screen_layout :: proc(window_w, window_h: i32) -> Screen_Layout {
     scene_aspect  := f32(SCENE_WIDTH) / f32(SCENE_HEIGHT)
 
     ndc_x, ndc_y: f32
-    scissor_x, scissor_y, scissor_w, scissor_h: i32
+    scissor_w, scissor_h: i32
+    scissor_x, scissor_y: i32
 
     if window_aspect > scene_aspect {
-        // Pillarbox: scene fills the full height, narrower than window.
+        // Pillarbox: scene fills the full height; width is the height scaled
+        // to preserve the scene's aspect ratio.
         ndc_x = scene_aspect / window_aspect
         ndc_y = 1.0
-        scissor_w = window_h  // full height
         scissor_h = window_h
-        scissor_x = (window_w - scissor_w) / 2  // centered horizontally
+        scissor_w = i32(f32(window_h) * scene_aspect)
+        scissor_x = (window_w - scissor_w) / 2
         scissor_y = 0
     } else {
-        // Letterbox: scene fills the full width, shorter than window.
+        // Letterbox: scene fills the full width; height is the width scaled
+        // to preserve the scene's aspect ratio.
         ndc_x = 1.0
         ndc_y = window_aspect / scene_aspect
-        scissor_w = window_w  // full width
-        scissor_h = window_w  // square height matching width, aspect-preserved
+        scissor_w = window_w
+        scissor_h = i32(f32(window_w) / scene_aspect)
         scissor_x = 0
-        scissor_y = (window_h - scissor_h) / 2  // centered vertically
+        scissor_y = (window_h - scissor_h) / 2
     }
 
     return Screen_Layout {
@@ -291,29 +294,12 @@ compute_screen_layout :: proc(window_w, window_h: i32) -> Screen_Layout {
     }
 }
 
-// cmd_begin_render_pass
-// cmd_set_pipeline
-// cmd_set_depth_stencil_state
-// cmd_use_resources
-// gpu_temp_malloc (Shader_Data, buffer 0)
-// gpu_temp_malloc (camera_data, buffer 1)
-// cmd_set_cull_mode
-// cmd_set_front_face_winding
-// cmd_draw_indiced_primitives
-// cmd_end_render_pass
-
-Draw_Set :: struct {
-    buckets: [dynamic]Draw_Bucket,
-}
-
-Draw_Bucket :: struct {}
-
-// You must not modify prev or curr in render or planet will explode..
+// You must not modify prev or curr in render or planet will explode.
 render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nuppu.Frame_Pass) {
     cam := nuppu.update_camera(prev.camera, curr.camera, alpha)
     cam_data := nuppu.camera_data(cam, {0, 0, 0})
-    
-    staged := nuppu.gpu_arena_alloc(arena, nuppu.Instance, curr.things.used_len) // used_len = how many in use currently
+
+    staged := nuppu.gpu_arena_alloc(arena, nuppu.Instance, curr.things.used_len) // pre-allocate for the worst case (all slots occupied)
     staged_idx: int
 
     curr_things := handle_map.static_iterator_make(&curr.things)
@@ -323,9 +309,10 @@ render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
         if handle.gen != prev_thing.handle.gen do continue
 
         position := math.lerp(prev_thing.position, thing.position, alpha)
-        rotation := nuppu.lerp_rotation(prev_thing.rotation_eular, thing.rotation_eular, alpha)
-        to_world := glm.mat4Translate(position) * rotation
-                
+        rotation := nuppu.lerp_rotation(prev_thing.rotation_eular * math.RAD_PER_DEG, thing.rotation_eular * math.RAD_PER_DEG, alpha)
+        scale := math.lerp(prev_thing.scale, thing.scale, alpha)
+        to_world := glm.mat4Translate(position) * glm.mat4Scale(scale) * rotation
+
         mesh_impl := nuppu.resource_library_get(&nuppu.dr.meshes, thing.mesh)
         inst := nuppu.Instance {
             transform = to_world,
@@ -337,7 +324,6 @@ render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
         staged_idx += 1
     }
 
-    // 1, 1
     instance_slice := slice.from_ptr((^nuppu.Instance)(staged.cpu), staged_idx)
     sort.heap_sort_proc(instance_slice[:], proc(a, b: nuppu.Instance) -> int {
         return int(a.mesh_id) - int(b.mesh_id)
@@ -375,6 +361,7 @@ render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
         meshes           = (^nuppu.Mesh)(nuppu.dr.mesh_data.gpu),
         vertex_positions = (^nuppu.Vertex_Position)(nuppu.dr.vertex_positions_data.gpu),
         vertex_uvs       = (^nuppu.Vertex_UV)(nuppu.dr.vertex_uvs_data.gpu),
+        vertex_normals   = (^nuppu.Vertex_Normal)(nuppu.dr.vertex_normals_data.gpu),
     }
     nuppu.gpu_temp_malloc(cmds, slice.bytes_from_ptr(&shader_data, size_of(nuppu.Shader_Data)), 0, .Vertex)
 
@@ -403,9 +390,7 @@ render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
         }
         mesh :nuppu.Mesh= nuppu.dr.slot_to_mesh[mesh_idx]
 
-        log.info("DRAWING MESH: ", mesh_idx, " MESH: ",  mesh)
-
-        nuppu.cmd_draw_indiced_primitives(cmds, .Triangle, nuppu.dr.index_data, u32(mesh.index_range.length), u32(mesh.index_range.location), u32(j - i))
+        nuppu.cmd_draw_indiced_primitives(cmds, .Triangle, nuppu.dr.index_data, mesh.index_range.length, mesh.index_range.location, u32(j - i), u32(i))
 
         i = j
     }

@@ -141,7 +141,7 @@ GPU_API :: struct #all_or_none {
 
     cmd_use_resources: proc(command_buffer: Command_Buffer, resource_list: []Shader_Resource),
     cmd_draw_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32),
-    cmd_draw_indiced_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32),
+    cmd_draw_indiced_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_instance: u32),
 
     cmd_set_scissor_rect: proc(command_buffer: Command_Buffer, x, y, width, height: u32),
 
@@ -643,8 +643,25 @@ cmd_draw_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive
     state.api.cmd_draw_primitives(command_buffer, primitive, vertex_count, vertex_start)
 }
 
-cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32 = 1) {
-    state.api.cmd_draw_indiced_primitives(command_buffer, primitive, index_buffer, index_count, index_offset, instance_count)
+// Issues an indexed draw on the active render command encoder.
+//
+// `index_count` is in indices (i.e. the number of indices to consume).
+// `index_offset` is ALSO in indices — it's the starting index into `index_buffer`,
+// matching `Mesh.index_range.location` from the Default_Renderer. The backend
+// converts this to bytes internally. Defaults to 0 (start of buffer).
+//
+// `instance_count` is the number of instances to draw. Defaults to 1
+// (non-instanced).
+//
+// `base_instance` is the starting instance index (added to `instance_id` in
+// the shader). Defaults to 0 (instance_id starts at 0). Set this when batching
+// instances across multiple draws — pass the absolute offset of this batch's
+// first instance in the instance buffer.
+//
+// Caller must ensure no other command is currently encoding draws and that
+// the index buffer has `index_offset + index_count` valid indices remaining.
+cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32 = 0, instance_count: u32 = 1, base_instance: u32 = 0) {
+    state.api.cmd_draw_indiced_primitives(command_buffer, primitive, index_buffer, index_count, index_offset, instance_count, base_instance)
 }
 
 // Sets the GPU scissor rectangle for subsequent draw calls on this command

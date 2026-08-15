@@ -817,17 +817,24 @@ MTL_cmd_set_buffers :: proc(command_buffer: Command_Buffer, buffers: []ptr, offs
     }
 }
 
-MTL_cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32) {
+MTL_cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_instance: u32 = 0) {
     if instance_count == 0 {
         return
     }
 
     buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
     index_buffer := (^MTL.Buffer)(index_buffer._data)
-    
+
+    // `index_offset` is in indices (matches `index_count`). Metal's
+    // indexBufferOffset is in bytes, so scale to bytes here. Forgetting this
+    // conversion looks like the renderer "drawing the wrong mesh" — Metal
+    // silently reads indices starting at byte N instead of index N, which
+    // lands inside the previous mesh's index range.
+    byte_offset := NS.UInteger(index_offset) * NS.UInteger(size_of(u32))
+
     buffer_impl.render_command_encoder->drawIndexPrimitivesWithBaseVertex(
         mtl_primitive_type_interop[primitive], NS.UInteger(index_count), MTL.IndexType.UInt32,
-        index_buffer, NS.UInteger(index_offset), NS.UInteger(instance_count), 0, 0
+        index_buffer, byte_offset, NS.UInteger(instance_count), 0, NS.UInteger(base_instance)
     )
 }
 
@@ -894,9 +901,13 @@ texture_index_pair :: struct {
     index: u32,
 }
 
+// `Range` MUST match the Metal struct exactly: two 32-bit fields, total 8
+// bytes. Do NOT use `uint` here — it's 64-bit on macOS ARM64, which makes
+// each Range 16 bytes and silently breaks the Mesh struct layout (the
+// shader would read the wrong fields).
 Range :: struct {
-    location: uint,
-    length: uint,
+    location: u32,
+    length:  u32,
 }
 
 MTL_cmd_set_textures :: proc(command_buffer: Command_Buffer, textures: []Texture, range: Range, stage: Shader_Stage) {

@@ -1,25 +1,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#define u8 uchar;
-#define u16 ushort;
-#define u32 uint;
-
-#define i8 char;
-#define i16 short;
-#define i32 int;
-
-#define f16 half;
-#define f32 float;
-
 struct v2f {
-    float4 position [[position]]; // vertex position
-    half3 color;                  // vertex color
+    float4 position [[position]];
+    half3 color;
     float2 uvs;
-};
-
-struct Vertex {
-    packed_float3 position;
 };
 
 struct alignas(16) Instance {
@@ -36,36 +21,26 @@ struct Range {
 struct alignas(16) Mesh {
     Range vertex_pos_range;
     Range vertex_uv_range;
+    Range vertex_normal_range;
     Range index_range;
 };
 
 struct alignas(16) Data {
     const device Instance* instances;
     const device Mesh* meshes;
-    const device uint* indices;
     const device packed_float3* vertex_positions;
     const device packed_float2* vertex_uvs;
+    const device packed_float3* vertex_normals;
 };
 
-struct alignas(16) CameraData
-{
+struct alignas(16) CameraData {
     float4x4 to_clip;
     float4x4 to_view;
 };
 
-float4 unpack_color(uint c) {
-    return float4(
-        float((c >> 24) & 0xFFu),
-        float((c >> 16) & 0xFFu),
-        float((c >>  8) & 0xFFu),
-        float( c        & 0xFFu)
-    ) / 255.0;
-}
-
 v2f vertex vertexMain(
     uint vertexID  [[vertex_id]],
     uint instanceID [[instance_id]],
-    uint v [[base_vertex]],
     device const Data* data [[buffer(0)]],
     device const CameraData& cameraData [[buffer(1)]]
 ) {
@@ -81,7 +56,8 @@ v2f vertex vertexMain(
     pos = cameraData.to_clip * cameraData.to_view * pos;
     o.position = pos;
 
-    // float4 vColorUnpacked = unpack_color(instance.color);
+    const device packed_float3& vertex_normal = data->vertex_normals[mesh.vertex_normal_range.location + vertexID];
+
     o.color = half3(1);
 
     const device packed_float2& vertex_uv = data->vertex_uvs[mesh.vertex_uv_range.location + vertexID];
