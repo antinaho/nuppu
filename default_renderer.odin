@@ -16,6 +16,8 @@ Default_Renderer :: struct {
 
     meshes: Resource_Library(128, Mesh_Impl, Mesh_Handle),
     slot_to_mesh: [128]Mesh,
+
+    instances_dirty: bool,
 }
 
 Mesh_Impl :: struct {
@@ -63,6 +65,8 @@ dr_deinit :: proc() {
 }
 
 dr_push_mesh :: proc(verts: []Vertex_Position, indices: []u32, uvs: []Vertex_UV, normals: []Vertex_Normal) -> Mesh_Handle {
+    dr.instances_dirty = true
+
     vertex_pos_gpu := gpu_arena_alloc(&dr.vertex_positions_data, Vertex_Position, len(verts))
     vertex_pos_upload := gpu_malloc(Vertex_Position, len(verts), Memory.CPU_GPU)
     gpu_ptr_fill_slice(vertex_pos_upload, verts)
@@ -167,13 +171,12 @@ Shader_Data :: struct #align(16) #all_or_none {
 
 Instance :: struct #align(16) {
     transform: matrix[4, 4]f32,
-    uv_: [4]f32,
     mesh_id: u32,
 }
 
 Mesh :: struct #align(16) {
     vertex_position_range: Range,
-    vertex_uv_range: Range,
     vertex_normal_range: Range,
+    vertex_uv_range: Range,
     index_range: Range,
 }

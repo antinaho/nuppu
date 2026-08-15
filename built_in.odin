@@ -517,5 +517,42 @@ mesh_load_from_obj :: proc(path: string, allocator: mem.Allocator) -> (mesh: OBJ
 	mesh.normals   = vert_normals[:]
 	mesh.uvs       = vert_uvs[:]
 	mesh.indices   = findices[:]
+
+	// If the OBJ had no `vn` lines, vert_normals is all zeros. Compute smooth
+	// vertex normals from the indexed triangles: each vertex accumulates the
+	// unnormalized face normal of every triangle it belongs to, then we
+	// normalize at the end. Produces correct smooth shading for meshes like
+	// the Stanford bunny that ship positions+faces only.
+	if len(normals) == 0 && len(findices) >= 3 {
+		for i := 0; i + 2 < len(findices); i += 3 {
+			i0, i1, i2 := findices[i], findices[i+1], findices[i+2]
+			p0 := vert_positions[i0]
+			p1 := vert_positions[i1]
+			p2 := vert_positions[i2]
+
+			// Face normal (unnormalized, magnitude = 2 * triangle area).
+			e1 := p1 - p0
+			e2 := p2 - p0
+			n  := [3]f32{
+				e1.y * e2.z - e1.z * e2.y,
+				e1.z * e2.x - e1.x * e2.z,
+				e1.x * e2.y - e1.y * e2.x,
+			}
+
+			vert_normals[i0] += n
+			vert_normals[i1] += n
+			vert_normals[i2] += n
+		}
+		for i in 0 ..< len(vert_normals) {
+			v := vert_normals[i]
+			l := math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
+			if l > 0 {
+				inv := 1.0 / l
+				vert_normals[i] = [3]f32{v.x * inv, v.y * inv, v.z * inv}
+			}
+		}
+		mesh.normals = vert_normals[:]
+	}
+
 	return mesh, nil
 }

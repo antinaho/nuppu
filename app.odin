@@ -26,11 +26,24 @@ DT_TARGET_NS_F64 :: DT_TARGET_S_F64 * f64(time.Second)
 
 RENDER_FRAMES_IN_FLIGHT :: 3
 
+Application :: struct {
+    track: mem.Tracking_Allocator
+}
+
+@(private="file")
+application: ^Application
+
+app_deinit :: proc() {
+    free(application)
+}
+
 app_init :: proc(
     desc: App_Desc($T),
     app_state: ^^T,
     config: App_Config,
 ) {
+    application = new(Application)
+
 when ODIN_DEBUG && ODIN_OS == .Darwin {
     os.set_env("MTL_DEBUG_LAYER", "1") // API validation
     os.set_env("MTL_SHADER_VALIDATION", "1") // Shader validation
@@ -38,11 +51,12 @@ when ODIN_DEBUG && ODIN_OS == .Darwin {
     os.set_env("MTL_HUD_ENABLED", "1") // HUD (performance counters)
     os.set_env("OBJC_DEBUG_MISSING_POOLS", "YES") // Track missing autorelease pools
 }
+    defer app_deinit()
     defer app_print_tracking()
     
     when ODIN_DEBUG {
-		mem.tracking_allocator_init(&track, context.allocator)
-		context.allocator = mem.tracking_allocator(&track)
+		mem.tracking_allocator_init(&application.track, context.allocator)
+		context.allocator = mem.tracking_allocator(&application.track)
 	}
 
     logger := log.create_console_logger()
@@ -127,19 +141,19 @@ when ODIN_DEBUG && ODIN_OS == .Darwin {
     }
 }
 
-track: mem.Tracking_Allocator
+
 app_print_tracking :: proc() {
-    if len(track.allocation_map) > 0 {
-        fmt.eprintf("=== %v allocations not freed: ===\n", len(track.allocation_map))
-        for _, entry in track.allocation_map {
+    if len(application.track.allocation_map) > 0 {
+        fmt.eprintf("=== %v allocations not freed: ===\n", len(application.track.allocation_map))
+        for _, entry in application.track.allocation_map {
             fmt.eprintf("- %v bytes @ %v\n", entry.size, entry.location)
         }
     }
-    if len(track.bad_free_array) > 0 {
-        fmt.eprintf("=== %v incorrect frees: ===\n", len(track.bad_free_array))
-        for entry in track.bad_free_array {
+    if len(application.track.bad_free_array) > 0 {
+        fmt.eprintf("=== %v incorrect frees: ===\n", len(application.track.bad_free_array))
+        for entry in application.track.bad_free_array {
             fmt.eprintf("- %p @ %v\n", entry.memory, entry.location)
         }
     }
-    mem.tracking_allocator_destroy(&track)
+    mem.tracking_allocator_destroy(&application.track)
 }

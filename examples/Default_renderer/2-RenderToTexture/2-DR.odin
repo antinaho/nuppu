@@ -9,6 +9,7 @@ import glm "core:math/linalg/glsl"
 import "core:fmt"
 import "core:sort"
 import "core:log"
+import "core:math/rand"
 
 // 2-RenderToTexture
 //
@@ -35,14 +36,6 @@ import "core:log"
 //   * Mini-maps / viewfinder style UI (render at native size, scale up)
 //   * Post-processing pipelines (sample the offscreen target in another shader)
 //   * Save-to-file workflows (read the offscreen target back to CPU)
-//
-// The library also exposes `cmd_blit_texture` for the simpler 1:1 byte-copy
-// case; this example focuses on the stretched-sampling variant because
-// that's the only way to actually fill the swapchain from a small target.
-//
-// We deliberately reuse the Default_Renderer (`dr_init`, `dr_push_mesh`) so
-// the focus is on the render-target + fullscreen-triangle workflow rather
-// than mesh plumbing.
 
 basic_app: ^Basic
 
@@ -74,19 +67,18 @@ Basic :: struct {
 Thing_Handle :: distinct handle_map.Handle64
 Thing :: struct {
     handle: Thing_Handle,
+
     position: [3]f32,
     rotation_eular: [3]f32,
     scale: [3]f32,
 
     mesh: nuppu.Mesh_Handle,
-
-    is_alive: bool,
 }
 
 
 SCENE_WIDTH  :: 512 * 2 + 200
 SCENE_HEIGHT :: 512 * 2
-CAMERA_Z     :: -4.25
+CAMERA_Z     :: -5
 
 // Screen-bounds uniform passed to the screen vertex shader. The shader maps
 // the fullscreen triangle's NDC positions into UV space using these bounds,
@@ -107,12 +99,6 @@ init :: proc() {
         aspect_ratio = f32(SCENE_WIDTH) / f32(SCENE_HEIGHT),
     }
 
-    // Default_Renderer owns the mesh / vertex / index arenas. We push two
-    // meshes: a high-poly bunny (loaded from OBJ) and a unit cube, both of
-    // which get their own slot in the GPU's Mesh array. The offscreen scene
-    // only instances the cube — the bunny upload is here purely to prove the
-    // multi-mesh upload path works (i.e. mesh_id=1 reads cube data and not
-    // the bunny's).
     nuppu.dr_init()
 
     bunny_mesh_obj, _ := nuppu.mesh_load_from_obj(fmt.tprintf("%v%v", #directory, "bunny.obj"), context.temp_allocator)
@@ -121,37 +107,23 @@ init :: proc() {
 
     cube_mesh := nuppu.dr_push_mesh(nuppu.UNIT_CUBE_VERTICES, nuppu.UNIT_CUBE_INDICES, nuppu.UNIT_CUBE_TEXCOORDS, nuppu.UNIT_CUBE_NORMALS)
 
-    _ = handle_map.static_add(&basic_app.things, Thing{
-        position = {2, 0, 0},
-        rotation_eular = {0, 0, 180},
-        scale = {1, 1, 1} * 5,
-        is_alive = true,
-        mesh = bunny_mesh,
-    })
+    for i in 0 ..< 9 {
+        column := i % 3
+        row := i / 3
 
-    _ = handle_map.static_add(&basic_app.things, Thing{
-        position = {-2, 0, 0},
-        rotation_eular = {0, 0, 0},
-        scale = {1, 1, 1},
-        is_alive = true,
-        mesh = cube_mesh,
-    })
+        _ = handle_map.static_add(&basic_app.things, Thing{
+            position = {-2.5 + f32(column) * 2.5, -2.5 + f32(row) * 2.5 + 1.5, 0},
+            rotation_eular = {0, 0, 180},
+            scale = {1, 1, 1} * 12,
+            mesh = bunny_mesh,
+        })
+    }
 
-    _ = handle_map.static_add(&basic_app.things, Thing{
-        position = {4, 0, 0},
-        rotation_eular = {0, 0, 0},
-        scale = {1, 1, 1} * 5,
-        is_alive = true,
-        mesh = bunny_mesh,
-    })
-
-
-    // Shaders for the offscreen scene.
     basic_app.scene_v_shader = nuppu.shader_init(#load("2-primitive.metal", []u8), "vertexMain", .Vertex)
     basic_app.scene_f_shader = nuppu.shader_init(#load("2-primitive.metal", []u8), "fragmentMain", .Fragment)
 
     // Pipeline pixel format MUST match the render target's pixel format (the
-    // first Color_Attachment format below). We use .BGRA8Unorm_sRGB to match
+    // first Color_Attachment format below). .BGRA8Unorm_sRGB to match
     // the swapchain so the screen pass can sample it without format conversion.
     basic_app.scene_pipeline = nuppu.pipeline_init(
         basic_app.scene_v_shader,
@@ -167,30 +139,21 @@ init :: proc() {
         }
     )
 
-    // Create the offscreen render target.
     basic_app.scene_color = nuppu.texture_init(
         {
             dimensions = {SCENE_WIDTH, SCENE_HEIGHT},
             format = .BGRA8Unorm_sRGB,
             texture_type = .Type2D,
             storage_mode = .Private,
-            // RenderTarget so we can write into it during the offscreen pass.
-            // ShaderRead so the screen pass can sample it (nearest filtering).
             usage = {.RenderTarget, .ShaderRead},
         }
     )
 
     basic_app.scene_depth = nuppu.texture_depth_init({SCENE_WIDTH, SCENE_HEIGHT}, .Depth32Float)
 
-    // Shaders for the screen pass. They live in the same .metal source file
-    // as the offscreen scene shaders — Metal libraries hold multiple
-    // functions, and we look them up by entry-point name.
     basic_app.screen_v_shader = nuppu.shader_init(#load("2-primitive.metal", []u8), "screenVertexMain", .Vertex)
     basic_app.screen_f_shader = nuppu.shader_init(#load("2-primitive.metal", []u8), "screenFragmentMain", .Fragment)
 
-    // Screen pipeline: same pixel format as the swapchain, NO depth attachment.
-    // Depth format `.Invalid` (which maps to MTL.PixelFormat.Invalid) signals
-    // "no depth" to the pipeline state.
     basic_app.screen_pipeline = nuppu.pipeline_init(
         basic_app.screen_v_shader,
         basic_app.screen_f_shader,
@@ -198,11 +161,6 @@ init :: proc() {
         .Invalid,
     )
 
-    // Sanity check: the new texture_format() and texture_type() APIs confirm
-    // at runtime that the offscreen color target has the properties we need:
-    //   - .BGRA8Unorm_sRGB: matches the swapchain so the screen sampler sees
-    //                       the same colours as the swapchain expects.
-    //   - .Type2D: the screen pipeline samples with a 2D texture sampler.
     offscreen_format := nuppu.texture_format(basic_app.scene_color)
     assert(offscreen_format == .BGRA8Unorm_sRGB,
            "scene_color must be .BGRA8Unorm_sRGB so the screen pass samples correct colours")
@@ -229,7 +187,7 @@ deinit :: proc() {
 
 update :: proc() {
     @static angle: f32
-    angle += nuppu.delta_time_f32() * 2
+    angle += nuppu.delta_time_f32() * 5
 
     iter := handle_map.static_iterator_make(&basic_app.things)
     for thing, _ in handle_map.iterate(&iter) {
@@ -294,23 +252,25 @@ compute_screen_layout :: proc(window_w, window_h: i32) -> Screen_Layout {
     }
 }
 
-// You must not modify prev or curr in render or planet will explode.
+// You MUST NOT modify prev or curr in render or planet will explode.
 render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nuppu.Frame_Pass) {
     cam := nuppu.update_camera(prev.camera, curr.camera, alpha)
     cam_data := nuppu.camera_data(cam, {0, 0, 0})
 
-    staged := nuppu.gpu_arena_alloc(arena, nuppu.Instance, curr.things.used_len) // pre-allocate for the worst case (all slots occupied)
+    staged := nuppu.gpu_arena_alloc(arena, nuppu.Instance, curr.things.used_len)
     staged_idx: int
 
-    curr_things := handle_map.static_iterator_make(&curr.things)
-    for thing, handle in handle_map.iterate(&curr_things) {
+    // Interpolate position and rotation of every thing
+    curr_things_iter := handle_map.static_iterator_make(&curr.things)
+    for thing, handle in handle_map.iterate(&curr_things_iter) {
         // Compare against stale handle
         prev_thing := prev.things.items[handle.idx]
-        if handle.gen != prev_thing.handle.gen do continue
+        if handle != prev_thing.handle do continue
 
         position := math.lerp(prev_thing.position, thing.position, alpha)
         rotation := nuppu.lerp_rotation(prev_thing.rotation_eular * math.RAD_PER_DEG, thing.rotation_eular * math.RAD_PER_DEG, alpha)
         scale := math.lerp(prev_thing.scale, thing.scale, alpha)
+        
         to_world := glm.mat4Translate(position) * glm.mat4Scale(scale) * rotation
 
         mesh_impl := nuppu.resource_library_get(&nuppu.dr.meshes, thing.mesh)
@@ -319,15 +279,18 @@ render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
             mesh_id = mesh_impl.slot_in_buffer,
         }
 
+        // Prob some easier way of doing this..
         cpu_ptr := uintptr((^nuppu.Instance)(staged.cpu)) + uintptr(staged_idx * size_of(nuppu.Instance))
         mem.copy(rawptr(cpu_ptr), &inst, size_of(nuppu.Instance))
         staged_idx += 1
     }
 
     instance_slice := slice.from_ptr((^nuppu.Instance)(staged.cpu), staged_idx)
-    sort.heap_sort_proc(instance_slice[:], proc(a, b: nuppu.Instance) -> int {
-        return int(a.mesh_id) - int(b.mesh_id)
-    })
+    if nuppu.dr.instances_dirty {
+        sort.heap_sort_proc(instance_slice[:], proc(a, b: nuppu.Instance) -> int {
+            return int(a.mesh_id) - int(b.mesh_id)
+        })
+    }
 
     dest := nuppu.dr.instances_gpu[pass.value % nuppu.RENDER_FRAMES_IN_FLIGHT]
 
@@ -364,7 +327,6 @@ render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
         vertex_normals   = (^nuppu.Vertex_Normal)(nuppu.dr.vertex_normals_data.gpu),
     }
     nuppu.gpu_temp_malloc(cmds, slice.bytes_from_ptr(&shader_data, size_of(nuppu.Shader_Data)), 0, .Vertex)
-
     nuppu.gpu_temp_malloc(cmds, slice.bytes_from_ptr(&cam_data, size_of(nuppu.Camera_Data)), 1, .Vertex)
 
     nuppu.cmd_set_pipeline(cmds, curr.scene_pipeline)
@@ -377,6 +339,7 @@ render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
         {nuppu.dr.mesh_data,             {.Read}, {.Vertex}},
         {nuppu.dr.vertex_positions_data, {.Read}, {.Vertex}},
         {nuppu.dr.vertex_uvs_data,       {.Read}, {.Vertex}},
+        {nuppu.dr.vertex_normals_data,   {.Read}, {.Vertex}},
         {dest,                     {.Read}, {.Vertex}},
     })
 

@@ -1,27 +1,27 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct v2f {
-    float4 position [[position]];
-    half3 color;
-    float2 uvs;
-};
-
-struct alignas(16) Instance {
-    float4x4 transform;
-    float4 uv_rect;
-    uint mesh_id;
-};
-
 struct Range {
     uint location;
     uint length;
 };
 
+struct v2f {
+    float4 position [[position]];
+    half3 color;
+    float2 uvs;
+    float3 normal;
+};
+
+struct alignas(16) Instance {
+    float4x4 transform;
+    uint mesh_id;
+};
+
 struct alignas(16) Mesh {
     Range vertex_pos_range;
-    Range vertex_uv_range;
     Range vertex_normal_range;
+    Range vertex_uv_range;
     Range index_range;
 };
 
@@ -37,6 +37,14 @@ struct alignas(16) CameraData {
     float4x4 to_clip;
     float4x4 to_view;
 };
+
+static float4 unpack_rgba(uint packed) {
+    float r = float((packed >> 24) & 0xFFu) / 255.0;
+    float g = float((packed >> 16) & 0xFFu) / 255.0;
+    float b = float((packed >>  8) & 0xFFu) / 255.0;
+    float a = float( packed        & 0xFFu) / 255.0;
+    return float4(r, g, b, a);
+}
 
 v2f vertex vertexMain(
     uint vertexID  [[vertex_id]],
@@ -57,17 +65,32 @@ v2f vertex vertexMain(
     o.position = pos;
 
     const device packed_float3& vertex_normal = data->vertex_normals[mesh.vertex_normal_range.location + vertexID];
+    float3 normal = instance.transform.columns[0].xyz * vertex_normal.x
+                   + instance.transform.columns[1].xyz * vertex_normal.y
+                   + instance.transform.columns[2].xyz * vertex_normal.z;
+    normal = cameraData.to_view.columns[0].xyz * normal.x
+           + cameraData.to_view.columns[1].xyz * normal.y
+           + cameraData.to_view.columns[2].xyz * normal.z;
+    o.normal = normal;
 
-    o.color = half3(1);
+    // float4 unpacked_color = unpack_rgba(instance.color);
+    // o.color = half3(unpacked_color.rgb);
+    o.color = half3(1.0);
 
     const device packed_float2& vertex_uv = data->vertex_uvs[mesh.vertex_uv_range.location + vertexID];
-    o.uvs = mix(instance.uv_rect.xy, instance.uv_rect.zw, vertex_uv.xy);
+    // o.uvs = mix(instance.uv_rect.xy, instance.uv_rect.zw, vertex_uv.xy);
+    o.uvs = float2(1.0);
 
     return o;
 }
 
 half4 fragment fragmentMain(v2f in [[stage_in]]) {
-    return half4(in.color, 1.0);
+    float3 l = normalize(float3(1.0, 1.0, 0.8));
+    float3 n = normalize(in.normal);
+
+    float ndotl = saturate(dot(n, l));
+
+    return half4(in.color * 0.1 + in.color * ndotl, 1.0);
 }
 
 // ---------------------------------------------------------------------------
