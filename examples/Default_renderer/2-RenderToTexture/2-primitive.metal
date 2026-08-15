@@ -42,6 +42,7 @@ struct alignas(16) Mesh {
 struct alignas(16) Data {
     const device Instance* instances;
     const device Mesh* meshes;
+    const device uint* indices;
     const device packed_float3* vertex_positions;
     const device packed_float2* vertex_uvs;
 };
@@ -64,6 +65,7 @@ float4 unpack_color(uint c) {
 v2f vertex vertexMain(
     uint vertexID  [[vertex_id]],
     uint instanceID [[instance_id]],
+    uint v [[base_vertex]],
     device const Data* data [[buffer(0)]],
     device const CameraData& cameraData [[buffer(1)]]
 ) {
@@ -71,6 +73,7 @@ v2f vertex vertexMain(
 
     const device Instance& instance = data->instances[instanceID];
     const device Mesh& mesh = data->meshes[instance.mesh_id];
+
     const device packed_float3& vertex_position = data->vertex_positions[mesh.vertex_pos_range.location + vertexID];
 
     float4 pos = float4(vertex_position.xyz, 1.0);

@@ -140,8 +140,8 @@ GPU_API :: struct #all_or_none {
     cmd_set_pipeline: proc(command_buffer: Command_Buffer, pipeline: Pipeline),
 
     cmd_use_resources: proc(command_buffer: Command_Buffer, resource_list: []Shader_Resource),
-    cmd_draw_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32),
-    cmd_draw_indiced_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, instance_count: u32),
+    cmd_draw_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32),
+    cmd_draw_indiced_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32),
 
     cmd_set_scissor_rect: proc(command_buffer: Command_Buffer, x, y, width, height: u32),
 
@@ -389,6 +389,11 @@ resource_library_deinit :: proc(library: ^Resource_Library($N, $T, $Handle_T)) {
     library^ = {}
 }
 
+resource_library_iterator_make :: proc(library: ^Resource_Library($N, $T, $Handle_T)) -> handle_map.Static_Handle_Map_Iterator(handle_map.Static_Handle_Map(N, Resource(T, Handle_T), Handle_T)) {
+    result := handle_map.static_iterator_make(&library.resources)
+    return result
+}
+
 // ---------------------------------------------------------------------------
 // Arena
 
@@ -413,7 +418,6 @@ gpu_arena_free_all :: proc(arena: ^GPU_Arena) {
 gpu_arena_alloc :: proc {
     gpu_arena_alloc_typed,
     gpu_arena_alloc_raw,
-    _gpu_arena_alloc_bytes,
 }
 
 gpu_arena_alloc_typed :: proc(arena: ^GPU_Arena, $T: typeid, #any_int count: uint = 1) -> ptr {
@@ -635,12 +639,12 @@ cmd_set_buffers :: proc(command_buffer: Command_Buffer, buffers: []ptr, offsets:
     state.api.cmd_set_buffers(command_buffer, buffers, offsets, range, stage)
 }
 
-cmd_draw_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32) {
-    state.api.cmd_draw_primitives(command_buffer, primitive, vertex_count)
+cmd_draw_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32 = 0) {
+    state.api.cmd_draw_primitives(command_buffer, primitive, vertex_count, vertex_start)
 }
 
-cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, instance_count: u32 = 1) {
-    state.api.cmd_draw_indiced_primitives(command_buffer, primitive, index_buffer, instance_count)
+cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32 = 1) {
+    state.api.cmd_draw_indiced_primitives(command_buffer, primitive, index_buffer, index_count, index_offset, instance_count)
 }
 
 // Sets the GPU scissor rectangle for subsequent draw calls on this command

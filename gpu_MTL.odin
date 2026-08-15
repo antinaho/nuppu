@@ -774,9 +774,9 @@ MTL_use_resources :: proc(command_buffer: Command_Buffer, resource_list: []Shade
     }
 }
 
-MTL_cmd_draw_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32) {
+MTL_cmd_draw_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32 = 0) {
     buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
-    buffer_impl.render_command_encoder->drawPrimitives(mtl_primitive_type_interop[primitive], 0, NS.UInteger(vertex_count))
+    buffer_impl.render_command_encoder->drawPrimitives(mtl_primitive_type_interop[primitive], NS.UInteger(vertex_start), NS.UInteger(vertex_count))
 }
 
 MTL_cmd_set_buffer :: proc(command_buffer: Command_Buffer, buffer: ptr, index: u32, stage: Shader_Stage, offset: uint = 0) {
@@ -817,19 +817,17 @@ MTL_cmd_set_buffers :: proc(command_buffer: Command_Buffer, buffers: []ptr, offs
     }
 }
 
-MTL_cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, instance_count: u32) {
+MTL_cmd_draw_indiced_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32) {
     if instance_count == 0 {
         return
     }
 
     buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
-
     index_buffer := (^MTL.Buffer)(index_buffer._data)
-    index_count := index_buffer->length() / size_of(u32)
-
-    buffer_impl.render_command_encoder->drawIndexedPrimitivesWithInstanceCount(
+    
+    buffer_impl.render_command_encoder->drawIndexPrimitivesWithBaseVertex(
         mtl_primitive_type_interop[primitive], NS.UInteger(index_count), MTL.IndexType.UInt32,
-        index_buffer, 0, NS.UInteger(instance_count)
+        index_buffer, NS.UInteger(index_offset), NS.UInteger(instance_count), 0, 0
     )
 }
 

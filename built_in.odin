@@ -1,6 +1,11 @@
 package nuppu
 
+import "core:log"
 import "core:math"
+import "core:mem"
+import "core:os"
+import "core:strconv"
+import "core:strings"
 import glm "core:math/linalg/glsl"
 
 // ---------------------------------------------------------------------------
@@ -194,32 +199,130 @@ lerp_rotation :: proc(prev, curr: [3]f32, alpha: f32) -> matrix[4, 4]f32 {
 // ---------------------------------------------------------------------------
 // OBJ loader
 
-import "core:log"
-import "core:os"
-import "core:strings"
-import "core:strconv"
-import "core:mem"
-
-Vertex_3D :: struct {
-	position: [3]f32,
-	normal:   [3]f32,
-	uv:       [2]f32,
-}
-
 OBJ_Mesh :: struct {
-	vertices: []Vertex_3D,
-	indices:  []u32,
+	positions: [][3]f32,
+	normals:   [][3]f32,
+	uvs:       [][2]f32,
+	indices:   []u32,
 }
 
 mesh_destroy :: proc(m: ^OBJ_Mesh, allocator: mem.Allocator) {
-	delete(m.vertices, allocator)
+	delete(m.positions, allocator)
+	delete(m.normals, allocator)
+	delete(m.uvs, allocator)
 	delete(m.indices, allocator)
 	m^ = {}
 }
 
+// A single face-vertex reference in the OBJ file. All indices are 1-based as
+// they appear in the OBJ; negative values are pre-resolved to absolute. t and n
+// are 0 when the OBJ reference omitted them (e.g. "1//3" -> {1, 0, 3}).
+Face_Ref :: struct {
+	p, t, n: int,
+}
+
+// Barycentric point-in-triangle test on raw 3D positions. Assumes the three
+// triangle vertices are coplanar (the polygon's vertices generally are, by
+// construction of the ear clipper below).
 @(private)
-abs_int :: proc(x: int) -> int {
-	return x < 0 ? -x : x
+point_in_triangle :: proc(p, a, b, c: [3]f32) -> bool {
+	v0  := c - a
+	v1  := b - a
+	v2  := p - a
+
+	dot00 := glm.dot(v0, v0)
+	dot01 := glm.dot(v0, v1)
+	dot02 := glm.dot(v0, v2)
+	dot11 := glm.dot(v1, v1)
+	dot12 := glm.dot(v1, v2)
+
+	inv_denom := 1.0 / (dot00 * dot11 - dot01 * dot01)
+	u := (dot11 * dot02 - dot01 * dot12) * inv_denom
+	v := (dot00 * dot12 - dot01 * dot02) * inv_denom
+
+	return (u >= 0) && (v >= 0) && (u + v <= 1)
+}
+
+// Triangulates a simple polygon via ear clipping. Correct for non-convex
+// polygons (unlike fan triangulation). The polygon is given by `poly_positions`
+// (in vertex order); `poly_indices` maps each polygon-vertex to its
+// already-deduplicated global vertex index, which is what gets emitted into
+// `into`. Falls back to a single triangle + warning on degenerate input
+// (collinear vertices, self-intersection) so the loader can never loop forever.
+@(private)
+ear_clip_polygon :: proc(poly_positions: [][3]f32, poly_indices: []u32, into: ^[dynamic]u32) {
+	n := len(poly_positions)
+	if n < 3 { return }
+
+	// Plane normal via Newell's method (robust against non-coplanar input).
+	normal: [3]f32
+	for i in 0 ..< n {
+		curr := poly_positions[i]
+		next := poly_positions[(i + 1) % n]
+		normal.x += (curr.y - next.y) * (curr.z + next.z)
+		normal.y += (curr.z - next.z) * (curr.x + next.x)
+		normal.z += (curr.x - next.x) * (curr.y + next.y)
+	}
+	n_len := glm.length(normal)
+	if n_len > 0 { normal /= n_len }
+
+	alive := make([dynamic]int, context.temp_allocator)
+	defer delete(alive)
+	for i in 0 ..< n { append(&alive, i) }
+
+	// Safety cap: O(n^2) iterations is the worst case for ear clipping.
+	safety := n * n + 4
+	for len(alive) > 3 && safety > 0 {
+		safety -= 1
+		found_ear := false
+
+		for ai in 0 ..< len(alive) {
+			prev_i := alive[(ai + len(alive) - 1) % len(alive)]
+			curr_i := alive[ai]
+			next_i := alive[(ai + 1) % len(alive)]
+
+			a := poly_positions[prev_i]
+			b := poly_positions[curr_i]
+			c := poly_positions[next_i]
+
+			// Convex w.r.t. polygon normal?
+			edge1 := b - a
+			edge2 := c - a
+			cross_x := edge1.y * edge2.z - edge1.z * edge2.y
+			cross_y := edge1.z * edge2.x - edge1.x * edge2.z
+			cross_z := edge1.x * edge2.y - edge1.y * edge2.x
+			if cross_x * normal.x + cross_y * normal.y + cross_z * normal.z <= 0 {
+				continue
+			}
+
+			// No other vertex inside triangle (a, b, c)?
+			inside := false
+			for ti in 0 ..< len(alive) {
+				t := alive[ti]
+				if t == prev_i || t == curr_i || t == next_i { continue }
+				if point_in_triangle(poly_positions[t], a, b, c) {
+					inside = true
+					break
+				}
+			}
+			if inside { continue }
+
+			append(into, poly_indices[prev_i], poly_indices[curr_i], poly_indices[next_i])
+			unordered_remove(&alive, ai)
+			found_ear = true
+			break
+		}
+
+		if !found_ear {
+			log.warnf("ear clipping failed (degenerate polygon), emitting first triangle only")
+			append(into, poly_indices[alive[0]], poly_indices[alive[1]], poly_indices[alive[2]])
+			return
+		}
+	}
+
+	if len(alive) == 3 {
+		append(into, poly_indices[alive[0]], poly_indices[alive[1]], poly_indices[alive[2]])
+	}
 }
 
 mesh_load_from_obj :: proc(path: string, allocator: mem.Allocator) -> (mesh: OBJ_Mesh, err: os.Error) {
@@ -229,45 +332,70 @@ mesh_load_from_obj :: proc(path: string, allocator: mem.Allocator) -> (mesh: OBJ
 	}
 	defer delete(data, allocator)
 
-	positions: [dynamic][3]f32
-	uvs:       [dynamic][2]f32
-	normals:   [dynamic][3]f32
-	vertices:  [dynamic]Vertex_3D
-	findices:  [dynamic]u32
+	positions := make([dynamic][3]f32, allocator)
+	uvs       := make([dynamic][2]f32, allocator)
+	normals   := make([dynamic][3]f32, allocator)
+	findices  := make([dynamic]u32, allocator)
+	dedup     := make(map[Face_Ref]u32, allocator)
 	defer {
 		delete(positions)
 		delete(uvs)
 		delete(normals)
+		delete(dedup)
 	}
 
-	parse_face_vertex :: proc(
+	// Parallel vertex arrays: positions[i], normals[i], uvs[i] describe vertex i.
+	// All three stay in lockstep so a single u32 index references all attributes.
+	vert_positions := make([dynamic][3]f32, allocator)
+	vert_normals   := make([dynamic][3]f32, allocator)
+	vert_uvs       := make([dynamic][2]f32, allocator)
+	defer {
+		delete(vert_positions)
+		delete(vert_normals)
+		delete(vert_uvs)
+	}
+
+	// Face_Ref builder from a single "v/vt/vn" token. Returns false if the
+	// position index is invalid (face gets dropped).
+	resolve_ref :: proc(
 		token: string,
 		positions: [dynamic][3]f32,
 		uvs:       [dynamic][2]f32,
 		normals:   [dynamic][3]f32,
-		out: ^Vertex_3D,
-	) -> bool {
-		parts, _ := strings.split(token, "/", context.temp_allocator)
-		defer delete(parts, context.temp_allocator)
+	) -> (ref: Face_Ref, ok: bool) {
+		parts := strings.split(token, "/", context.temp_allocator)
+		if len(parts) == 0 { return {}, false }
 
-		v_idx, v_ok := strconv.parse_int(parts[0])
-		if !v_ok || v_idx == 0 || abs_int(v_idx) > len(positions) { return false }
-		out.position = positions[v_idx > 0 ? v_idx - 1 : len(positions) + v_idx]
+		p_raw, p_ok := strconv.parse_int(parts[0])
+		if !p_ok || p_raw == 0 || math.abs(p_raw) > len(positions) {
+			return {}, false
+		}
+		ref.p = p_raw > 0 ? p_raw : len(positions) + p_raw + 1
 
 		if len(parts) >= 2 && len(parts[1]) > 0 {
-			vt_idx, vt_ok := strconv.parse_int(parts[1])
-			if vt_ok && vt_idx != 0 && abs_int(vt_idx) <= len(uvs) {
-				out.uv = uvs[vt_idx > 0 ? vt_idx - 1 : len(uvs) + vt_idx]
+			if t_raw, t_ok := strconv.parse_int(parts[1]); t_ok {
+				if t_raw != 0 {
+					if math.abs(t_raw) > len(uvs) {
+						log.warnf("malformed vt index in face vertex %q", token)
+					} else {
+						ref.t = t_raw > 0 ? t_raw : len(uvs) + t_raw + 1
+					}
+				}
 			}
 		}
 
 		if len(parts) >= 3 && len(parts[2]) > 0 {
-			vn_idx, vn_ok := strconv.parse_int(parts[2])
-			if vn_ok && vn_idx != 0 && abs_int(vn_idx) <= len(normals) {
-				out.normal = normals[vn_idx > 0 ? vn_idx - 1 : len(normals) + vn_idx]
+			if n_raw, n_ok := strconv.parse_int(parts[2]); n_ok {
+				if n_raw != 0 {
+					if math.abs(n_raw) > len(normals) {
+						log.warnf("malformed vn index in face vertex %q", token)
+					} else {
+						ref.n = n_raw > 0 ? n_raw : len(normals) + n_raw + 1
+					}
+				}
 			}
 		}
-		return true
+		return ref, true
 	}
 
 	line_it := strings.split_lines(string(data), context.temp_allocator)
@@ -275,7 +403,7 @@ mesh_load_from_obj :: proc(path: string, allocator: mem.Allocator) -> (mesh: OBJ
 		trim := strings.trim_space(line)
 		if len(trim) == 0 || trim[0] == '#' { continue }
 
-		fields, _ := strings.split(trim, " ", context.temp_allocator)
+		fields := strings.split(trim, " ", context.temp_allocator)
 		if len(fields) == 0 { continue }
 
 		switch fields[0] {
@@ -335,37 +463,59 @@ mesh_load_from_obj :: proc(path: string, allocator: mem.Allocator) -> (mesh: OBJ
 				break
 			}
 
-			parsed: [dynamic]Vertex_3D
+			// Resolve all face-vertex references, deduplicating as we go.
+			poly_indices   := make([dynamic]u32, context.temp_allocator)
+			poly_positions := make([dynamic][3]f32, context.temp_allocator)
 			all_ok := true
+
 			for i in 1 ..< len(fields) {
-				vtx: Vertex_3D
-				if parse_face_vertex(fields[i], positions, uvs, normals, &vtx) {
-					append(&parsed, vtx)
-				} else {
+				ref, ok := resolve_ref(fields[i], positions, uvs, normals)
+				if !ok {
+					log.warnf("dropping malformed face vertex %q in %s", fields[i], path)
 					all_ok = false
 					break
 				}
+
+				// Position is always valid (resolve_ref checked ref.p).
+				append(&poly_positions, positions[ref.p - 1])
+
+				if existing, found := dedup[ref]; found {
+					append(&poly_indices, existing)
+				} else {
+					new_idx := u32(len(vert_positions))
+					append(&vert_positions, positions[ref.p - 1])
+					if ref.n >= 1 && ref.n <= len(normals) {
+						append(&vert_normals, normals[ref.n - 1])
+					} else {
+						append(&vert_normals, [3]f32{})
+					}
+					if ref.t >= 1 && ref.t <= len(uvs) {
+						append(&vert_uvs, uvs[ref.t - 1])
+					} else {
+						append(&vert_uvs, [2]f32{})
+					}
+					dedup[ref] = new_idx
+					append(&poly_indices, new_idx)
+				}
 			}
-			if !all_ok || len(parsed) < 3 {
+
+			if !all_ok || len(poly_indices) < 3 {
 				log.warnf("dropping degenerate face in %s", path)
-				delete(parsed)
 				continue
 			}
 
-			// Fan-triangulate the polygon.
-			base_idx := u32(len(vertices))
-			append(&vertices, ..parsed[:])
-			for i in 1 ..< len(parsed) - 1 {
-				append(&findices, base_idx)
-				append(&findices, base_idx + u32(i))
-				append(&findices, base_idx + u32(i + 1))
+			// 3-vertex face: trivial triangle.
+			if len(poly_indices) == 3 {
+				append(&findices, poly_indices[0], poly_indices[1], poly_indices[2])
+			} else {
+				ear_clip_polygon(poly_positions[:], poly_indices[:], &findices)
 			}
-			delete(parsed)
 		}
-		delete(fields, context.temp_allocator)
 	}
 
-	mesh.vertices = vertices[:]
-	mesh.indices  = findices[:]
+	mesh.positions = vert_positions[:]
+	mesh.normals   = vert_normals[:]
+	mesh.uvs       = vert_uvs[:]
+	mesh.indices   = findices[:]
 	return mesh, nil
 }

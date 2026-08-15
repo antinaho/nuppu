@@ -8,6 +8,7 @@ import "core:container/handle_map"
 import "core:mem"
 import glm "core:math/linalg/glsl"
 import "core:fmt"
+import "core:sort"
 
 // 2-RenderToTexture
 //
@@ -77,7 +78,8 @@ Thing :: struct {
     handle: Thing_Handle,
     position: [3]f32,
     rotation_eular: [3]f32,
-    mesh_id: u32,
+
+    mesh: nuppu.Mesh_Handle,
     
     is_alive: bool,
 }
@@ -85,9 +87,9 @@ Thing :: struct {
 player: Thing_Handle
 
 
-SCENE_WIDTH  :: 512 * 2
+SCENE_WIDTH  :: 512 * 2 + 200
 SCENE_HEIGHT :: 512 * 2
-CAMERA_Z     :: -3.75
+CAMERA_Z     :: -4.25
 
 // Screen-bounds uniform passed to the screen vertex shader. The shader maps
 // the fullscreen triangle's NDC positions into UV space using these bounds,
@@ -113,25 +115,33 @@ init :: proc() {
     // Default_Renderer owns the mesh / vertex / index arenas. We just push the
     // single cube mesh that the offscreen scene will instance.
     nuppu.dr_init()
-    cube_id := nuppu.dr_push_mesh(nuppu.UNIT_CUBE_VERTICES, nuppu.UNIT_CUBE_INDICES, nuppu.UNIT_CUBE_TEXCOORDS)
     
-    dragon_mesh, _ := nuppu.mesh_load_from_obj(fmt.tprintf("%v%v", #directory, "Dragon.obj"), context.temp_allocator)
-    defer nuppu.mesh_destroy(&dragon_mesh, context.temp_allocator)
+    bunny_mesh_obj, _ := nuppu.mesh_load_from_obj(fmt.tprintf("%v%v", #directory, "bunny.obj"), context.temp_allocator)
+    defer nuppu.mesh_destroy(&bunny_mesh_obj, context.temp_allocator)
+    bunny_mesh := nuppu.dr_push_mesh(bunny_mesh_obj.positions, bunny_mesh_obj.indices, bunny_mesh_obj.uvs)
+    
+    cube_mesh := nuppu.dr_push_mesh(nuppu.UNIT_CUBE_VERTICES, nuppu.UNIT_CUBE_INDICES, nuppu.UNIT_CUBE_TEXCOORDS)
 
-    //dragon_id := nuppu.dr_push_mesh(dragon_mesh.vertices, dragon_mesh.indices, dragon_mesh.uvs)
+
+    b_impl := nuppu.resource_library_get(&nuppu.dr.meshes, bunny_mesh)
+    c_impl := nuppu.resource_library_get(&nuppu.dr.meshes, cube_mesh)
+
+    log.info("FROM INIT")
+    log.info("BUNNY SLOT: ", b_impl.slot_in_buffer, " MESH: ",  b_impl.mesh)
+    log.info("CUBE SLOT: ", c_impl.slot_in_buffer, " MESH: ",  c_impl.mesh)
 
     player = handle_map.static_add(&basic_app.things, Thing{
         position = {0, 0, 0},
         rotation_eular = {0, 0, 0},
         is_alive = true,
-        mesh_id = cube_id,
+        mesh = cube_mesh,
     })
 
     a := handle_map.static_add(&basic_app.things, Thing{
         position = {2, 0, 0},
         rotation_eular = {0, 0, 0},
         is_alive = false,
-        mesh_id = cube_id,
+        mesh = cube_mesh,
     })
 
     // Shaders for the offscreen scene.
@@ -216,22 +226,13 @@ deinit :: proc() {
 }
 
 update :: proc() {
-    player_thing, ok := handle_map.static_get(&basic_app.things, player)
-    if !ok {
-        panic("update: player not found")
-    }
-
     @static angle: f32
-    angle += nuppu.delta_time_f32() * 2.2
-
-    player_thing.rotation_eular.y = angle
+    angle += nuppu.delta_time_f32() * 2
 
     iter := handle_map.static_iterator_make(&basic_app.things)
     for thing, handle in handle_map.iterate(&iter) {
-        if !thing.is_alive {
-            thing.position = math.sin(nuppu.sim_time() * 0.75) * 2
-            thing.position += {2, 0, 2}
-        }
+        thing.rotation_eular.y = angle
+        thing.position.y = math.sin(angle * 0.4) * 3
     }
     //player_thing.position.x += 0.01 * nuppu.delta_time_f32()
 }
@@ -301,7 +302,11 @@ compute_screen_layout :: proc(window_w, window_h: i32) -> Screen_Layout {
 // cmd_draw_indiced_primitives
 // cmd_end_render_pass
 
+Draw_Set :: struct {
+    buckets: [dynamic]Draw_Bucket,
+}
 
+Draw_Bucket :: struct {}
 
 // You must not modify prev or curr in render or planet will explode..
 render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nuppu.Frame_Pass) {
@@ -319,18 +324,24 @@ render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
 
         position := math.lerp(prev_thing.position, thing.position, alpha)
         rotation := nuppu.lerp_rotation(prev_thing.rotation_eular, thing.rotation_eular, alpha)
-        to_world := rotation * 
-                    glm.mat4Translate(position)
-        
+        to_world := glm.mat4Translate(position) * rotation
+                
+        mesh_impl := nuppu.resource_library_get(&nuppu.dr.meshes, thing.mesh)
         inst := nuppu.Instance {
             transform = to_world,
-            mesh_id = thing.mesh_id
+            mesh_id = mesh_impl.slot_in_buffer,
         }
 
         cpu_ptr := uintptr((^nuppu.Instance)(staged.cpu)) + uintptr(staged_idx * size_of(nuppu.Instance))
         mem.copy(rawptr(cpu_ptr), &inst, size_of(nuppu.Instance))
         staged_idx += 1
     }
+
+    // 1, 1
+    instance_slice := slice.from_ptr((^nuppu.Instance)(staged.cpu), staged_idx)
+    sort.heap_sort_proc(instance_slice[:], proc(a, b: nuppu.Instance) -> int {
+        return int(a.mesh_id) - int(b.mesh_id)
+    })
 
     dest := nuppu.dr.instances_gpu[pass.value % nuppu.RENDER_FRAMES_IN_FLIGHT]
 
@@ -381,7 +392,23 @@ render :: proc(prev, curr: ^Basic, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
         {nuppu.dr.vertex_uvs_data,       {.Read}, {.Vertex}},
         {dest,                     {.Read}, {.Vertex}},
     })
-    nuppu.cmd_draw_indiced_primitives(cmds, .Triangle, nuppu.dr.index_data, u32(staged_idx))
+
+    i := 0
+    for i < staged_idx {
+        mesh_idx := instance_slice[i].mesh_id
+
+        j := i + 1
+        for j < staged_idx && instance_slice[j].mesh_id == mesh_idx {
+            j += 1
+        }
+        mesh :nuppu.Mesh= nuppu.dr.slot_to_mesh[mesh_idx]
+
+        log.info("DRAWING MESH: ", mesh_idx, " MESH: ",  mesh)
+
+        nuppu.cmd_draw_indiced_primitives(cmds, .Triangle, nuppu.dr.index_data, u32(mesh.index_range.length), u32(mesh.index_range.location), u32(j - i))
+
+        i = j
+    }
 
     nuppu.cmd_end_render_pass(cmds)
 

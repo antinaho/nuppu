@@ -2,10 +2,12 @@ package nuppu
 
 import "core:log"
 import "core:math/rand"
+import "core:container/handle_map"
 import "core:math"
 
 Default_Renderer :: struct {
     mesh_data: GPU_Arena,
+    
     vertex_positions_data: GPU_Arena,
     vertex_uvs_data: GPU_Arena,
     
@@ -13,7 +15,16 @@ Default_Renderer :: struct {
     instances_gpu: []ptr,
     
     index_data: GPU_Arena,
+
+    meshes: Resource_Library(128, Mesh_Impl, Mesh_Handle),
+    slot_to_mesh: [128]Mesh,
 }
+
+Mesh_Impl :: struct {
+    slot_in_buffer: u32,
+    mesh: Mesh,
+}
+Mesh_Handle :: handle_map.Handle16
 
 dr: ^Default_Renderer
 MAX_INSTANCES :: 10_000
@@ -21,6 +32,7 @@ MAX_INSTANCES :: 10_000
 dr_init :: proc() {
     dr = new(Default_Renderer)
 
+    resource_library_init(&dr.meshes)
     // Later take in T and count instead of bytes + align, but currently not API for that
     dr.mesh_data = gpu_arena_init(align=align_of(Mesh), mem=Memory.GPU_Only)
     
@@ -42,24 +54,23 @@ dr_deinit :: proc() {
     gpu_arena_deinit(&dr.vertex_uvs_data)
     gpu_arena_deinit(&dr.index_data)
     
-
     gpu_arena_deinit(&dr.instance_arena)
     
     delete(dr.instances_gpu)
     free(dr)
 }
 
-dr_push_mesh :: proc(verts: []Vertex_Position, indices: []u32, uvs: []Vertex_UV) -> u32 {
+dr_push_mesh :: proc(verts: []Vertex_Position, indices: []u32, uvs: []Vertex_UV) -> Mesh_Handle {
     vertex_pos_gpu := gpu_arena_alloc(&dr.vertex_positions_data, Vertex_Position, len(verts))
-    vertex_uv_gpu := gpu_arena_alloc(&dr.vertex_uvs_data, Vertex_UV, len(uvs))
-    index_gpu := gpu_arena_alloc(&dr.index_data, u32, len(indices))
-    
     vertex_pos_upload := gpu_malloc(Vertex_Position, len(verts), Memory.CPU_GPU)
-    vertex_uv_upload := gpu_malloc(Vertex_UV, len(uvs), Memory.CPU_GPU)
-    index_upload := gpu_malloc(u32, len(indices), Memory.CPU_GPU)
-
     gpu_ptr_fill_slice(vertex_pos_upload, verts)
+    
+    vertex_uv_gpu := gpu_arena_alloc(&dr.vertex_uvs_data, Vertex_UV, len(uvs))
+    vertex_uv_upload := gpu_malloc(Vertex_UV, len(uvs), Memory.CPU_GPU)
     gpu_ptr_fill_slice(vertex_uv_upload, uvs)
+    
+    index_gpu := gpu_arena_alloc(&dr.index_data, u32, len(indices))
+    index_upload := gpu_malloc(u32, len(indices), Memory.CPU_GPU)
     gpu_ptr_fill_slice(index_upload, indices)
 
     cmds := begin_commands()
@@ -79,17 +90,24 @@ dr_push_mesh :: proc(verts: []Vertex_Position, indices: []u32, uvs: []Vertex_UV)
         index_range = {index_delta / size_of(u32), len(indices)},
     }
 
-    mesh_idx := dr.mesh_data.offset / size_of(Mesh)
+    gpu_slot := dr.mesh_data.offset / size_of(Mesh)
+    dr.slot_to_mesh[gpu_slot] = result
+    
     mesh_gpu := gpu_arena_alloc(&dr.mesh_data, Mesh, 1)
     mesh_upload := gpu_malloc(Mesh, 1, Memory.CPU_GPU)
     gpu_ptr_fill_slice(mesh_upload, []Mesh{result})
+
+    handle := resource_library_add(&dr.meshes, Mesh_Impl {
+        slot_in_buffer = u32(gpu_slot),
+        mesh = result,
+    }, {})
 
     cmds = begin_commands()
     cmd_mem_copy(cmds, mesh_gpu, mesh_upload, u64(size_of(Mesh)))
     cmd_barrier(cmds, .Transfer, .All)
     end_commands(cmds, {})
     
-    return u32(mesh_idx)
+    return handle
 }
 
 random_array :: proc(N: int, rng: proc() -> $T, allocator := context.temp_allocator) -> []T {
