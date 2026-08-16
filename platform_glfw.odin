@@ -1,3 +1,4 @@
+#+build darwin
 package nuppu
 
 import "vendor:glfw"
@@ -16,6 +17,7 @@ GLFW_PLATFORM_API :: Platform_API {
 	pixel_scale = glfw_get_pixel_scale,
 	set_window_title = glfw_set_window_title,
 	monitor_size_logical = glfw_monitor_size_logical,
+	set_window_size = glfw_set_window_size,
 }
 
 @(private="file")
@@ -50,7 +52,6 @@ glfw_init :: proc(window_size: [2]i32, window_title: string) -> Platform_API_Sta
     state.window = glfw.CreateWindow(window_x, window_y, cstring(raw_data(window_title[:])), nil, nil)
     assert(state.window != nil, "In platform_glfw: glfw_platform_api_init: Failed to create GLFW window")
 
-    glfw.SetFramebufferSizeCallback(state.window, glfw_resize_callback)
 	glfw.SetKeyCallback(state.window, glfw_key_callback)
 	glfw.SetMouseButtonCallback(state.window, glfw_mouse_button_callback)
 	glfw.SetCursorPosCallback(state.window, glfw_cursor_pos_callback)
@@ -64,7 +65,7 @@ glfw_init :: proc(window_size: [2]i32, window_title: string) -> Platform_API_Sta
 	// GLFW doesnt expose this so we assume its always true
 	// Just need to make sure we don't zero out the flags at some point..
 	platform.flags += {.Visible}
-
+	platform_ready()
     return Platform_API_State(state)
 }
 
@@ -129,16 +130,11 @@ glfw_monitor_size_logical :: proc() -> [2]i32 {
 // ---------------------------------------------------------------------------
 // Callbacks
 
-glfw_resize_callback :: proc "c" (window: glfw.WindowHandle, width, height: i32) {
-    context = platform.ctx
-	fire_resize_event()
-}
-
 glfw_key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: c.int) {
 	context = platform.ctx
 
-	nolla_key := glfw_key_to_nolla_key(key)
-	if nolla_key == .UNKNOWN {
+	nuppu_key := glfw_key_to_nuppu_key(key)
+	if nuppu_key == .UNKNOWN {
 		log.warnf("Unknown GLFW keycode: %i", key)
 		return
 	}
@@ -146,11 +142,11 @@ glfw_key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action,
 	input := &platform.input
 	switch action {
 	case glfw.PRESS:
-		input.keys_press_started[nolla_key] = input.keys_held[nolla_key] ~ true
-		input.keys_held[nolla_key] = true
+		input.keys_press_started[nuppu_key] = input.keys_held[nuppu_key] ~ true
+		input.keys_held[nuppu_key] = true
 	case glfw.RELEASE:
-		input.keys_released[nolla_key] = true
-		input.keys_held[nolla_key] = false
+		input.keys_released[nuppu_key] = true
+		input.keys_held[nuppu_key] = false
 	case glfw.REPEAT:
 	}
 }
@@ -158,8 +154,8 @@ glfw_key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action,
 glfw_mouse_button_callback :: proc "c" (window: glfw.WindowHandle, button, action, mods: c.int) {
 	context = platform.ctx
 	
-	nolla_mouse_button := glfw_mouse_button_to_nolla_mouse_button(button)
-	if nolla_mouse_button == .UNKNOWN { 
+	nuppu_mouse_button := glfw_mouse_button_to_nuppu_mouse_button(button)
+	if nuppu_mouse_button == .UNKNOWN { 
 		log.warnf("Unknown GLFW mousebutton: %i", button)
 		return 
 	}
@@ -167,11 +163,11 @@ glfw_mouse_button_callback :: proc "c" (window: glfw.WindowHandle, button, actio
 	input := &platform.input
 	switch action {
 	case glfw.PRESS:
-		input.mouse_press_started[nolla_mouse_button] = input.mouse_held[nolla_mouse_button] ~ true
-		input.mouse_held[nolla_mouse_button] = true
+		input.mouse_press_started[nuppu_mouse_button] = input.mouse_held[nuppu_mouse_button] ~ true
+		input.mouse_held[nuppu_mouse_button] = true
 	case glfw.RELEASE:
-		input.mouse_released[nolla_mouse_button] = true
-		input.mouse_held[nolla_mouse_button] = false
+		input.mouse_released[nuppu_mouse_button] = true
+		input.mouse_held[nuppu_mouse_button] = false
 	}	
 }
 
@@ -195,18 +191,6 @@ glfw_window_focus_callback :: proc "c" (window: glfw.WindowHandle, focused: c.in
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Input
-
-glfw_mouse_button_to_nolla_mouse_button :: proc(button: c.int) -> Mouse_Button {
-	switch button {
-	case glfw.MOUSE_BUTTON_LEFT:   return .LEFT
-	case glfw.MOUSE_BUTTON_RIGHT:  return .RIGHT
-	case glfw.MOUSE_BUTTON_MIDDLE: return .MIDDLE
-	case:                          return .UNKNOWN
-	}
-}
-
 glfw_cursor_pos_callback :: proc "c" (window: glfw.WindowHandle, xpos,  ypos: f64) {
 	platform.input.previous_mouse_position = platform.mouse_position_window
 	platform.mouse_position_window = {xpos, ypos}
@@ -216,7 +200,19 @@ glfw_scroll_input_callback :: proc "c" (window: glfw.WindowHandle, xoffset, yoff
 	platform.scroll_value = {xoffset, yoffset}
 }
 
-glfw_key_to_nolla_key :: proc "contextless" (key: c.int) -> Keyboard_Key {
+// ---------------------------------------------------------------------------
+// Input
+
+glfw_mouse_button_to_nuppu_mouse_button :: proc(button: c.int) -> Mouse_Button {
+	switch button {
+	case glfw.MOUSE_BUTTON_LEFT:   return .LEFT
+	case glfw.MOUSE_BUTTON_RIGHT:  return .RIGHT
+	case glfw.MOUSE_BUTTON_MIDDLE: return .MIDDLE
+	case:                          return .UNKNOWN
+	}
+}
+
+glfw_key_to_nuppu_key :: proc "contextless" (key: c.int) -> Keyboard_Key {
 	switch key {
 	case glfw.KEY_0:            return .KEY_0
 	case glfw.KEY_1:            return .KEY_1
@@ -294,80 +290,3 @@ glfw_key_to_nolla_key :: proc "contextless" (key: c.int) -> Keyboard_Key {
 	}
 }
 
-key_to_glfw_key :: proc(key: Keyboard_Key) -> c.int {
-	switch key {
-	case .KEY_0:            return glfw.KEY_0
-	case .KEY_1:            return glfw.KEY_1
-	case .KEY_2:            return glfw.KEY_2
-	case .KEY_3:            return glfw.KEY_3
-	case .KEY_4:            return glfw.KEY_4
-	case .KEY_5:            return glfw.KEY_5
-	case .KEY_6:            return glfw.KEY_6
-	case .KEY_7:            return glfw.KEY_7
-	case .KEY_8:            return glfw.KEY_8
-	case .KEY_9:            return glfw.KEY_9
-
-	case .KEY_A:            return glfw.KEY_A
-	case .KEY_B:            return glfw.KEY_B
-	case .KEY_C:            return glfw.KEY_C
-	case .KEY_D:            return glfw.KEY_D
-	case .KEY_E:            return glfw.KEY_E
-	case .KEY_F:            return glfw.KEY_F
-	case .KEY_G:            return glfw.KEY_G
-	case .KEY_H:            return glfw.KEY_H
-	case .KEY_I:            return glfw.KEY_I
-	case .KEY_J:            return glfw.KEY_J
-	case .KEY_K:            return glfw.KEY_K
-	case .KEY_L:            return glfw.KEY_L
-	case .KEY_M:            return glfw.KEY_M
-	case .KEY_N:            return glfw.KEY_N
-	case .KEY_O:            return glfw.KEY_O
-	case .KEY_P:            return glfw.KEY_P
-	case .KEY_Q:            return glfw.KEY_Q
-	case .KEY_R:            return glfw.KEY_R
-	case .KEY_S:            return glfw.KEY_S
-	case .KEY_T:            return glfw.KEY_T
-	case .KEY_U:            return glfw.KEY_U
-	case .KEY_V:            return glfw.KEY_V
-	case .KEY_W:            return glfw.KEY_W
-	case .KEY_X:            return glfw.KEY_X
-	case .KEY_Y:            return glfw.KEY_Y
-	case .KEY_Z:            return glfw.KEY_Z
-
-	case .KEY_ESCAPE:       return glfw.KEY_ESCAPE
-	case .KEY_ENTER:        return glfw.KEY_ENTER
-	case .KEY_TAB:          return glfw.KEY_TAB
-	case .KEY_BACKSPACE:    return glfw.KEY_BACKSPACE
-	case .KEY_INSERT:       return glfw.KEY_INSERT
-	case .KEY_DELETE:       return glfw.KEY_DELETE
-	case .KEY_RIGHT:        return glfw.KEY_RIGHT
-	case .KEY_LEFT:         return glfw.KEY_LEFT
-	case .KEY_DOWN:         return glfw.KEY_DOWN
-	case .KEY_UP:           return glfw.KEY_UP
-	case .KEY_PAGE_UP:      return glfw.KEY_PAGE_UP
-	case .KEY_PAGE_DOWN:    return glfw.KEY_PAGE_DOWN
-	case .KEY_HOME:         return glfw.KEY_HOME
-	case .KEY_END:          return glfw.KEY_END
-	case .KEY_CAPS_LOCK:    return glfw.KEY_CAPS_LOCK
-	case .KEY_SCROLL_LOCK:  return glfw.KEY_SCROLL_LOCK
-	case .KEY_NUM_LOCK:     return glfw.KEY_NUM_LOCK
-	case .KEY_PRINT_SCREEN: return glfw.KEY_PRINT_SCREEN
-	case .KEY_PAUSE:        return glfw.KEY_PAUSE
-
-	case .KEY_F1:            return glfw.KEY_F1
-	case .KEY_F2:            return glfw.KEY_F2
-	case .KEY_F3:            return glfw.KEY_F3
-	case .KEY_F4:            return glfw.KEY_F4
-	case .KEY_F5:            return glfw.KEY_F5
-	case .KEY_F6:            return glfw.KEY_F6
-	case .KEY_F7:            return glfw.KEY_F7
-	case .KEY_F8:            return glfw.KEY_F8
-	case .KEY_F9:            return glfw.KEY_F9
-	case .KEY_F10:           return glfw.KEY_F10
-	case .KEY_F11:           return glfw.KEY_F11
-	case .KEY_F12:           return glfw.KEY_F12
-
-	case .UNKNOWN:          return glfw.KEY_UNKNOWN
-	case:                   return glfw.KEY_UNKNOWN
-	}
-}

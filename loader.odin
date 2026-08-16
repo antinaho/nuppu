@@ -1,3 +1,5 @@
+#+build !js
+#+build !freestanding
 package nuppu
 
 import "core:fmt"

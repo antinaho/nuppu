@@ -1,3 +1,4 @@
+#+build darwin
 package nuppu
 
 import "core:log"
@@ -15,6 +16,7 @@ MTL_RENDERER_API :: GPU_API {
     free = MTL_free,
     malloc = MTL_malloc,
     mem_copy_to_texture = MTL_mem_copy_to_texture,
+    ptr_fill_slice = MTL_ptr_fill_slice,
     temp_malloc = MTL_temp_malloc,
 
     signal_init = MTL_signal_init,
@@ -37,12 +39,12 @@ MTL_RENDERER_API :: GPU_API {
 
     pipeline_init = MTL_pipeline_init,
     pipeline_deinit = MTL_pipeline_deinit,
-    cmd_set_pipeline = MTL_cmd_set_graphics_pipeline,
+    cmd_set_graphics_pipeline = MTL_cmd_set_graphics_pipeline,
 
     cmd_draw_indiced_primitives = MTL_cmd_draw_indiced_primitives,
     cmd_draw_primitives = MTL_cmd_draw_primitives,
     cmd_set_scissor_rect = MTL_cmd_set_scissor_rect,
-    cmd_use_resources = MTL_use_resources,
+    cmd_use_resources = MTL_cmd_use_resources,
 
     depth_stencil_state_init = MTL_depth_stencil_state_init,
     depth_stencil_state_deinit = MTL_depth_stencil_state_deinit,
@@ -74,8 +76,15 @@ MTL_State :: struct {
     queue: ^MTL.CommandQueue,
     metal_layer: ^CA.MetalLayer,
 
-    command_buffers: Resource_Library(16, MTL_Command_Buffer_Impl, Command_Buffer),
+    command_buffers: Resource_Library(1 << 4, MTL_Command_Buffer_Impl, Command_Buffer),
+    shaders: Resource_Library(1 << 4, MTL_Shader_Impl, Shader),
     textures: Resource_Library(1 << 16, MTL_Texture_Impl, Texture)
+}
+
+MTL_Shader_Impl :: struct {
+    function: ^MTL.Function,
+    kernel_pso: ^MTL.ComputePipelineState,
+    stage: Shader_Stage,
 }
 
 MTL_Texture_Impl :: struct {
@@ -130,6 +139,9 @@ MTL_init :: proc() -> GPU_API_State {
 
     resource_library_init(&state.command_buffers)
     resource_library_init(&state.textures)
+    resource_library_init(&state.shaders)
+
+    GPU_ready()
 
     return GPU_API_State(state)
 }
@@ -244,6 +256,14 @@ MTL_temp_malloc :: proc(command_buffer: Command_Buffer, bytes: []u8, index: u32,
         }
         buffer_impl.compute_command_encoder->setBytes(bytes, NS.UInteger(index))
     }
+}
+
+MTL_ptr_fill_slice :: proc(dst: ptr, data: rawptr, size, count: int) {
+    if dst.cpu == nil {
+        log.error("gpu_ptr_fill_slice: dst must have CPU ptr set. Is ptr GPU private?")
+        return
+    }
+    mem.copy(dst.cpu, data, size * count)
 }
 
 MTL_free :: proc(ptr: ptr) {
@@ -472,11 +492,6 @@ MTL_cmd_present :: proc(command_buffer: Command_Buffer, texture: Texture) {
     command_buffer.presentable = texture
 }
 
-Frame_Pass :: struct {
-    signal: Signal,
-    value: u64,
-}
-
 MTL_end_commands :: proc(command_buffer: Command_Buffer, frame_pass: Frame_Pass) {
     command_buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
     defer {
@@ -673,7 +688,12 @@ MTL_kernel_init :: proc(code: []u8, function_name: string) -> Shader {
         log.panicf("Failed to create pipeline state: %v", k_err->localizedDescription()->odinString())
     }
 
-    return Shader(kernel)
+    handle := resource_library_add(&state.shaders, MTL_Shader_Impl {
+        kernel_pso = kernel,
+        stage = .Compute,
+    }, {})
+
+    return handle
 }
 
 MTL_cmd_dispatch :: proc(command_buffer: Command_Buffer, threads_per_grid, threads_per_thread_group: [3]int) {
@@ -694,6 +714,7 @@ MTL_shader_init :: proc(code: []u8, entry_point: string, stage: Graphics_Stage) 
     defer compile_options->release()
     compile_options->setLanguageVersion(.Version3_0)
 
+    // Could cache library
     library, err = state.device->newLibraryWithSource(code_ns, compile_options) // Cache the library later
     if err != nil {
         log.panicf("Failed to create shader library: %v", err->localizedDescription()->odinString())
@@ -707,21 +728,35 @@ MTL_shader_init :: proc(code: []u8, entry_point: string, stage: Graphics_Stage) 
     // functions are released by user manually when calling shader_deinit
     function := library->newFunctionWithName(entry_ns_str)
 
-    return Shader(function)
+    handle := resource_library_add(&state.shaders, MTL_Shader_Impl {
+        function = function,
+        stage = transmute(Shader_Stage)stage,
+    }, {})
+
+    return handle
 }
 
 MTL_shader_deinit :: proc(shader: Shader) {
-    shader := (^NS.Object)(shader)
-    shader->release()
-    shader^ = {}
+    shader_impl := resource_library_get(&state.shaders, shader)
+    switch shader_impl.stage {
+    case .Vertex, .Fragment:
+        shader_impl.function->release()
+    case .Compute:
+        shader_impl.kernel_pso->release()
+    }
+    
+    resource_library_remove(&state.shaders, shader)
+    shader_impl^ = {}
 }
 
 MTL_pipeline_init :: proc(vertex_shader, fragment_shader: Shader, formats: []Pixel_Format, depth_format: Pixel_Format) -> Pipeline {
     desc := MTL.RenderPipelineDescriptor.alloc()->init()
 	defer desc->release()
 
-    desc->setVertexFunction((^MTL.Function)(vertex_shader))
-    desc->setFragmentFunction((^MTL.Function)(fragment_shader))
+    vertex_shader_impl := resource_library_get(&state.shaders, vertex_shader)
+    fragment_shader_impl := resource_library_get(&state.shaders, fragment_shader)
+    desc->setVertexFunction(vertex_shader_impl.function)
+    desc->setFragmentFunction(fragment_shader_impl.function)
     desc->setDepthAttachmentPixelFormat(mtl_pixel_format_interop[depth_format])
     
     for format, I in formats {
@@ -758,10 +793,11 @@ MTL_cmd_set_compute_pipeline :: proc(command_buffer: Command_Buffer, kernel: Sha
         buffer_impl.compute_command_encoder = buffer_impl.command_buffer->computeCommandEncoder()
     }
 
-    buffer_impl.compute_command_encoder->setComputePipelineState((^MTL.ComputePipelineState)(kernel))
+    shader_impl := resource_library_get(&state.shaders, kernel)
+    buffer_impl.compute_command_encoder->setComputePipelineState(shader_impl.kernel_pso)
 }
 
-MTL_use_resources :: proc(command_buffer: Command_Buffer, resource_list: []Shader_Resource) {
+MTL_cmd_use_resources :: proc(command_buffer: Command_Buffer, resource_list: []Shader_Resource) {
     buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
     // temp use of resource list before heap implementation
     for res in resource_list {
@@ -774,7 +810,7 @@ MTL_use_resources :: proc(command_buffer: Command_Buffer, resource_list: []Shade
     }
 }
 
-MTL_cmd_draw_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32 = 0) {
+MTL_cmd_draw_primitives :: proc(command_buffer: Command_Buffer, index_buffer: ptr, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32 = 0) {
     buffer_impl := resource_library_get(&state.command_buffers, command_buffer)
     buffer_impl.render_command_encoder->drawPrimitives(mtl_primitive_type_interop[primitive], NS.UInteger(vertex_start), NS.UInteger(vertex_count))
 }
@@ -861,8 +897,9 @@ MTL_cmd_set_scissor_rect :: proc(command_buffer: Command_Buffer, x, y, width, he
 // Prefer passing by pointer instead of using argument buffers
 @(deprecated="Use pointer approach")
 __MTL_argument_buffer_init :: proc(shader: Shader, index: u32, buffers: []ptr, offsets: []uint, range: Range) -> ptr {
-    shader_fn := (^MTL.Function)(shader)
-    argument_encoder := shader_fn->newArgumentEncoder(NS.UInteger(index))
+    
+    shader_impl := resource_library_get(&state.shaders, shader)
+    argument_encoder := shader_impl.function->newArgumentEncoder(NS.UInteger(index))
     defer argument_encoder->release()
 
     ptr := MTL_malloc(uint(argument_encoder->encodedLength()), 16, .CPU_GPU)
@@ -894,20 +931,6 @@ MTL_mem_copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u
     }
 
     texture_impl.texture->replaceRegion(region, NS.UInteger(level), data, NS.UInteger(bytes_per_row))
-}
-
-texture_index_pair :: struct {
-    texture: Texture,
-    index: u32,
-}
-
-// `Range` MUST match the Metal struct exactly: two 32-bit fields, total 8
-// bytes. Do NOT use `uint` here — it's 64-bit on macOS ARM64, which makes
-// each Range 16 bytes and silently breaks the Mesh struct layout (the
-// shader would read the wrong fields).
-Range :: struct {
-    location: u32,
-    length:  u32,
 }
 
 MTL_cmd_set_textures :: proc(command_buffer: Command_Buffer, textures: []Texture, range: Range, stage: Shader_Stage) {
@@ -950,10 +973,9 @@ MTL_cmd_set_texture :: proc(command_buffer: Command_Buffer, pairs: []texture_ind
     }
 }
 
-
-
 MTL_max_total_threads_per_threadgroup :: proc(kernel: Shader) -> int {
-    res := (^MTL.ComputePipelineState)(kernel)->maxTotalThreadsPerThreadgroup()
+    shader_impl := resource_library_get(&state.shaders, kernel)
+    res := shader_impl.kernel_pso->maxTotalThreadsPerThreadgroup()
     return int(res)
 }
 
@@ -978,6 +1000,7 @@ mtl_texture_type_interop := [Texture_Type]MTL.TextureType {
 
 @(rodata)
 mtl_compare_function_interop := [Compare_Function]MTL.CompareFunction {
+    .Invalid      = .Never,
     .Never        = .Never,
     .Less         = .Less,
     .Equal        = .Equal,

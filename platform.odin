@@ -22,7 +22,19 @@ Platform :: struct {
 	frame_counter: int,
 
 	debug_shutdown_key: Keyboard_Key,
+
+	is_init: bool,
 }
+
+platform_is_ready :: proc() -> bool {
+    return platform.is_init
+}
+
+platform_ready :: proc() {
+    assert(!platform.is_init)
+    platform.is_init = true
+}
+
 
 Platform_API_State :: distinct rawptr
 
@@ -38,6 +50,7 @@ Platform_API :: struct #all_or_none {
 	window_size_pixel:   proc() -> [2]i32,
 	pixel_scale: proc() -> [2]f32,
 
+	set_window_size: proc(w, h: i32),
 	set_window_title: proc(title: string),
 }
 
@@ -156,23 +169,6 @@ Mouse_Button :: enum u32 {
 
 @(private="package")
 platform: ^Platform
-
-
-// ---------------------------------------------------------------------------
-// Callbacks
-
-on_resize_proc: proc()
-
-set_resize_callback :: proc(p: Resize_Window_Proc) {
-	on_resize_proc = p
-}
-
-fire_resize_event :: proc() {
-	if on_resize_proc == nil {
-		return
-	}
-	on_resize_proc()
-}
 
 // ---------------------------------------------------------------------------
 // Window Flags

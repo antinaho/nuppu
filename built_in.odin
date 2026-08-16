@@ -1,3 +1,6 @@
+#+build !js
+#+build !freestanding
+
 package nuppu
 
 import "core:log"
@@ -325,6 +328,8 @@ ear_clip_polygon :: proc(poly_positions: [][3]f32, poly_indices: []u32, into: ^[
 	}
 }
 
+when ODIN_OS != .JS {
+
 mesh_load_from_obj :: proc(path: string, allocator: mem.Allocator) -> (mesh: OBJ_Mesh, err: os.Error) {
 	data, read_err := os.read_entire_file(path, allocator)
 	if read_err != nil {
@@ -555,4 +560,5 @@ mesh_load_from_obj :: proc(path: string, allocator: mem.Allocator) -> (mesh: OBJ
 	}
 
 	return mesh, nil
+}
 }

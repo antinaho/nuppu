@@ -1,17 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#define u8 uchar;
-#define u16 ushort;
-#define u32 uint;
-
-#define i8 char;
-#define i16 short;
-#define i32 int;
-
-#define f16 half;
-#define f32 float;
-
 struct v2f {
     float4 position [[position]]; // vertex position
     half3 color;                  // vertex color

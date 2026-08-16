@@ -2,12 +2,11 @@ package nuppu
 
 import "base:runtime"
 import "core:mem"
-import "core:os"
 import "core:time"
 import "core:container/handle_map"
 import "core:log"
 
-Color :: distinct [4]u8
+Color :: [4]u8
 
 Color_Attachment :: struct {
     clear_color: Color,
@@ -24,6 +23,22 @@ Color_Attachment :: struct {
     // `texture`.
     resolve_texture: Texture,
 }
+
+
+texture_index_pair :: struct {
+    texture: Texture,
+    index: u32,
+}
+
+// `Range` MUST match the Metal struct exactly: two 32-bit fields, total 8
+// bytes. Do NOT use `uint` here — it's 64-bit on macOS ARM64, which makes
+// each Range 16 bytes and silently breaks the Mesh struct layout (the
+// shader would read the wrong fields).
+Range :: struct {
+    location: u32,
+    length:  u32,
+}
+
 
 GPU_Arena :: struct {
     using ptr: ptr,
@@ -54,6 +69,17 @@ GPU :: struct {
     
     api: GPU_API,
     api_state: GPU_API_State,
+
+    is_init: bool,
+}
+
+GPU_is_ready :: proc() -> bool {
+    return state.is_init
+}
+
+GPU_ready :: proc() {
+    assert(!state.is_init)
+    state.is_init = true
 }
 
 Shader_Resource :: struct {
@@ -95,6 +121,11 @@ Storage_Mode :: enum u64 {
 	Memoryless = 3,
 }
 
+Frame_Pass :: struct {
+    signal: Signal,
+    value: u64,
+}
+
 @(private="file")
 state: ^GPU
 
@@ -107,6 +138,7 @@ GPU_API :: struct #all_or_none {
 
     malloc: proc(size: uint, align: uint, usage: Memory) -> ptr,
     temp_malloc: proc(command_buffer: Command_Buffer, bytes: []u8, buffer_index: u32, shader_stage: Shader_Stage),
+    ptr_fill_slice: proc(dst: ptr, data: rawptr, size: int, count: int),
     mem_copy_to_texture: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32),
     free: proc(ptr: ptr),
 
@@ -137,10 +169,10 @@ GPU_API :: struct #all_or_none {
 
     pipeline_init: proc(vertex_shader, fragment_shader: Shader, formats: []Pixel_Format, depth_format: Pixel_Format) -> Pipeline,
     pipeline_deinit: proc(pipeline: Pipeline),
-    cmd_set_pipeline: proc(command_buffer: Command_Buffer, pipeline: Pipeline),
+    cmd_set_graphics_pipeline: proc(command_buffer: Command_Buffer, pipeline: Pipeline),
 
     cmd_use_resources: proc(command_buffer: Command_Buffer, resource_list: []Shader_Resource),
-    cmd_draw_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32),
+    cmd_draw_primitives: proc(command_buffer: Command_Buffer, index_buffer: ptr, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32),
     cmd_draw_indiced_primitives: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_instance: u32),
 
     cmd_set_scissor_rect: proc(command_buffer: Command_Buffer, x, y, width, height: u32),
@@ -234,22 +266,23 @@ Depth_Stencil_State_Descriptor :: struct {
 }
 
 Compare_Function :: enum u64 {
-	Never        = 0,
-	Less         = 1,
-	Equal        = 2,
-	LessEqual    = 3,
-	Greater      = 4,
-	NotEqual     = 5,
-	GreaterEqual = 6,
-	Always       = 7,
+    Invalid      = 0,
+	Never        = 1,
+	Less         = 2,
+	Equal        = 3,
+	LessEqual    = 4,
+	Greater      = 5,
+	NotEqual     = 6,
+	GreaterEqual = 7,
+	Always       = 8,
 }
 
-Shader :: distinct rawptr
+Shader :: distinct handle_map.Handle64
 
 Shader_Stage :: enum u64 {
     Vertex   = 0,
     Fragment = 1,
-    Compute
+    Compute = 2,
 }
 
 Graphics_Stage :: enum u64 {
@@ -342,16 +375,6 @@ gpu_init :: proc() {
 gpu_deinit :: proc() {
     state.api.deinit()
     free(state)
-}
-
-gpu_debug_init :: proc( ) {   
-when ODIN_DEBUG && ODIN_OS == .Darwin {
-    os.set_env("MTL_DEBUG_LAYER", "1") // API validation
-    os.set_env("MTL_SHADER_VALIDATION", "1") // Shader validation
-    os.set_env("MTL_CAPTURE_ENABLED", "1") // GPU capture (.gputrace)
-    os.set_env("MTL_HUD_ENABLED", "1") // HUD (performance counters)
-    os.set_env("OBJC_DEBUG_MISSING_POOLS", "YES") // Track missing autorelease pools
-}
 }
 
 gpu_resize_swapchain :: proc() {
@@ -455,11 +478,7 @@ _gpu_arena_alloc_bytes :: proc(arena: ^GPU_Arena, bytes: uint, align: uint = 16)
 }
 
 gpu_ptr_fill_slice :: proc(dst: ptr, src: []$T) {
-    if dst.cpu == nil {
-        log.error("gpu_ptr_fill_slice: dst must have CPU ptr set. Is ptr GPU private?")
-        return
-    }
-    mem.copy(dst.cpu, raw_data(src[:]), size_of(T) * len(src))
+    state.api.ptr_fill_slice(dst, raw_data(src[:]), size_of(T), len(src))
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +647,7 @@ _cmd_set_compute_pipeline :: proc(command_buffer: Command_Buffer, kernel: Shader
 }
 
 _cmd_set_graphics_pipeline :: proc(command_buffer: Command_Buffer, pipeline: Pipeline) {
-    state.api.cmd_set_pipeline(command_buffer, pipeline)
+    state.api.cmd_set_graphics_pipeline(command_buffer, pipeline)
 }
 
 cmd_set_buffer :: proc(command_buffer: Command_Buffer, buffer: ptr, index: u32, stage: Shader_Stage, offset: uint = 0) {
@@ -639,8 +658,8 @@ cmd_set_buffers :: proc(command_buffer: Command_Buffer, buffers: []ptr, offsets:
     state.api.cmd_set_buffers(command_buffer, buffers, offsets, range, stage)
 }
 
-cmd_draw_primitives :: proc(command_buffer: Command_Buffer, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32 = 0) {
-    state.api.cmd_draw_primitives(command_buffer, primitive, vertex_count, vertex_start)
+cmd_draw_primitives :: proc(command_buffer: Command_Buffer, index_buffer: ptr, primitive: Primitive_Type, vertex_count: u32, vertex_start: u32 = 0) {
+    state.api.cmd_draw_primitives(command_buffer, index_buffer, primitive, vertex_count, vertex_start)
 }
 
 // Issues an indexed draw on the active render command encoder.
