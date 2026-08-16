@@ -18,3 +18,12 @@
 !gpu_chooser.odin
 !gpu_MTL.odin
 !loader.odin
+
+!web/
+!web/index.html
+!build_web.sh
+
+*.obj
+*.mtl
+*.dSYM
+*.dSYM/**
