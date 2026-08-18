@@ -1,125 +1,103 @@
-package main
+package lo
 
-import nuppu "../../../"
+import nuppu "../../.."
+import gpu "../../../gpu"
 import "core:fmt"
-import "core:log"
 
-basic_app: ^Basic
+State :: struct {
+    pso: gpu.Resource,
 
-Basic :: struct {
-    v_shader: nuppu.Shader,
-    f_shader: nuppu.Shader,
-
-    positions_gpu: nuppu.ptr,
-    colors_gpu: nuppu.ptr,
-    indices_gpu: nuppu.ptr,
-
-    pipeline: nuppu.Pipeline,
+    pos_gpu: gpu.ptr,
+    color_gpu: gpu.ptr,
+    index_gpu: gpu.ptr,
 }
 
-init :: proc() {
+state: ^State
+
+_init :: proc() {
 when ODIN_OS == .Darwin {
-    shader_code := #load("1-primitive.metal", []u8)
-} else when ODIN_OS == .JS {
-    shader_code := #load("1-primitive.wgsl", []u8)
+    shader_code := #load("triangle.metal", []u8)
 }
-    basic_app.v_shader = nuppu.shader_init(shader_code, "vertexMain", .Vertex)
-    basic_app.f_shader = nuppu.shader_init(shader_code, "fragmentMain", .Fragment)
+when ODIN_OS == .JS {
+    shader_code := #load("triangle.wgsl", []u8)
+}
+    shader := gpu.shader_init("my_vert_shader", shader_code)
 
-    basic_app.pipeline = nuppu.pipeline_init(basic_app.v_shader, basic_app.f_shader, {.BGRA8Unorm_sRGB}, .Invalid)
+    state.pso = gpu.pipeline_init(shader, "vertexMain", shader, "fragmentMain", .BGRA8Unorm)
 
-    upload_arena := nuppu.gpu_arena_init()
-    defer nuppu.gpu_arena_deinit(&upload_arena)
+    upload_arena := gpu.arena_init()
 
     NUM_VERTICES :: 3
     Position :: [3]f32
     Color :: [3]f32
 
-    positions := nuppu.gpu_arena_alloc(&upload_arena, Position, NUM_VERTICES)
+    positions := gpu.arena_alloc(&upload_arena, Position, NUM_VERTICES)
     ps := []Position {
         { -0.8,  0.8, 0.0 },
         {  0.0, -0.8, 0.0 },
         { +0.8,  0.8, 0.0 },
     }
-    nuppu.gpu_ptr_fill_slice(positions, ps)
+    gpu.ptr_fill_slice(&positions, ps)
 
-    colors := nuppu.gpu_arena_alloc(&upload_arena, Color, NUM_VERTICES)
+    colors := gpu.arena_alloc(&upload_arena, Color, NUM_VERTICES)
     cs := []Color {
         { 1, 0, 0 },
         { 0, 1, 0 },
         { 0, 0, 1 },
     }
-    nuppu.gpu_ptr_fill_slice(colors, cs)
+    gpu.ptr_fill_slice(&colors, cs)
 
-    indices := nuppu.gpu_arena_alloc(&upload_arena, u32, NUM_VERTICES)
+    indices := gpu.arena_alloc(&upload_arena, u32, NUM_VERTICES)
     is := []u32 {
         0, 1, 2,
     }
-    nuppu.gpu_ptr_fill_slice(indices, is)
-
-    basic_app.positions_gpu = nuppu.__gpu_malloc_bytes(size_of(Position) * NUM_VERTICES, align_of(Position), .GPU_Only)
-    basic_app.colors_gpu = nuppu.__gpu_malloc_bytes(size_of(Color) * NUM_VERTICES, align_of(Color), .GPU_Only)
-    basic_app.indices_gpu = nuppu.__gpu_malloc_bytes(size_of(u32) * NUM_VERTICES, align_of(u32), .GPU_Only)
-
-    cmds := nuppu.begin_commands()
-    nuppu.cmd_mem_copy(cmds, basic_app.positions_gpu, positions, size_of(Position) * NUM_VERTICES)
-    nuppu.cmd_mem_copy(cmds, basic_app.colors_gpu, colors, size_of(Color) * NUM_VERTICES)
-    nuppu.cmd_mem_copy(cmds, basic_app.indices_gpu, indices, size_of(u32) * NUM_VERTICES)
-    nuppu.cmd_barrier(cmds, .Transfer, .All)
-    nuppu.end_commands(cmds, {})
+    gpu.ptr_fill_slice(&indices, is)
+    
+    state.pos_gpu = gpu.buffer_init(size_of(Position) * NUM_VERTICES, align_of(Position), .GPU_Only)
+    state.color_gpu = gpu.buffer_init(size_of(Color) * NUM_VERTICES, align_of(Color), .GPU_Only)
+    state.index_gpu = gpu.buffer_init(size_of(u32) * NUM_VERTICES, align_of(u32), .GPU_Only)
+    
+    gpu.upload_one_shot({
+        {&state.pos_gpu, positions, size_of(Position) * NUM_VERTICES},
+        {&state.color_gpu, colors, size_of(Color) * NUM_VERTICES},
+        {&state.index_gpu, indices, size_of(u32) * NUM_VERTICES},
+    })
 }
 
-deinit :: proc() {
-    nuppu.shader_deinit(basic_app.v_shader)
-    nuppu.shader_deinit(basic_app.f_shader)
+_update :: proc() {}
 
-    nuppu.pipeline_deinit(basic_app.pipeline)
+_render :: proc(previous, current: ^State, alpha: f32) {
+    gpu.begin_frame()
 
-    nuppu.gpu_free(basic_app.positions_gpu)
-    nuppu.gpu_free(basic_app.colors_gpu)
-}
+    // color_rt
+    // depth_rt
 
-render :: proc(prev, curr: rawptr, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nuppu.Frame_Pass) {
-    prev := (^Basic)(prev)
-    curr := (^Basic)(curr)
-
-    cmds := nuppu.begin_commands()
-    swapchain := nuppu.acquire_next_swapchain(cmds)
-
-    nuppu.cmd_begin_render_pass(cmds, {
-        {
-            clear_color = {64, 128, 255, 255},
-            load_action = .Clear,
-            store_action = .Store,
-            texture = swapchain,
-        }
+    swapchain := gpu.acquire_next_swapchain()
+    gpu.begin_render_pass({
+        clear_color = {12, 12, 12, 255},
+        load_action = .Clear,
+        store_action = .Store,
+        texture = swapchain,
     })
 
-    nuppu.cmd_set_buffers(cmds, {curr.positions_gpu, curr.colors_gpu}, {0, 0}, {0, 2}, .Vertex)
-    nuppu.cmd_set_pipeline(cmds, curr.pipeline)
-    nuppu.cmd_draw_primitives(cmds, curr.indices_gpu, .Triangle, 3)
+    gpu.set_pipeline(current.pso)
+    gpu.set_buffers({current.pos_gpu, current.color_gpu}, {0, 0}, {0, 2}, .Vertex)
+    gpu.draw_primitives(.Triangle, current.index_gpu, 3, 0)
 
-    nuppu.cmd_end_render_pass(cmds)
-    nuppu.cmd_present(cmds, swapchain)
-    nuppu.end_commands(cmds, pass)
+    gpu.end_render_pass()
+    gpu.present(swapchain)
+
+    defer gpu.end_frame()
 }
 
-@export _desc := nuppu.App_Desc {
-    size = size_of(Basic),
-    init = init,
-    deinit = deinit,
-    render = render,
-}
-
-config :: nuppu.App_Config {
-    window_size = [2]i32{1280, 720},
-    window_title = "Window",
+desc := nuppu.App_Desc(State) {
+    state = &state,
+    window_size = {1000, 1000},
+    init = _init,
+    update = _update,
+    render = _render,
 }
 
 main :: proc() {
-    nuppu.app_init(
-        _desc,
-        &basic_app,
-        config
-    )
+    nuppu.run(desc)
 }

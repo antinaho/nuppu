@@ -6,12 +6,6 @@ struct v2f {
     half3 color;
 };
 
-// Without using pointers
-// struct VertexData {
-//     device packed_float3* positions [[id(0)]];
-//     device packed_float3* colors    [[id(1)]];
-// };
-
 struct VertexData {
     device packed_float3* positions;
     device packed_float3* colors;

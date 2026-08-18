@@ -163,7 +163,9 @@ deinit :: proc() {
     nuppu.depth_stencil_state_deinit(window_app.depth_stencil_state)
 }
 
-render :: proc(prev, curr: Window, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nuppu.Frame_Pass) {
+render :: proc(prev, curr: rawptr, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nuppu.Frame_Pass) {
+    prev := (^Window)(prev)
+    curr := (^Window)(curr)
 
     @static angle: f32
     angle += nuppu.delta_time_f32() * 0.45
@@ -255,14 +257,17 @@ render :: proc(prev, curr: Window, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
     nuppu.cmd_draw_indiced_primitives(cmds,
     .Triangle,
     window_app.index_gpu,
-    INSTANCE_COUNT)
+    nuppu.UNIT_CUBE_INDEX_COUNT,
+    0,
+    INSTANCE_COUNT, 0)
 
     nuppu.cmd_end_render_pass(cmds)
     nuppu.cmd_present(cmds, swapchain)
     nuppu.end_commands(cmds, pass)
 }
 
-@export _desc := nuppu.App_Desc(Window) {
+@export _desc := nuppu.App_Desc {
+    size = size_of(Window),
     init = init,
     deinit = deinit,
     render = render,

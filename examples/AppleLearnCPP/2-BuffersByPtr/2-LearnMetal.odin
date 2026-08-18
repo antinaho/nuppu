@@ -2,12 +2,9 @@ package main
 
 import nuppu "../../.."
 import gpu "../../../gpu"
-import "core:slice"
 import "core:fmt"
 
 State :: struct {
-    angle: f32,
-
     pso: gpu.Resource,
 
     pos_gpu: gpu.ptr,
@@ -16,9 +13,6 @@ State :: struct {
 
     // Metal
     by_ptr_buffer: gpu.ptr,
-
-    // WGPU
-    angle_buffer: gpu.ptr,
 }
 
 Position :: [3]f32
@@ -32,10 +26,10 @@ state: ^State
 
 _init :: proc() {
 when ODIN_OS == .Darwin {
-    shader_code := #load("animation.metal", []u8)
+    shader_code := #load("triangle.metal", []u8)
 }
 when ODIN_OS == .JS {
-    shader_code := #load("animation.wgsl", []u8)
+    shader_code := #load("triangle.wgsl", []u8)
 }
     shader := gpu.shader_init("my_vert_shader", shader_code)
 
@@ -77,10 +71,6 @@ when ODIN_OS == .JS {
         {&state.index_gpu, indices, size_of(u32) * NUM_VERTICES},
     })
 
-    //
-    state.angle_buffer = gpu.buffer_init(size_of(f32), align_of(f32), .CPU_GPU)
-
-    //
     state.by_ptr_buffer = gpu.buffer_init(size_of(Buffer_Data), align_of(Buffer_Data), .CPU_GPU)
     (^Buffer_Data)(state.by_ptr_buffer.cpu)^ = Buffer_Data {
         positions = (^Position)(state.pos_gpu.gpu),
@@ -88,9 +78,7 @@ when ODIN_OS == .JS {
     }
 }
 
-_update :: proc() {
-    state.angle += 0.001
-}
+_update :: proc() {}
 
 _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.begin_frame()
@@ -107,20 +95,11 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     })
 
     gpu.set_pipeline(current.pso)
-    
 
 when gpu.GPU_BACKEND == gpu.GPU_BACKEND_WGPU {
-    gpu.set_buffers({current.pos_gpu, current.color_gpu, current.angle_buffer}, {0, 0, 0}, {0, 3}, .Vertex)
+    gpu.set_buffers({current.pos_gpu, current.color_gpu}, {0, 0}, {0, 2}, .Vertex)
 }
 when gpu.GPU_BACKEND == gpu.GPU_BACKEND_METAL {
-
-    FrameData :: struct {
-        angle: f32,
-    }
-    frame_data := FrameData { angle = current.angle }
-
-    gpu.temp_malloc(slice.bytes_from_ptr(&frame_data, size_of(FrameData)), 1, .Vertex)
-
     gpu.use_resources({
         {current.pos_gpu, {.Read}, {.Vertex}},
         {current.color_gpu, {.Read}, {.Vertex}},

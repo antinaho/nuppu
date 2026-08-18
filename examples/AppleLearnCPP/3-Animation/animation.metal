@@ -13,13 +13,6 @@ struct VertexData
     device packed_float3* colors;
 };
 
-// Without using pointers (argument buffer approach)
-// struct VertexData
-// {
-//     device packed_float3* positions [[id(0)]];
-//     device packed_float3* colors [[id(1)]];
-// };
-
 struct FrameData
 {
     float angle;
