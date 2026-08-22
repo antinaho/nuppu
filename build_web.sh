@@ -13,7 +13,7 @@ ODIN_ROOT=$(odin root)
 ODIN_JS="$ODIN_ROOT/core/sys/wasm/js/odin.js"
 WGPU_JS="$ODIN_ROOT/vendor/wgpu/wgpu.js"
 
-odin build examples/AppleLearnCPP/0-Window -target:js_wasm32 -out:web/nuppu.wasm -o:size \
+odin build examples/AppleLearnCPP/1-Primitive/ -target:js_wasm32 -out:web/nuppu.wasm -o:size \
 	-extra-linker-flags:"--export-table --import-memory --initial-memory=$INITIAL_MEMORY_BYTES --max-memory=$MAX_MEMORY_BYTES"
 
 cp $ODIN_JS web/odin.js

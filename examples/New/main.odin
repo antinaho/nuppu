@@ -67,7 +67,7 @@ when ODIN_OS == .JS {
 _update :: proc() {}
 
 _render :: proc(previous, current: ^State, alpha: f32) {
-    gpu.begin_frame()
+    gpu.begin_frame_or_commands()
 
     // color_rt
     // depth_rt
@@ -85,7 +85,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.draw_primitives(.Triangle, current.index_gpu, 3, 0)
 
     gpu.end_render_pass()
-    gpu.present(swapchain)
+    gpu.commit(swapchain)
 
     defer gpu.end_frame()
 }

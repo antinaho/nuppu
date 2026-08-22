@@ -3,6 +3,7 @@ package nuppu_platform
 import "core:sys/wasm/js"
 import "core:container/queue"
 import "core:log"
+import "core:time"
 
 when PLATFORM_BACKEND == PLATFORM_BACKEND_WEB {
 
@@ -89,9 +90,8 @@ when PLATFORM_BACKEND == PLATFORM_BACKEND_WEB {
         return {ratio, ratio}
     }
 
-    // NOTE
     _get_time_ns :: proc() -> u64 {
-        return {}
+        return u64(time.tick_now()._nsec)
     }
 
     _poll_events :: proc() {

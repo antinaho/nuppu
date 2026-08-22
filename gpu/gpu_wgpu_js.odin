@@ -1,3 +1,4 @@
+#+build js
 package nuppu_gpu
 
 import "vendor:wgpu"
