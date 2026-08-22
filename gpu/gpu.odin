@@ -47,8 +47,6 @@ State :: struct #align(64) {
     frame_arenas: [dynamic; FRAMES_IN_FLIGHT]^Arena,
     frame_n: u64,
 
-    resources: Resource_Library(MAX_RESOURCES),
-
     pipelines: hm.Static_Handle_Map(MAX_PIPELINES, Pipeline_Descriptor, Pipeline_Handle),    
     shaders: hm.Static_Handle_Map(MAX_SHADERS, Shader, Shader_Handle),
 }
@@ -56,63 +54,11 @@ State :: struct #align(64) {
 _state: ^State
 
 
-/*
-Resource = Generally anything that gets stored in GPU memory
-
-API gives and recieves Resource_Handles and their specialications
-*/
-
-Resource_Handle :: distinct hm.Handle32
-
-Resource_Library :: struct($N: uint)
-{
-    is_init: bool,
-    resources: hm.Static_Handle_Map(N, Resource, Resource_Handle),
-}
-
-Resource :: struct
-{
-    using info: _Resource,
-    handle: Resource_Handle,
-    meta: Metadata,
-    kind: Resource_Kind,
-}
-
-Resource_Kind :: enum u8 {
-    Index_Buffer,
-    Buffer,
-}
-
 Metadata :: struct
 {
     name: string,
     created_at: runtime.Source_Code_Location,
 }
-
-resource_library_init :: proc(library: ^Resource_Library($N)) {
-    library.is_init = true
-}
-
-@(require_results)
-resource_add :: proc(library: ^Resource_Library($N), res: Resource) -> (handle: Resource_Handle, ok: bool) #optional_ok {
-    handle, ok = hm.static_add(&library.resources, res)
-    return
-}
-
-resource_remove :: proc(library: ^Resource_Library($N), handle: $T/Resource_Handle) -> (ok: bool) {
-    ok = hm.static_remove(&library.resources, Resource_Handle(handle))
-    return
-}
-
-@(require_results)
-resource_get :: proc(library: ^Resource_Library($N), handle: $T/Resource_Handle) -> (result: ^Resource, ok: bool) #optional_ok {
-    result, ok = hm.static_get(&library.resources, Resource_Handle(handle))
-    return
-}
-
-/////
-
-// Linear bump arena
 
 // Linear bump arena used in rendering loop. Automatically recycled after use
 // Should only be used in the render loop
@@ -128,19 +74,6 @@ recycle_frame_arena :: proc(arena: ^Arena) {
 // 'Allocates' slice from upload or frame arena.
 // Just moves arena's offset forward and return slice to the slice that was allocated
 // Returned slice's raw data points to cpu pointer given by the arena's buffer
-
-
-// destroy_arena :: proc(arena: ^Arena) {
-//     destroy_res(arena.handle)
-//     arena^ = {}
-// }
-
-
-destroy_res :: proc(handle: $T/Resource_Handle) {
-    res := resource_get(&_state.resources, handle)
-    _destroy_res(res.info, res.kind)
-    resource_remove(&_state.resources, handle)
-}
 
 Shader_Resource :: struct {
     ptr: ptr,
@@ -162,8 +95,6 @@ init :: proc(state: ^State, native_window: rawptr) -> bool {
 
     _state = state
     _state.ctx = context
-
-    resource_library_init(&_state.resources)
 
     return _init(native_window)
 }
@@ -305,6 +236,8 @@ Pipeline_Descriptor :: struct {
     buffers: [8]ptr,
 
     index_buffer: ptr,
+
+    using native: _Pipeline,
 }
 
 Primitive_State :: struct {
@@ -391,8 +324,8 @@ Primitive_Type :: enum u8 {
     Triangle      = 3,
 }
 
-set_buffers :: proc(buffers: []ptr, offsets: []uint, range: Range, stage: Shader_Stage) {
-    _set_buffers(buffers, offsets, range, stage)
+set_buffers :: proc(buffers: []ptr, range: Range, stage: Shader_Stage) {
+    _set_buffers(buffers, range, stage)
 }
 
 draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
@@ -413,18 +346,6 @@ end_frame :: proc() {
     _end_frame()
 }
 
-
-    Role :: enum u8 {
-        Default,
-        Index,
-    }
-
-    Memory :: enum u8 {
-        Default,
-        GPU,
-        Readback,
-    }
-
 copy :: proc(dst, src: ptr) {
     _mem_copy(
             dst = dst,
@@ -434,51 +355,23 @@ copy :: proc(dst, src: ptr) {
 
 
 barrier :: proc(before: Stage, after: Stage) {
-when GPU_BACKEND != GPU_BACKEND_WGPU {
     _barrier(before, after)
-// Not needed on WGPU
-}
 }
 
 // reserve (create gpu only buffer with bytes + align)
 // view (current ptr approach, view into a reserve buffer)
 
-Mem :: enum u8 {
-    Default,  // CPU visible exposed cpu ptr. Used as staging on copy source into GPU buffers or copy destination with Readback
-    GPU,      // GPU private, data can be copied into this buffer
-    Readback, // GPU private, data can be copied into cpu array from from buffer
+Buffer_Type :: enum u8 {
+    Staging,       // CPU visible, mapped at creation; GPU reads as copy source
+    GPU_Storage,   // Device-local; bindable as storage buffer
+    GPU_Constant,  // Device-local; bindable as uniform buffer
+    GPU_Index,     // Device-local; bindable as index buffer
+    Readback,      // CPU visible; GPU writes via copy; CPU reads after fence
 }
 
-    Buffer_Kind :: enum u8 {
-        Buffer,
-        Index_Buffer,
-    }
-
-malloc :: proc {
-    malloc_raw,
-    malloc_T,
-}
-
-malloc_T :: proc($T: typeid, el_count: int, m: Mem, name: string = {}, loc := #caller_location) -> ptr {
-    alignment := align_of(T)
-    return malloc_raw(size_of(T), el_count, alignment, m, name, loc)
-}
-
-malloc_raw :: proc(el_size, el_count, alignment: int, m: Mem, name: string = {}, loc := #caller_location) -> ptr {
-    size := runtime.align_forward_int(el_size * el_count, alignment)
-    
-    _ptr := _malloc(size, alignment, m, name)
-    
-    return ptr {
-        cpu = nil,
-        gpu = nil,
-        native = _ptr,
-        kind = .Buffer,
-        meta = Metadata {
-            name = strings.clone(name, context.allocator),
-            created_at = loc,
-        }
-    }
+Buffer_Kind :: enum u8 {
+    Buffer,
+    Index_Buffer,
 }
 
 Index_Type :: enum u8 {
@@ -495,58 +388,7 @@ malloc_index :: proc(el_count: int, type: Index_Type, name: string = {}, loc := 
         el_size = 4
     }
 
-    _ptr := _malloc_index(uint(el_count), uint(el_size), name, loc)
-
-    return ptr {
-        cpu = nil,
-        gpu = nil,
-        native = _ptr,
-        kind = .Index_Buffer,
-        meta = Metadata {
-            name = strings.clone(name, context.allocator),
-            created_at = loc,
-        }
-    }
-}
-
-// Mapped buffer
-
-malloc_mapped :: proc {
-    malloc_raw_mapped,
-    malloc_mapped_T,
-}
-
-// Malloc Default buffer that is returned in mapped state. You must unmap before copying data out of it!
-malloc_mapped_T :: proc($T: typeid, el_count: int, name: string = {}, loc := #caller_location) -> ptr {
-    alignment := align_of(T)
-    malloc_raw_mapped(size_of(T), el_count, alignment, name, loc)
-}
-
-malloc_raw_mapped :: proc(
-    el_size, el_count, alignment: int, 
-    name: string = {}, 
-    loc := #caller_location
-) -> ptr {
-    size := runtime.align_forward_int(el_size * el_count, alignment)
-
-    _ptr := _malloc_mapped(size, alignment, name, loc)
-    cpu_ptr, gpu_ptr := _map_range(_ptr, uint(size))
-
-    return ptr {
-        native = _ptr,
-        cpu = cpu_ptr,
-        gpu = gpu_ptr,
-        kind = .Buffer,
-        meta = Metadata {
-            name = strings.clone(name, context.allocator),
-            created_at = loc,
-        }
-    }
-}
-
-unmap :: proc(ptr: ptr) {
-    assert(ptr.kind == .Buffer || ptr.kind == .Index_Buffer)
-    _unmap(ptr.native)
+    return malloc(.GPU_Index, el_count, el_size, el_size, name, loc)
 }
 
 // Arena
@@ -576,8 +418,8 @@ arena :: proc(
     arena: Arena
 
     bytes := runtime.align_forward_uint(size, alignment)
-    _ptr := _malloc_mapped(bytes, alignment, "ARENA", loc)
-    cpu_ptr, gpu_ptr := _map_range(_ptr, bytes)
+    _ptr := _malloc(.Staging, bytes, alignment, "ARENA")
+    cpu_ptr, gpu_ptr := _map_range(_ptr)
 
     arena.ptr = {
         meta = Metadata {
@@ -628,4 +470,70 @@ arena_alloc :: proc(arena: ^Arena, $T: typeid, el_count: uint = 1) -> ptr {
     // s := slice.from_ptr((^T)(temp.cpu), int(el_count))
     
     return temp
+}
+
+
+
+
+
+//////////////////////////////////////////////////////////////
+// Memory
+
+// Allocate a buffer of the given type.
+//   - .Staging     returns ptr with valid .cpu; caller fills data then calls copy() + unmap()
+//   - .GPU_*       returns ptr with .cpu=nil; receive data via copy() from a Staging buffer
+//   - .Readback    returns ptr with .cpu=nil; receive data via copy() then map() after fence
+malloc :: proc(
+    type:        Buffer_Type,
+    el_count:    int,
+    el_size:     int        = 1,
+    alignment:   int        = 1,
+    name:        string     = "",
+    loc:                    = #caller_location,
+) -> ptr {
+    size := runtime.align_forward_int(el_size * el_count, alignment)
+
+    _ptr := _malloc(type, size, alignment, name)
+
+    if type == .Staging {
+        cpu_ptr, gpu_ptr := _map_range(_ptr)
+        return ptr {
+            native = _ptr,
+            cpu    = cpu_ptr,
+            gpu    = gpu_ptr,
+            kind   = .Buffer,
+            meta   = Metadata {
+                name = strings.clone(name, context.allocator),
+                created_at = loc,
+            },
+        }
+    }
+
+    kind: Buffer_Kind = .Buffer
+    if type == .GPU_Index {
+        kind = .Index_Buffer
+    }
+
+    result := ptr {
+        native = _ptr,
+        cpu    = nil,
+        gpu    = _gpu_address(_ptr),
+        kind   = kind,
+        meta   = Metadata {
+            name = strings.clone(name, context.allocator),
+            created_at = loc,
+        },
+    }
+
+    if type == .GPU_Index {
+        result.index_bytes = u8(el_size)
+    }
+
+    return result
+}
+
+// Release the mapping on a Staging buffer. Backend _unmap is a no-op for Metal.
+unmap :: proc(ptr: ptr) {
+    assert(ptr.kind == .Buffer || ptr.kind == .Index_Buffer)
+    _unmap(ptr.native)
 }

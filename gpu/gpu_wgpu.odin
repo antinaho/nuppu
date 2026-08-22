@@ -5,9 +5,8 @@ import "vendor:wgpu"
 import "core:fmt"
 import "core:log"
 import "core:strings"
-import "core:mem"
-import "base:intrinsics"
 import "base:runtime"
+import hm "core:container/handle_map"
 
 when GPU_BACKEND == GPU_BACKEND_WGPU {
 
@@ -32,23 +31,9 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         module: wgpu.ShaderModule,
     }
 
-    _Resource :: struct #raw_union {
-        index_buffer : struct {
-            el_count: int,
-            el_size: int,
-            buf: wgpu.Buffer,
-        },
-        using _ : struct {
-            ptr: ptr,
-            capacity: uint,
-            buffer: wgpu.Buffer,
-        },
-    }
-
-
-
     _ptr :: struct {
         buffer: wgpu.Buffer,
+        offset: uint, // Byte offset of this view into `buffer` (0 for top-level allocations)
         capacity: uint, // Capacity of the ptr, NOT the buffer
         index_bytes: u8,
     }
@@ -58,10 +43,11 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         assert(length <= parent.capacity - offset)
 
         result := parent
-        result.cpu = rawptr(uintptr(parent.cpu) + uintptr(offset))
-        result.gpu = rawptr(uintptr(parent.gpu) + uintptr(offset))
+        result.cpu      = rawptr(uintptr(parent.cpu) + uintptr(offset))
+        result.gpu      = rawptr(uintptr(parent.gpu) + uintptr(offset))
+        result.offset   = offset
         result.capacity = length
-        
+
         return result
     }
 
@@ -81,6 +67,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         },
         view: wgpu.TextureView,
     }
+
+    _barrier :: proc(before: Stage, after: Stage) { /* no op */ }
 
     _init :: proc(native_window: rawptr) -> bool {
 
@@ -205,11 +193,9 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         _state.curr_pipeline = pipeline
     }
 
-    _set_buffers :: proc(buffers: []ptr, offsets: []uint, range: Range, stage: Shader_Stage) {
+    _set_buffers :: proc(buffers: []ptr, range: Range, stage: Shader_Stage) {
         assert(len(buffers) > 0)
         assert(len(buffers) == int(range.length))
-        assert(len(offsets) == int(range.length))
-        assert(len(buffers) == len(offsets))
 
         pipe_desc := hm.static_get(&_state.pipelines, _state.curr_pipeline)
 
@@ -333,11 +319,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             depthStencil = nil,
         })
 
-        // _state.frame_dummy = wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor{
-        //     usage = {.Storage, .CopyDst},
-        //     size  = 16,
-        // })
-
         bg_entries: [8]wgpu.BindGroupEntry
         for B, I in pipe_desc.buffers {
             if B == {} {
@@ -349,7 +330,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             bg_entries[I] = wgpu.BindGroupEntry{
                 binding = u32(I),
                 buffer  = B.buffer,
-                offset  = 0,
+                offset  = u64(B.offset),
                 size    = u64(B.capacity),
             }
         }
@@ -367,10 +348,19 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         
         assert(index_buffer.kind == .Index_Buffer)
 
+        index_format: wgpu.IndexFormat
+        switch index_buffer.native.index_bytes {
+        case 2:
+            index_format = .Uint16
+        case 4:
+            index_format = .Uint32
+        case: panic("Index buffer format not supported")
+        }
+
         wgpu.RenderPassEncoderSetIndexBuffer(
             _state.render_pass_encoder,
-            index_buffer.buffer, .Uint32,
-            0, u64(index_buffer.capacity),
+            index_buffer.buffer, index_format,
+            u64(index_buffer.offset), u64(index_buffer.capacity),
         )
         
         wgpu.RenderPassEncoderDrawIndexed(
@@ -447,9 +437,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     _pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function_entry: string, fragment_shader: Shader_Handle, fragment_function_entry: string, format: Pixel_Format) -> Pipeline_Handle {
 
-        vertex_shader_m := hm.static_get(&_state.shaders, vertex_shader)
-        fragment_shader_m := hm.static_get(&_state.shaders, fragment_shader)
-
         handle := hm.static_add(&_state.pipelines, Pipeline_Descriptor {
                 vertex_shader = vertex_shader,
                 vertex_function = strings.clone(vertex_function_entry),
@@ -499,110 +486,19 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         wgpu.QueueSubmit(_state.queue, []wgpu.CommandBuffer{finished})
     }
 
-    
-    
-    
-    
-    
-    
     _end_frame :: proc() {
         wgpu.SurfacePresent(_state.surface)
     }
 
-//////////
-    _Buffer :: wgpu.Buffer
-
-
-    
-
-    // _destroy_res :: proc(res: _Resource, kind: Resource_Kind) {
-    //     switch kind {
-    //     case .Buffer, .Index_Buffer:
-    //         wgpu.BufferRelease(res.buffer)
-    //     }
-    // }
-
-    // _default_buffer :: proc(
-    //     name: string,
-    //     #any_int size: uint,
-    //     #any_int alignment: uint
-    // ) -> _Resource {
-        
-    //     bytes := runtime.align_forward_uint(size, alignment)
-
-    //     buffer := wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor {
-    //         label = name,
-    //         usage = {.CopySrc, .MapWrite},
-    //         size = u64(bytes),
-    //         mappedAtCreation = true,
-    //     })
-
-    //     cpu := wgpu.RawBufferGetMappedRange(buffer, 0, uint(size))
-
-    //     return _Resource {
-    //         ptr = ptr {
-    //             cpu = cpu,
-    //             gpu = nil,
-    //         },
-    //         capacity = uint(size),
-    //         buffer = buffer,
-    //     }
-    // }
-
-    // _gpu_buffer :: proc(
-    //     #any_int size: uint,
-    //     #any_int alignment: uint,
-    //     role: Role = .Default
-    // ) -> _Resource {
-
-    //     role_usage: wgpu.BufferUsage
-    //     switch role {
-    //     case .Default:
-    //         role_usage = .Storage
-    //     case .Index:
-    //         role_usage = .Index
-    //     }
-
-    //     buffer := wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor {
-    //         usage = {.CopyDst} + {role_usage},
-    //         size = u64(size),
-    //         mappedAtCreation = false,
-    //     })
-
-    //     return _Resource {
-    //         ptr = ptr {
-    //             cpu = nil,
-    //             gpu = nil,
-    //         },
-    //         capacity = uint(size),
-    //         buffer = buffer,
-    //     }
-    // }
-
-    // _readback_buffer :: proc(
-    //     size: u64
-    // ) -> _Resource {
-    //     buffer := wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor {
-    //         usage = {.CopyDst, .MapRead},
-    //         size = size,
-    //         mappedAtCreation = false,
-    //     })
-
-    //     return _Resource {
-    //         ptr = ptr {
-    //             cpu = nil,
-    //             gpu = nil,
-    //         },
-    //         capacity = uint(size),
-    //         buffer = buffer,
-    //     }
-    // }
-//////////
-
     _mem_copy :: proc(dst, src: ptr) {
-        fmt.println(dst)
-        fmt.println(src)
-        wgpu.CommandEncoderCopyBufferToBuffer(_state.command_encoder, src.buffer, 0, dst.buffer, 0, u64(src.capacity))
+        wgpu.CommandEncoderCopyBufferToBuffer(
+            _state.command_encoder,
+            src.native.buffer,
+            u64(src.native.offset),
+            dst.native.buffer,
+            u64(dst.native.offset),
+            u64(src.capacity),
+        )
     }
 
     _frame_arena :: proc() -> ^Arena {
@@ -621,7 +517,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     }
 
     _recycle_frame_arena :: proc(arena: ^Arena) {
-        
+
         //BufferMapCallback :: #type proc "c" (status: MapAsyncStatus, message: StringView, userdata1: rawptr, userdata2: rawptr)
         callback_ :: proc "c" (status: wgpu.MapAsyncStatus, message: wgpu.StringView, userdata1: rawptr, userdata2: rawptr) {
             context = _state.ctx
@@ -637,7 +533,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             _unmap(arena.ptr.native)
         }
 
-        
         wgpu.BufferMapAsync(arena.ptr.buffer, {.Write}, 0, arena.ptr.capacity, wgpu.BufferMapCallbackInfo {
             mode = .AllowProcessEvents,
             callback = callback_,
@@ -645,86 +540,60 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         })
     }
 
+    _map_range :: proc(ptr: _ptr) -> (cpu: rawptr, gpu: rawptr) {
+        assert(ptr.offset % 8 == 0)
+        assert(ptr.capacity > 0)
+        assert(ptr.capacity % 4 == 0)
 
-
-
-
-
-    _map_range :: proc(ptr: _ptr, length: uint, offset: uint = 0) -> (cpu: rawptr, gpu: rawptr) {
-        assert(offset % 8 == 0)
-        
-        assert(length > 0)
-        assert((length - offset) > 0)
-        assert((length - offset) % 4 == 0)
-        assert((length <= ptr.capacity))
-        
-        cpu = wgpu.RawBufferGetMappedRange(ptr.buffer, offset, length)
+        cpu = wgpu.RawBufferGetMappedRange(ptr.buffer, ptr.offset, ptr.capacity)
         gpu = nil
         return
     }
 
+    _gpu_address :: proc(p: _ptr) -> rawptr {
+        return nil
+    }
+
     _malloc :: proc(
-        #any_int size: uint,
-        #any_int alignment: uint,
-        m: Mem,
-        name: string,
-    ) -> _ptr {
-        bytes := runtime.align_forward_uint(size, alignment)
-    
-        buffer := wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor {
-            label = name,
-            usage = {.CopyDst, .Storage},
-            size = u64(bytes),
-            mappedAtCreation = false,
-        })
-
-        return _ptr {
-            buffer = buffer,
-            capacity = uint(bytes),
-        }
-    }
-
-
-    _malloc_mapped :: proc(
+        type: Buffer_Type,
         #any_int size: uint,
         #any_int alignment: uint,
         name: string,
-        loc := #caller_location
     ) -> _ptr {
         bytes := runtime.align_forward_uint(size, alignment)
 
-        buffer := wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor {
-            label = name,
-            usage = {.CopySrc, .MapWrite},
-            size = u64(bytes),
-            mappedAtCreation = true,
-        })
+        usage: wgpu.BufferUsageFlags
+        mapped: b32
 
-        return _ptr {
-            buffer = buffer,
-            capacity = uint(bytes),
+        switch type {
+        case .Staging:
+            usage  = {.CopySrc, .MapWrite}
+            mapped = true
+        case .GPU_Storage:
+            usage  = {.CopyDst, .Storage}
+            mapped = false
+        case .GPU_Constant:
+            usage  = {.CopyDst, .Uniform}
+            mapped = false
+        case .GPU_Index:
+            usage  = {.CopyDst, .Index}
+            mapped = false
+        case .Readback:
+            usage  = {.CopyDst, .MapRead}
+            mapped = false
         }
-    }
-
-    _malloc_index :: proc(
-        el_count: uint, el_size: uint,
-        name: string = {},
-        loc := #caller_location
-    ) -> _ptr {
-
-        bytes := el_count * el_size
 
         buffer := wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor {
             label = name,
-            usage = {.CopyDst, .Index},
+            usage = usage,
             size = u64(bytes),
-            mappedAtCreation = false,
+            mappedAtCreation = mapped,
         })
 
         return _ptr {
             buffer = buffer,
+            offset = 0,
             capacity = uint(bytes),
-            index_bytes = u8(el_size),
         }
     }
 
@@ -734,4 +603,3 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
 
 }
-import hm "core:container/handle_map"

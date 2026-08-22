@@ -55,8 +55,8 @@ when ODIN_OS == .JS {
 
     gpu.unmap(upload.ptr)
 
-    state.pos_gpu = gpu.malloc(Position, NUM_VERTICES, gpu.Mem.GPU, "Positions buffer")
-    state.color_gpu = gpu.malloc(Color, NUM_VERTICES, gpu.Mem.GPU, "Colors buffer")
+    state.pos_gpu   = gpu.malloc(.GPU_Storage, NUM_VERTICES, size_of(Position), align_of(Position), "Positions buffer")
+    state.color_gpu = gpu.malloc(.GPU_Storage, NUM_VERTICES, size_of(Color),    align_of(Color),    "Colors buffer")
     state.index_gpu = gpu.malloc_index(NUM_VERTICES, .Uint32, "Indices buffer")
 
     gpu.begin_frame_or_commands()
@@ -72,7 +72,7 @@ _update :: proc() {}
 
 _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.begin_frame_or_commands()
-    //frame_arena := gpu.frame_arena()
+    frame_arena := gpu.frame_arena()
 
     swapchain := gpu.acquire_next_swapchain()
     gpu.begin_render_pass({
@@ -83,7 +83,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     })
 
     gpu.set_pipeline(current.pso)
-    gpu.set_buffers({current.pos_gpu, current.color_gpu}, {0, 0}, {0, 2}, .Vertex)
+    gpu.set_buffers({current.pos_gpu, current.color_gpu}, {0, 2}, .Vertex)
     gpu.draw_indiced_primitives(.Triangle, current.index_gpu, 3, 0, 1, 0, 0)
 
     gpu.end_render_pass()
