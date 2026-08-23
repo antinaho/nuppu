@@ -456,7 +456,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return _Depth_Stencil_State(depth_state)
     }
 
-    _pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function_entry: string, fragment_shader: Shader_Handle, fragment_function_entry: string, format: Pixel_Format, depth_format: Pixel_Format = .Depth32Float) -> Pipeline_Handle {
+    _pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function_entry: string, fragment_shader: Shader_Handle, fragment_function_entry: string, format: Pixel_Format, depth_format: Pixel_Format) -> Pipeline_Handle {
         desc := MTL.RenderPipelineDescriptor.alloc()->init()
 	    defer desc->release()
 
@@ -494,6 +494,8 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _pixel_format_interop :: proc(format: Pixel_Format) -> MTL.PixelFormat {
         switch format {
+        case .None:
+            return .Invalid
         case .BGRA8Unorm:
             return .BGRA8Unorm
         case .Depth32Float:

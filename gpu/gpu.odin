@@ -132,6 +132,7 @@ resize_swapchain :: proc(width, height: i32) -> bool {
 
 
 Pixel_Format :: enum u8 {
+    None,
     BGRA8Unorm,
     Depth32Float,
 }
@@ -358,7 +359,7 @@ shader_init :: proc(name: string, code: []u8) -> Shader_Handle {
     return _shader_init(name, code)
 }
 
-pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function: string, fragment_shader: Shader_Handle, fragment_function: string, format: Pixel_Format, depth_format: Pixel_Format = .Depth32Float) -> Pipeline_Handle {
+pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function: string, fragment_shader: Shader_Handle, fragment_function: string, format: Pixel_Format, depth_format: Pixel_Format = .None) -> Pipeline_Handle {
     return _pipeline_init(vertex_shader, vertex_function, fragment_shader, fragment_function, format, depth_format)
 }
 

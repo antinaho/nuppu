@@ -744,6 +744,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     _pixel_format_interop :: proc(format: Pixel_Format) -> wgpu.TextureFormat {
         switch format {
+        case .None:
+            return .Undefined
         case .BGRA8Unorm:
             return .BGRA8Unorm
         case .Depth32Float:
