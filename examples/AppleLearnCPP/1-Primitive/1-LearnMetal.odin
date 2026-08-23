@@ -53,7 +53,7 @@ when ODIN_OS == .JS {
     indices := gpu.arena_alloc(&upload, u32, NUM_VERTICES)
     mem.copy_non_overlapping(indices.cpu, &[3]u32{ 0, 1, 2 }, 3 * size_of(u32))
 
-    gpu.unmap(upload.ptr)
+    gpu.unmap(&upload)
 
     state.pos_gpu   = gpu.malloc(.GPU_Storage, NUM_VERTICES, size_of(Position), align_of(Position), "Positions buffer")
     state.color_gpu = gpu.malloc(.GPU_Storage, NUM_VERTICES, size_of(Color),    align_of(Color),    "Colors buffer")

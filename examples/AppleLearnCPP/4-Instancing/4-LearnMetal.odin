@@ -8,13 +8,13 @@ import "core:math"
 import "core:math/linalg"
 
 State :: struct {
-    pso: gpu.Resource,
-
     pos_gpu: gpu.ptr,
     index_gpu: gpu.ptr,
     instance_gpu: gpu.ptr,
 
     angle: f32,
+
+    pso: gpu.Pipeline_Handle,
 }
 
 Position :: [3]f32
@@ -26,7 +26,7 @@ Instance_Data :: struct #align(16) {
 }
 
 state: ^State
-
+import "core:mem"
 _init :: proc() {
 when ODIN_OS == .Darwin {
     shader_code := #load("instancing.metal", []u8)
@@ -41,34 +41,31 @@ when ODIN_OS == .JS {
     NUM_VERTICES :: 4
     NUM_INDICES :: 6
     s :: 0.5
+//
+    upload := gpu.arena()
 
-    upload_arena := gpu.arena_init()
-    defer gpu.arena_deinit(&upload_arena)
-
-    positions := gpu.arena_alloc(&upload_arena, Position, NUM_VERTICES)
-    gpu.arena_copy(positions, []Position{
+    positions := gpu.arena_alloc(&upload, Position, NUM_VERTICES)
+    mem.copy_non_overlapping(positions.cpu, &[NUM_VERTICES]Position{
         { -s, -s, +s },
         { +s, -s, +s },
         { +s, +s, +s },
-        { -s, +s, +s },
-    })
+        { -s, +s, +s },    
+    }, NUM_VERTICES * size_of(Position))
     
-    indices := gpu.arena_alloc(&upload_arena, u32, NUM_INDICES)
-    gpu.arena_copy(indices, []u32{
-        0, 1, 2, 
-        2, 3, 0,
-    })
+    indices := gpu.arena_alloc(&upload, u32, NUM_INDICES)
+    mem.copy_non_overlapping(indices.cpu, &[NUM_INDICES]u32{
+        0, 1, 2, 2, 3, 0    
+    }, NUM_INDICES * size_of(u32))
     
-    gpu.arena_upload_stop(&upload_arena)
-    
-    state.pos_gpu = gpu.buffer_init(size_of(Position) * NUM_VERTICES, align_of(Position), .GPU_Only)
-    state.index_gpu = gpu.buffer_init(size_of(u32) * NUM_INDICES, align_of(u32), .GPU_Only)
-    
-    state.instance_gpu = gpu.buffer_init(INSTANCE_COUNT * size_of(Instance_Data), align_of(Instance_Data), .GPU_Only)
+    gpu.unmap(&upload.ptr)    
+//
+    state.pos_gpu = gpu.malloc(.GPU_Storage, NUM_VERTICES, size_of(Position), align_of(Position), "Positions")
+    state.index_gpu = gpu.malloc_index(NUM_INDICES, .Uint32, "Indices")    
+    state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance_Data), align_of(Instance_Data), "Instances")
 
     gpu.begin_frame_or_commands()
-    gpu.mem_copy(state.pos_gpu, positions, size_of(Position) * NUM_VERTICES)
-    gpu.mem_copy(state.index_gpu, indices, size_of(u32) * NUM_INDICES)
+    gpu.copy(state.pos_gpu, positions)
+    gpu.copy(state.index_gpu, indices)
     gpu.barrier(.Transfer, .All)
     gpu.commit()
 }
@@ -79,14 +76,10 @@ _update :: proc() {
 
 _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.begin_frame_or_commands()
+    frame_arena := gpu.frame_arena()
     scl :: 0.12
 
-
-when gpu.GPU_BACKEND == gpu.GPU_BACKEND_WGPU {
-    frame_arena := gpu.frame_arena()
-     defer gpu.frame_arena_deinit(frame_arena) 
     instances := gpu.arena_alloc(frame_arena, Instance_Data, INSTANCE_COUNT)
-
     for &isnt, idx in ([^]Instance_Data)(instances.cpu)[:INSTANCE_COUNT] {
         i := f32(idx) / f32(INSTANCE_COUNT)
         x_off := (i * 2 - 1) + (1.0 / INSTANCE_COUNT)
@@ -99,13 +92,11 @@ when gpu.GPU_BACKEND == gpu.GPU_BACKEND_WGPU {
         })
         isnt.color = [4]f32{i, 1 - i, math.sin(math.PI * i), 1}
     }
+    gpu.unmap(&frame_arena.ptr)
 
-    gpu.arena_upload_stop(frame_arena)
-   
-
-    gpu.mem_copy(current.instance_gpu, instances, size_of(Instance_Data) * INSTANCE_COUNT)
-}
-
+    gpu.copy(current.instance_gpu, instances)
+    gpu.barrier(.Transfer, .All)
+    
     // instances_staging := gpu.buffer_init(size_of(Instance_Data) * INSTANCE_COUNT, align_of(Instance_Data), .CPU_GPU)
     // instances_array := slice.from_ptr((^Instance_Data)(instances_staging.cpu), INSTANCE_COUNT)
     // 
@@ -131,11 +122,11 @@ when gpu.GPU_BACKEND == gpu.GPU_BACKEND_WGPU {
         load_action = .Clear,
         store_action = .Store,
         texture = swapchain,
-    })
+    }, {})
 
     gpu.set_pipeline(current.pso)
 
-    gpu.set_buffers({current.pos_gpu, current.instance_gpu}, {0, 0}, {0, 2}, .Vertex)
+    gpu.set_buffers({current.pos_gpu, current.instance_gpu}, {0, 2}, .Vertex)
 
     gpu.draw_indiced_primitives(
     .Triangle,
@@ -147,7 +138,7 @@ when gpu.GPU_BACKEND == gpu.GPU_BACKEND_WGPU {
     gpu.end_render_pass()
     gpu.commit()
 
-    defer gpu.end_frame()
+    gpu.end_frame()
 }
 
 desc := nuppu.App_Desc(State) {

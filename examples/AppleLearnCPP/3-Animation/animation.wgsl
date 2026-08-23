@@ -5,13 +5,13 @@ struct v2f {
 
 @group(0) @binding(0) var<storage, read> a_positions: array<f32>;
 @group(0) @binding(1) var<storage, read> a_colors:    array<f32>;
-@group(0) @binding(2) var<uniform> u_angle:           vec4<f32>;
+@group(0) @binding(2) var<uniform>        u_angle:    vec4<f32>;
 
 @vertex
 fn vertexMain(@builtin(vertex_index) vid: u32) -> v2f {
     var out: v2f;
 
-    let a = u_angle[0].x;
+    let a = u_angle.x;
 
     let m = mat3x3<f32>(
         vec3<f32>( sin(a),  cos(a), 0.0),
