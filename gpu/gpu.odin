@@ -32,7 +32,6 @@ FRAME_ARENA_SIZE :: 4 * 1024 * 1024
 
 MAX_PIPELINES :: 64
 MAX_SHADERS :: 64
-MAX_TEXTURES :: 1 << 16 - 2
 
 Shader_Handle :: distinct hm.Handle32
 Pipeline_Handle :: distinct hm.Handle32
@@ -47,12 +46,11 @@ State :: struct #align(64) {
     frame_arenas: [dynamic; FRAMES_IN_FLIGHT]^Arena,
     frame_n: u64,
 
-    depth_texture: Texture_Handle,
+    depth_texture: Texture,
 
     pipelines: hm.Static_Handle_Map(MAX_PIPELINES, Pipeline_Descriptor, Pipeline_Handle), // holds descriptor and native pso object for now
     shaders: hm.Static_Handle_Map(MAX_SHADERS, Shader, Shader_Handle),
     depth_stencil_states: hm.Static_Handle_Map(MAX_DEPTH_STENCIL_STATES, Depth_Stencil_State, Depth_Stencil_Handle),
-    textures: hm.Static_Handle_Map(MAX_TEXTURES, Texture, Texture_Handle),
 }
 
 Depth_Stencil_Handle :: distinct hm.Handle16
@@ -85,7 +83,7 @@ Resource_Usage_Flag :: enum u64 {
 }
 Resource_Usage :: distinct bit_set[Resource_Usage_Flag; u64]
 
-depth :: proc() -> Texture_Handle {
+depth :: proc() -> Texture {
     return _state.depth_texture
 }
 
@@ -376,7 +374,11 @@ end_frame :: proc() {
 }
 
 acquire_next_swapchain :: proc() -> Texture {
-    return _acquire_next_swapchain()
+    native := _acquire_next_swapchain()
+
+    return Texture {
+        native = native,
+    }
 }
 
 set_pipeline :: proc(pipeline: Pipeline_Handle) {
@@ -390,7 +392,7 @@ set_buffers :: proc(buffers: []ptr, range: Range, stage: Shader_Stage) {
 Depth_Attachment :: struct {
     load_action: Load_Action,
     store_action: Store_Action,
-    texture: Texture_Handle,
+    texture: Texture,
 }
 
 Texture_Descriptor :: struct {
@@ -413,17 +415,15 @@ Texture_Usage_Flags :: enum u64 {
 }
 Texture_Usage :: bit_set[Texture_Usage_Flags; u64]
 
-NIL_TEXTURE_HANDLE :: Texture_Handle{}
 Texture :: struct {
-    handle: Texture_Handle,
-    using impl: _Texture,
+    using native: _Texture,
 }
 
 Texture_Type :: enum u8 {
     _2D,
 }
 
-texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture_Handle {
+texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture {
     desc := Texture_Descriptor {
         dimensions = dimensions,
         format = format,
@@ -434,21 +434,19 @@ texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture_
     return texture_init(desc)
 }
 
-texture_init :: proc(desc: Texture_Descriptor) -> Texture_Handle {
-    _tex := _texture_init(desc)
+texture_init :: proc(desc: Texture_Descriptor) -> Texture {
+    native := _texture_init(desc)
 
-    handle := hm.static_add(&_state.textures, Texture {
-        impl = _tex,
-    })
+    tex := Texture { native = native }
 
-    return handle
+    return tex
 }
 
 set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_Handle) {
     _set_depth_stencil_state(depth_stencil_state)
 }
 
-begin_render_pass :: proc(color_attachment: Color_Attachment, depth_attachment: Depth_Attachment) {
+begin_render_pass :: proc(color_attachment: Color_Attachment, depth_attachment: Depth_Attachment = {}) {
     _begin_render_pass(color_attachment, depth_attachment)
 }
 

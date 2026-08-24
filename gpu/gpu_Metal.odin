@@ -15,16 +15,17 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         device: ^MTL.Device,
         metal_layer: ^CA.MetalLayer,
         queue: ^MTL.CommandQueue,
-
         //
-        curr_swapchain: Texture,
-
         frame_pool: ^NS.AutoreleasePool,
         command_buffer: ^MTL.CommandBuffer,
-
-        render_pass_descriptor: ^MTL.RenderPassDescriptor,
+        curr_drawable: _Texture, // Swapchain
         render_command_encoder: ^MTL.RenderCommandEncoder,
+
+        
+
+        
         blit_command_encoder: ^MTL.BlitCommandEncoder,
+        compute_command_encoder: ^MTL.ComputeCommandEncoder,
 
         curr_pipeline: Pipeline_Handle,
     }
@@ -63,16 +64,11 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _resize_depth_texture :: proc(width, height: i32) {
         swapchain_dims := _state.metal_layer->drawableSize()
-        texture_impl := hm.static_get(&_state.textures, _state.depth_texture)
-
-        texture_impl.T.(^MTL.Texture)->release()
-        hm.static_remove(&_state.textures, _state.depth_texture)
-
+        _state.depth_texture.native.texture->release()
         _state.depth_texture = texture_depth_init({u32(swapchain_dims.width), u32(swapchain_dims.height)}, .Depth32Float)
     }
 
     _deinit :: proc() {
-        _barrier(.All, .All)
         // frame arena
         _state.metal_layer->release()
         _state.queue->release()
@@ -89,16 +85,10 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         _state.command_buffer = _state.queue->commandBufferWithDescriptor(buffer_desc)
     }
 
-    _commit :: proc() {
-        if drawable, ok := _state.curr_swapchain.T.(^CA.MetalDrawable); ok {
-            _state.command_buffer->presentDrawable(drawable)
-        }
-        _state.command_buffer->commit()
-    }
+    
 
     _end_frame :: proc() {
         _state.frame_pool->drain()
-        _state.curr_swapchain.T = nil
 
         // Hack to signal the event to the next frame
         _state.frame_pool = NS.AutoreleasePool.alloc()->init()
@@ -111,42 +101,20 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         _state.command_buffer = _state.queue->commandBufferWithDescriptor(buffer_desc)
         _state.command_buffer->encodeSignalEvent((^MTL.SharedEvent)(_state.frame_semaphore), _state.frame_n) // frame_n incremented in gpu.end_frame() after this is called
         _state.command_buffer->commit()
+
+
+        _state.frame_pool = {}
+        _state.command_buffer = {}
+        _state.curr_drawable = {}
+        _state.render_command_encoder = {}
     }
 
-    _semaphore :: proc(value: u64) -> Semaphore {
-        event := _state.device->newSharedEvent()
-        event->setSignaledValue(value)
-        return Semaphore(event)
-    }
 
-    _semaphore_wait :: proc(semaphore: Semaphore, value: u64) -> bool {
-        event := (^MTL.SharedEvent)(semaphore)
-        
-        if event->signaledValue() >= value {
-            return true
-        }
-        
-        // implement timeout later
-        //timestamp := time.now()
-        //has_deadline := timeout_milliseconds != time.MAX_DURATION
 
-        for {
-            if event->signaledValue() >= value {
-                return true
-            }
-
-            // if has_deadline && time.diff(timestamp, time.now()) >= timeout_milliseconds {
-            //     return false
-            // }
-
-            time.sleep(10 * time.Millisecond)
-        }
-    }
-
-    _Texture :: struct {
-        T : union {
-            ^MTL.Texture,
-            ^CA.MetalDrawable,
+    _Texture :: struct #raw_union {
+        using _ : struct {
+            texture: ^MTL.Texture,
+            drawable: ^CA.MetalDrawable,
         }
     }
 
@@ -258,24 +226,20 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             log.panic("gpu_MTL.odin: MTL_texture_init: failed to create texture")
         }
 
-        return _Texture {
-            T = texture,
-        }
+        return _Texture { texture = texture }
     }
 
-    _acquire_next_swapchain :: proc() -> Texture {
+    _acquire_next_swapchain :: proc() -> _Texture {
         drawable := _state.metal_layer->nextDrawable()
         if drawable == nil {
-            panic("_acquire_next_swapchain: no drawable")
+            panic("In gpu_Metal.odin: _acquire_next_swapchain: Couldn't acquire next drawable")
         }
 
-        result := Texture {
-            T = drawable
-        }
+        native := _Texture { drawable = drawable, texture = drawable->texture() }
+        
+        _state.curr_drawable = native
 
-        _state.curr_swapchain = result
-
-        return result
+        return native
     }
 
     _set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_Handle) {
@@ -285,29 +249,23 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_Attachment) {
         pass_descriptor := MTL.RenderPassDescriptor.renderPassDescriptor()
+        defer pass_descriptor->release()
 
         color_attachment := pass_descriptor->colorAttachments()->object(0)
         color_attachment->setClearColor(_to_clear_color(c_attachment.clear_color))
         color_attachment->setLoadAction(_load_action_interop(c_attachment.load_action))
         color_attachment->setStoreAction(_store_action_interop(c_attachment.store_action))
-        switch t in c_attachment.texture.T {
-        case ^MTL.Texture:
-            color_attachment->setTexture(t)
-        case ^CA.MetalDrawable:
-            color_attachment->setTexture(t->texture())
-        }
-
-        if d_attachment.texture != NIL_TEXTURE_HANDLE {
-            depth_texture_target := hm.static_get(&_state.textures, d_attachment.texture)
+        color_attachment->setTexture(c_attachment.texture.native.texture)
+        
+        if d_attachment.texture.native.texture != nil {
             depth_desc := pass_descriptor->depthAttachment()
             depth_desc->setLoadAction(_load_action_interop(d_attachment.load_action))
             depth_desc->setStoreAction(_store_action_interop(d_attachment.store_action))
-            depth_desc->setTexture(depth_texture_target.T.(^MTL.Texture))
+            depth_desc->setTexture(d_attachment.texture.native.texture)
             // depth_desc->setClearDepth(1.0)
         }
 
-        _state.render_pass_descriptor = pass_descriptor
-        _state.render_command_encoder = _state.command_buffer->renderCommandEncoderWithDescriptor(_state.render_pass_descriptor)
+        _state.render_command_encoder = _state.command_buffer->renderCommandEncoderWithDescriptor(pass_descriptor)
     }
 
     _end_render_pass :: proc() {
@@ -315,43 +273,11 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             assert(_state.render_command_encoder != nil, "_end_render_pass: no render pass is active")
         }
 
-        if _state.render_command_encoder != nil {
-            _state.render_command_encoder->endEncoding()
-            _state.render_command_encoder = nil
-        }
+        _state.render_command_encoder->endEncoding()
+        _state.render_command_encoder = nil
     }
 
-    _barrier :: proc(before: Stage, after: Stage) {
-        switch before {
-        case .Transfer:
-            if _state.blit_command_encoder != nil {
-                _state.blit_command_encoder->endEncoding()
-                _state.blit_command_encoder = nil
-            }
-        case .All:
-            if _state.blit_command_encoder != nil {
-                _state.blit_command_encoder->endEncoding()
-                _state.blit_command_encoder = nil
-            }
-            if _state.render_command_encoder != nil {
-                _state.render_command_encoder->endEncoding()
-                _state.render_command_encoder = nil
-            }
-
-            // if _state.compute_command_encoder != nil {
-            //     _state.compute_command_encoder->endEncoding()
-            //     _state.compute_command_encoder = nil
-            // }
-
-        case .Compute:
-            // if _state.compute_command_encoder != nil {
-            //     _state.compute_command_encoder->endEncoding()
-            //     _state.compute_command_encoder = nil
-            // }
-        }
-
-        _ = after
-    }
+    
 
 
 
@@ -456,6 +382,37 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return _Depth_Stencil_State(depth_state)
     }
 
+    __Pipeline_Descriptor :: struct {
+        handle: Pipeline_Handle,
+
+        vertex_shader:   Shader_Handle, vertex_function:   string,
+        fragment_shader: Shader_Handle, fragment_function: string, 
+    
+        multisample: Multisample_State,
+
+        blend: Blend_State,
+    
+        depth_format: Pixel_Format,
+        format: Pixel_Format,
+
+        primitive: Primitive_State,
+
+        buffers: [8]ptr,
+
+        index_buffer: ptr,
+    }
+
+
+    _set_blend :: proc() {
+        // color_attachment->setBlendingEnabled(true)
+        // color_attachment->setRgbBlendOperation(_blend_operation_interop(desc.blend.color.operation))
+        // color_attachment->setSourceRGBBlendFactor(_blend_factor_interop(desc.blend.color.srcFactor))
+        // color_attachment->setDestinationRGBBlendFactor(_blend_factor_interop(desc.blend.color.dstFactor))
+        // color_attachment->setAlphaBlendOperation(_blend_operation_interop(desc.blend.alpha.operation))
+        // color_attachment->setSourceAlphaBlendFactor(_blend_factor_interop(desc.blend.alpha.srcFactor))
+        // color_attachment->setDestinationAlphaBlendFactor(_blend_factor_interop(desc.blend.alpha.dstFactor))
+    }
+
     _pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function_entry: string, fragment_shader: Shader_Handle, fragment_function_entry: string, format: Pixel_Format, depth_format: Pixel_Format) -> Pipeline_Handle {
         desc := MTL.RenderPipelineDescriptor.alloc()->init()
 	    defer desc->release()
@@ -476,8 +433,10 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         desc->setVertexFunction(vertex_function)
         desc->setFragmentFunction(fragment_function)
         desc->setDepthAttachmentPixelFormat(_pixel_format_interop(depth_format))
-        desc->colorAttachments()->object(0)->setPixelFormat(_pixel_format_interop(format))
 
+        color_attachment := desc->colorAttachments()->object(0)
+        color_attachment->setPixelFormat(_pixel_format_interop(format))
+        
         pso, err := _state.device->newRenderPipelineStateWithDescriptor(desc)
         if err != nil {
             log.panicf("Failed to create pipeline state: %v", err->localizedDescription()->odinString())
@@ -686,6 +645,76 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             buffer = buffer,
             offset = 0,
             capacity = uint(bytes),
+        }
+    }
+
+    //////////////////////////////////////////////////////////////
+    // Synchronization
+
+    _barrier :: proc(before: Stage, after: Stage) {
+        switch before {
+        case .Transfer:
+            if _state.blit_command_encoder != nil {
+                _state.blit_command_encoder->endEncoding()
+                _state.blit_command_encoder = nil
+            }
+        case .All:
+            if _state.blit_command_encoder != nil {
+                _state.blit_command_encoder->endEncoding()
+                _state.blit_command_encoder = nil
+            }
+            if _state.render_command_encoder != nil {
+                _state.render_command_encoder->endEncoding()
+                _state.render_command_encoder = nil
+            }
+
+            if _state.compute_command_encoder != nil {
+                _state.compute_command_encoder->endEncoding()
+                _state.compute_command_encoder = nil
+            }
+
+        case .Compute:
+            if _state.compute_command_encoder != nil {
+                _state.compute_command_encoder->endEncoding()
+                _state.compute_command_encoder = nil
+            }
+        }
+
+        _ = after
+    }
+
+    _commit :: proc() {
+        _state.command_buffer->presentDrawable(_state.curr_drawable.drawable)
+        _state.command_buffer->commit()
+    }
+
+    _semaphore :: proc(value: u64) -> Semaphore {
+        event := _state.device->newSharedEvent()
+        event->setSignaledValue(value)
+        return Semaphore(event)
+    }
+
+    _semaphore_wait :: proc(semaphore: Semaphore, value: u64) -> bool {
+        event := (^MTL.SharedEvent)(semaphore)
+        
+        if event->signaledValue() >= value {
+            return true
+        }
+        
+        // implement timeout later
+        // timestamp := time.now()
+        // has_deadline := timeout_milliseconds != time.MAX_DURATION
+
+        for {
+            if event->signaledValue() >= value {
+                return true
+            }
+
+            // if has_deadline && time.diff(timestamp, time.now()) >= timeout_milliseconds {
+            //     return false
+            // }
+
+            time.sleep(10 * time.Millisecond)
         }
     }
 }
