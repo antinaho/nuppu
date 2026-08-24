@@ -48,6 +48,7 @@ State :: struct #align(64) {
     depth_texture: Texture,
 
     pipelines: hm.Static_Handle_Map(MAX_PIPELINES, Pipeline_Descriptor, Pipeline_Handle), // holds descriptor and native pso object for now
+    compute_pipelines: hm.Static_Handle_Map(16, Compute_Pipeline_Descriptor, Compute_Pipeline_Handle),
     shaders: hm.Static_Handle_Map(MAX_SHADERS, Shader, Shader_Handle),
     depth_stencil_states: hm.Static_Handle_Map(MAX_DEPTH_STENCIL_STATES, Depth_Stencil_State, Depth_Stencil_Handle),
 }
@@ -205,6 +206,8 @@ Pipeline_Descriptor :: struct {
     primitive: Primitive_State,
 
     buffers: [8]ptr,
+    textures: [8]Texture,
+    samplers: [8]Sampler,
 
     index_buffer: ptr,
 
@@ -359,8 +362,20 @@ shader_init :: proc(name: string, code: []u8) -> Shader_Handle {
     return _shader_init(name, code)
 }
 
+compute_shader_init :: proc(name: string, code: []u8) -> Shader_Handle {
+    return _shader_init(name, code)
+}
+
 pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function: string, fragment_shader: Shader_Handle, fragment_function: string, format: Pixel_Format, depth_format: Pixel_Format = .None) -> Pipeline_Handle {
     return _pipeline_init(vertex_shader, vertex_function, fragment_shader, fragment_function, format, depth_format)
+}
+Compute_Pipeline_Handle :: distinct hm.Handle32
+Compute_Pipeline_Descriptor :: struct {
+    handle: Compute_Pipeline_Handle,
+    using native: _Compute_Pipeline,
+}
+compute_pipeline_init :: proc(shader: Shader_Handle, entry_point: string) -> Compute_Pipeline_Handle {
+    return _compute_pipeline_init(shader, entry_point)
 }
 
 //////////////////////////////////////////////////////////////
@@ -394,6 +409,14 @@ acquire_next_swapchain :: proc() -> Texture {
     }
 }
 
+compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
+    _compute_dispatch(num_groups, num_threads_per_group)
+}
+
+set_compute_pipeline :: proc(pipeline: Compute_Pipeline_Handle) {
+    _set_compute_pipeline(pipeline)
+}
+
 set_pipeline :: proc(pipeline: Pipeline_Handle) {
     _set_pipeline(pipeline)
 }
@@ -406,13 +429,55 @@ set_textures :: proc(textures: []Texture, range: Range, stage: Shader_Stage) {
     _set_textures(textures, range, stage)
 }
 
+set_samplers :: proc(samplers: []Sampler, range: Range, stage: Shader_Stage) {
+    _set_samplers(samplers, range, stage)
+}
+
+Sampler :: struct {
+    using native: _Sampler,
+}
+
+Sampler_Min_Mag_Filter :: enum u8 {
+	Nearest = 0,
+	Linear  = 1,
+}
+
+Sampler_Mip_Filter :: enum u8 {
+	NotMipmapped = 0,
+	Nearest      = 1,
+	Linear       = 2,
+}
+
+Sampler_Address_Mode :: enum u8 {
+	ClampToEdge  = 0,
+	MirrorRepeat = 1,
+	Repeat       = 2,
+}
+
+Sampler_Descriptor :: struct {
+    min_filter: Sampler_Min_Mag_Filter,
+    mag_filter: Sampler_Min_Mag_Filter,
+    mip_filter: Sampler_Mip_Filter,
+    wrap_s: Sampler_Address_Mode,
+    wrap_t: Sampler_Address_Mode,
+    wrap_r: Sampler_Address_Mode,
+}
+
+sampler_init :: proc(desc: Sampler_Descriptor) -> Sampler {
+    native := _sampler_init(desc)
+    
+    return Sampler {
+        native = native,
+    }
+}
+
 Depth_Attachment :: struct {
     load_action: Load_Action,
     store_action: Store_Action,
     texture: Texture,
 }
 
-Texture_Descriptor :: struct {
+Texture_Descriptor :: struct #all_or_none {
     dimensions: [2]u32,
     format: Pixel_Format,
     storage: StorageMode,
@@ -425,12 +490,12 @@ StorageMode :: enum u8 {
 	Private    = 2,
 }
 
-Texture_Usage_Flags :: enum u64 {
-    ShaderRead,
-    ShaderWrite,
-    RenderTarget,
+Texture_Usage :: enum u8 {
+    Sampled,
+    Storage,
+    Color_Attachment,
+    Depth_Attachment,
 }
-Texture_Usage :: bit_set[Texture_Usage_Flags; u64]
 
 Texture :: struct {
     using native: _Texture,
@@ -444,7 +509,7 @@ texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture 
     desc := Texture_Descriptor {
         dimensions = dimensions,
         format = format,
-        usage = {.RenderTarget},
+        usage = .Depth_Attachment,
         storage = .Private,
         type = ._2D,
     }

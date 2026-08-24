@@ -77,7 +77,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             height             = u32(size.y),
             depthOrArrayLayers = u32(size.z),
         }
-        data_size := u64(bytes_per_row) * u64(size.y) * u64(max(size.z, 1))
+        data_size := uint(bytes_per_row) * uint(size.y) * uint(max(size.z, 1))
 
         wgpu.QueueWriteTexture(_state.queue, &destination, data, data_size, &layout, &write_size)
     }
@@ -211,6 +211,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
         return handle
     }
+
+
 
     _pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function_entry: string, fragment_shader: Shader_Handle, fragment_function_entry: string, format: Pixel_Format, depth_format: Pixel_Format = .Depth32Float) -> Pipeline_Handle {
 
@@ -357,7 +359,27 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     }
 
     _set_textures :: proc(textures: []Texture, range: Range, stage: Shader_Stage) {
-        
+        assert(len(textures) > 0)
+        assert(len(textures) == int(range.length))
+
+        pipe_desc := hm.static_get(&_state.pipelines, _state.curr_pipeline)
+
+        for slot in range.location ..< range.location + range.length {
+            i := slot - range.location
+            pipe_desc.textures[i] = textures[i]
+        }
+    }
+
+    _set_samplers :: proc(samplers: []Sampler, range: Range, stage: Shader_Stage) {
+        assert(len(samplers) > 0)
+        assert(len(samplers) == int(range.length))
+
+        pipe_desc := hm.static_get(&_state.pipelines, _state.curr_pipeline)
+
+        for slot in range.location ..< range.location + range.length {
+            i := slot - range.location
+            pipe_desc.samplers[i] = samplers[i]
+        }
     }
 
     _Depth_Stencil_State :: wgpu.DepthStencilState
@@ -392,16 +414,22 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         unreachable()
     }
 
-    _texture_usage_interop :: proc(usage: Texture_Usage_Flags) -> wgpu.TextureUsage {
+    _texture_usage_interop :: proc(usage: Texture_Usage, storage: StorageMode) -> wgpu.TextureUsageFlags {
+        flags: wgpu.TextureUsageFlags
         switch usage {
-        case .ShaderRead:
-            return .StorageBinding
-        case .ShaderWrite:
-            return .StorageBinding
-        case .RenderTarget:
-            return .RenderAttachment
+        case .Sampled:
+            flags = {.TextureBinding}
+        case .Storage:
+            flags = {.StorageBinding}
+        case .Color_Attachment:
+            flags = {.RenderAttachment, .TextureBinding}
+        case .Depth_Attachment:
+            flags = {.RenderAttachment}
         }
-        unreachable()
+        if storage == .Shared && (usage == .Sampled || usage == .Storage) {
+            flags += {.CopyDst}
+        }
+        return flags
     }
     
     _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
@@ -411,7 +439,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         desc.sampleCount = 1
         desc.dimension = _texture_type_interop(texture_descriptor.type)
         desc.format = _pixel_format_interop(texture_descriptor.format)
-        desc.usage = bit_set_to_another(texture_descriptor.usage, wgpu.TextureUsageFlags, _texture_usage_interop)
+        desc.usage = _texture_usage_interop(texture_descriptor.usage, texture_descriptor.storage)
 
         texture := wgpu.DeviceCreateTexture(_state.device, &desc)
         if texture == nil {
@@ -453,6 +481,55 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         return dpso
     }
 
+    _Sampler :: struct {
+        sampler: wgpu.Sampler,
+    }
+
+    _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
+        address_mode_interop :: proc(m: Sampler_Address_Mode) -> wgpu.AddressMode {
+            switch m {
+            case .ClampToEdge:  return .ClampToEdge
+            case .MirrorRepeat: return .MirrorRepeat
+            case .Repeat:       return .Repeat
+            }
+            unreachable()
+        }
+
+        filter_mode_interop :: proc(m: Sampler_Min_Mag_Filter) -> wgpu.FilterMode {
+            switch m {
+            case .Nearest: return .Nearest
+            case .Linear:  return .Linear
+            }
+            unreachable()
+        }
+
+        mip_filter_interop :: proc(m: Sampler_Mip_Filter) -> wgpu.MipmapFilterMode {
+            switch m {
+            case .NotMipmapped: return .Nearest
+            case .Nearest:      return .Nearest
+            case .Linear:       return .Linear
+            }
+            unreachable()
+        }
+
+        wgpu_desc := wgpu.SamplerDescriptor {
+            addressModeU  = address_mode_interop(desc.wrap_s),
+            addressModeV  = address_mode_interop(desc.wrap_t),
+            addressModeW  = address_mode_interop(desc.wrap_r),
+            magFilter     = filter_mode_interop(desc.mag_filter),
+            minFilter     = filter_mode_interop(desc.min_filter),
+            mipmapFilter  = mip_filter_interop(desc.mip_filter),
+            lodMinClamp   = 0,
+            lodMaxClamp   = 32,
+            maxAnisotropy = 1,
+        }
+
+        sampler := wgpu.DeviceCreateSampler(_state.device, &wgpu_desc)
+
+        return _Sampler {
+            sampler = sampler,
+        }
+    }
 
     _draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
         p := _state.curr_pipeline
@@ -460,7 +537,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         pipe_desc := hm.static_get(&_state.pipelines, _state.curr_pipeline)
         
         entry_count := 0
-        bg_layout_entries: [8]wgpu.BindGroupLayoutEntry
+        bg_layout_entries: [24]wgpu.BindGroupLayoutEntry
         for B, I in pipe_desc.buffers {
             if B == {} {
                 continue
@@ -473,6 +550,38 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
                     type             = B.binding_type,
                     hasDynamicOffset = false,
                     minBindingSize   = 0,
+                },
+            }
+
+            entry_count += 1
+        }
+        for T, I in pipe_desc.textures {
+            if T.view == nil {
+                continue
+            }
+
+            bg_layout_entries[entry_count + I] = wgpu.BindGroupLayoutEntry{
+                binding    = u32(entry_count + I),
+                visibility = {.Fragment},
+                texture = wgpu.TextureBindingLayout{
+                    sampleType    = .Float,
+                    viewDimension = ._2D,
+                    multisampled  = false,
+                },
+            }
+
+            entry_count += 1
+        }
+        for S, I in pipe_desc.samplers {
+            if S.sampler == nil {
+                continue
+            }
+
+            bg_layout_entries[entry_count + I] = wgpu.BindGroupLayoutEntry{
+                binding    = u32(entry_count + I),
+                visibility = {.Fragment},
+                sampler = wgpu.SamplerBindingLayout{
+                    type = .Filtering,
                 },
             }
 
@@ -571,7 +680,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             depthStencil = nil if !depth_set else &dpso,
         })
 
-        bg_entries: [8]wgpu.BindGroupEntry
+        bg_entries: [24]wgpu.BindGroupEntry
+        entry_count = 0
         for B, I in pipe_desc.buffers {
             if B == {} {
                 continue
@@ -585,6 +695,29 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
                 offset  = u64(B.offset),
                 size    = u64(B.capacity),
             }
+            entry_count += 1
+        }
+        for T, I in pipe_desc.textures {
+            if T.view == nil {
+                continue
+            }
+
+            bg_entries[entry_count + I] = wgpu.BindGroupEntry{
+                binding    = u32(entry_count + I),
+                textureView = T.view,
+            }
+            entry_count += 1
+        }
+        for S, I in pipe_desc.samplers {
+            if S.sampler == nil {
+                continue
+            }
+
+            bg_entries[entry_count + I] = wgpu.BindGroupEntry{
+                binding = u32(entry_count + I),
+                sampler = S.sampler,
+            }
+            entry_count += 1
         }
 
         frame_bg := wgpu.DeviceCreateBindGroup(_state.device, &wgpu.BindGroupDescriptor{
