@@ -1,89 +1,117 @@
 package main
 
-import nuppu "../../../"
+import nuppu "../../.."
+import gpu "../../../gpu"
 import "core:log"
 import "core:math"
 import "core:slice"
 import "core:mem"
 import glm "core:math/linalg/glsl"
+import "base:runtime"
 
-window_app: ^Window
+state: ^State
 
-Window :: struct {
-    number: [2]f32,
+State :: struct {
+    angle: f32,
+    animation_index: u32,
 
-    v_shader: nuppu.Shader,
-    f_shader: nuppu.Shader,
+    g_shader: gpu.Shader_Handle,
+    
+    vertex_gpu: gpu.ptr,
+    index_gpu: gpu.ptr,
+    instance_gpu: gpu.ptr,
+    camera_uniform: gpu.ptr,
 
-    vertex_gpu: nuppu.ptr,
-    index_gpu: nuppu.ptr,
-    instance_gpu: nuppu.ptr,
+    depth_pso: gpu.Depth_Stencil_Handle,
+    pso: gpu.Pipeline_Handle,
+    
+    c_shader: gpu.Shader_Handle,
+    compute_pso: gpu.Compute_Pipeline_Handle,
 
-    depth_stencil_state: nuppu.Depth_Stencil_State,
+    uniform_animation_index: gpu.ptr,
 
-    pipeline: nuppu.Pipeline,
-    depth_texture: nuppu.Texture,
-    texture: nuppu.Texture,
-    kernel: nuppu.Shader,
+    texture: gpu.Texture,
+
+    sampler: gpu.Sampler,
 }
 
 init :: proc() {
-    window_app.v_shader = nuppu.shader_init(#load("9-graphics.metal", []u8), "vertexMain", .Vertex)
-    window_app.f_shader = nuppu.shader_init(#load("9-graphics.metal", []u8), "fragmentMain", .Fragment)
+when ODIN_OS == .Darwin {
+    g_shader_code := #load("graphics.metal", []u8)
+    k_shader_code := #load("compute.metal", []u8)
+}
+when ODIN_OS == .JS {
+    g_shader_code := #load("graphics.wgsl", []u8)
+    k_shader_code := #load("compute.wgsl", []u8)
+}
 
-    window_app.kernel = nuppu.shader_init(#load("9-compute.metal", []u8), "mandelbrot_set", .Compute)
+    state.g_shader = gpu.shader_init("my_shader", g_shader_code)
+    state.c_shader = gpu.compute_shader_init("my_compute_shader", k_shader_code)
 
-    window_app.pipeline = nuppu.pipeline_init(window_app.v_shader, window_app.f_shader, {.BGRA8Unorm_sRGB}, .Depth32Float)
-    window_app.depth_stencil_state = nuppu.depth_stencil_state_init(
-        {
-            compare_func = .Less,
-            depth_write = true,
-        }
-    )
+    state.pso = gpu.pipeline_init(state.g_shader, "vertexMain", state.g_shader, "fragmentMain", .BGRA8Unorm, .Depth32Float)
+    state.depth_pso = gpu.depth_stencil_state_init({compare = .Less, write_enabled = true})
+    state.compute_pso = gpu.compute_pipeline_init(state.c_shader, "mandelbrot_set")
 
-    window_app.texture = nuppu.texture_init({
+    state.texture = gpu.texture_init({
         dimensions = {TEXTURE_WIDTH, TEXTURE_HEIGHT},
         format = .RGBA8Unorm,
-        texture_type = .Type2D,
-        storage_mode = .Managed,
-        usage = {.ShaderRead, .ShaderWrite},
+        type = ._2D,
+        storage = .Shared,
+        usage = .Storage
     })
 
-    upload_arena := nuppu.gpu_arena_init()
-    defer nuppu.gpu_arena_deinit(&upload_arena)
+    upload := gpu.arena()
+    // defer nuppu.gpu_arena_deinit(&upload_arena)
 
     VERT_COUNT :: nuppu.UNIT_CUBE_VERTEX_COUNT
     INDEX_COUNT :: nuppu.UNIT_CUBE_INDEX_COUNT
 
-    verts := nuppu.gpu_arena_alloc(&upload_arena, Vertex, VERT_COUNT)
+    verts := gpu.arena_alloc(&upload, Vertex, VERT_COUNT)
     vs: [VERT_COUNT]Vertex
     for &v, idx in vs {
         v.position = nuppu.UNIT_CUBE_VERTICES[idx]
         v.normal = nuppu.UNIT_CUBE_NORMALS[idx]
         v.tex_coord = nuppu.UNIT_CUBE_TEXCOORDS[idx]
     }
-    nuppu.gpu_ptr_fill_slice(verts, vs[:])   
+    runtime.mem_copy_non_overlapping(verts.cpu, &vs, size_of(Vertex) * VERT_COUNT)
 
-    indices := nuppu.gpu_arena_alloc(&upload_arena, u32, INDEX_COUNT)
-    nuppu.gpu_ptr_fill_slice(indices, nuppu.UNIT_CUBE_INDICES)
+    indices := gpu.arena_alloc(&upload, u32, INDEX_COUNT)
+    runtime.mem_copy_non_overlapping(indices.cpu, &nuppu.UNIT_CUBE_INDICES, size_of(u32) * INDEX_COUNT)
+    
+    state.vertex_gpu = gpu.malloc(.GPU_Storage, VERT_COUNT, size_of(Vertex), align_of(Vertex), "Vertices")
+    state.index_gpu = gpu.malloc_index(INDEX_COUNT, .Uint32, "Indices")
+    state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance_Data), align_of(Instance_Data), "Instances")
+    state.camera_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Camera_Data), align_of(Camera_Data), "Camera")
+    state.uniform_animation_index = gpu.malloc(.GPU_Constant, 1, size_of(Anim), align_of(Anim), "Animation")
 
-    window_app.vertex_gpu = nuppu.__gpu_malloc_bytes(size_of(Vertex) * VERT_COUNT, align_of(Vertex), .GPU_Only)
-    window_app.index_gpu = nuppu.__gpu_malloc_bytes(size_of(u32) * INDEX_COUNT, align_of(u32), .GPU_Only)
-    window_app.instance_gpu = nuppu.__gpu_malloc_bytes(size_of(Instance_Data) * INSTANCE_COUNT, align_of(Instance_Data), .GPU_Only)
+    gpu.unmap(&upload.ptr)
 
-    cmds := nuppu.begin_commands()
-    nuppu.cmd_mem_copy(cmds, window_app.vertex_gpu, verts, size_of(Vertex) * VERT_COUNT)
-    nuppu.cmd_mem_copy(cmds, window_app.index_gpu, indices, size_of(u32) * INDEX_COUNT)
-    nuppu.cmd_barrier(cmds, .Transfer, .All)
-    nuppu.end_commands(cmds, {})
+    gpu.begin_commands()
+    gpu.copy(state.vertex_gpu, verts)
+    gpu.copy(state.index_gpu, indices)
+    gpu.barrier(.Transfer, .All)
+    gpu.commit_commands()
 
-    window_app.depth_texture = nuppu.texture_depth_init({1280, 720}, .Depth32Float)
+    state.sampler = gpu.sampler_init({
+        min_filter = .Linear,
+        mag_filter = .Linear,
+        mip_filter = .Linear,
+        wrap_s = .Repeat,
+        wrap_t = .Repeat,
+        wrap_r = .Repeat,
+    })
 }
-
+Anim :: struct {
+    frame: u32,
+    _pad: [3]u32, // pad to 48 bytes
+}
 Vertex :: struct {
 	position: glm.vec3,
+    _pad: u32,
 	normal:   glm.vec3,
+    _pad2: u32,
     tex_coord: glm.vec2,
+    _pad3: [2]u32, // pad to 48 bytes
 }
 
 INSTANCE_WIDTH  :: 10
@@ -106,29 +134,22 @@ TEXTURE_WIDTH  :: 128
 TEXTURE_HEIGHT :: 128
 
 deinit :: proc() {
-    nuppu.shader_deinit(window_app.v_shader)
-    nuppu.shader_deinit(window_app.f_shader)
 
-    nuppu.pipeline_deinit(window_app.pipeline)
-
-    nuppu.gpu_free(window_app.vertex_gpu)
-    nuppu.gpu_free(window_app.index_gpu)
-    nuppu.gpu_free(window_app.instance_gpu)
-
-    nuppu.depth_stencil_state_deinit(window_app.depth_stencil_state)
 }
 
-render :: proc(prev, curr: rawptr, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nuppu.Frame_Pass) {
-    prev := (^Window)(prev)
-    curr := (^Window)(curr)
+update :: proc() {
+    state.angle += nuppu.sim_delta_time() * 0.45
+    state.animation_index = (state.animation_index + 1) % 5000
+}
 
-    @static angle: f32
-    angle += nuppu.delta_time_f32() * 0.45
+render :: proc(prev, curr: ^State, alpha: f32) {
+    gpu.begin_frame()
+    frame_arena := gpu.frame_arena()
 
-    instances := nuppu.gpu_arena_alloc(arena, Instance_Data, INSTANCE_COUNT)
-    instances_array := slice.from_ptr((^Instance_Data)(instances.cpu), INSTANCE_COUNT)
+    angle := math.lerp(prev.angle, curr.angle, alpha)
 
-    object_position := glm.vec3{0, 0, -5}
+    instances := gpu.arena_alloc(frame_arena, Instance_Data, INSTANCE_COUNT)
+    object_position := glm.vec3{0, 0, -7}
     rt := glm.mat4Translate(object_position)
     rr1 := glm.mat4Rotate({0, 1, 0}, -angle)
     rr0 := glm.mat4Rotate({1, 0, 0}, angle*0.5)
@@ -137,7 +158,7 @@ render :: proc(prev, curr: rawptr, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
 
     ix, iy, iz := 0, 0, 0
 
-    for &instance, idx in instances_array {
+    for &instance, idx in ([^]Instance_Data)(instances.cpu)[:INSTANCE_COUNT] {
         if ix == INSTANCE_WIDTH {
             ix = 0
             iy += 1
@@ -169,89 +190,79 @@ render :: proc(prev, curr: rawptr, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nu
         instance.color = {r, 1-r, math.sin(math.TAU * r), 1}
     }
 
-    cmds := nuppu.begin_commands()
-
-    nuppu.cmd_mem_copy(cmds, curr.instance_gpu, instances, size_of(Instance_Data) * INSTANCE_COUNT)
-    nuppu.cmd_barrier(cmds, .Transfer, .All)
-
-    @static animation_index: u32
-    Anim :: struct {
-        frame: u32,
-    }
-    anim := Anim {
-        frame = animation_index,
-    }
-    nuppu.gpu_temp_malloc(cmds, slice.bytes_from_ptr(&anim, size_of(Anim)), 0, .Compute)
-    nuppu.cmd_set_pipeline(cmds, window_app.kernel)
-    nuppu.cmd_set_texture(cmds, {{window_app.texture, 0}}, .Compute)
-    nuppu.cmd_dispatch(cmds, {TEXTURE_WIDTH, TEXTURE_HEIGHT, 1}, {nuppu.max_total_threads_per_threadgroup(window_app.kernel), 1, 1})
-
-    animation_index = (animation_index + 1) % 5000
-    nuppu.cmd_barrier(cmds, .Compute, .All)
-    
-    swapchain := nuppu.acquire_next_swapchain(cmds)
-
-    nuppu.cmd_begin_render_pass(cmds, {
-        {
-            clear_color = {64, 128, 255, 255},
-            load_action = .Clear,
-            store_action = .Store,
-            texture = swapchain,
-        }
-    },
-    {
-        clear_depth = 1,
-        load_action = .Clear,
-        store_action = .Store,
-        texture = curr.depth_texture,
-    }
-    )
-
-    nuppu.cmd_set_pipeline(cmds, window_app.pipeline)
-    nuppu.cmd_set_depth_stencil_state(cmds, window_app.depth_stencil_state)
-
     cam := Camera_Data {
 		perspective_transform = glm.mat4Perspective(glm.radians_f32(45), nuppu.aspect_ratio(), 0.03, 500),
 		world_transform = 1,
 		world_normal_transform = glm.mat3(1)
     }
+    camera_ptr := gpu.arena_alloc(frame_arena, Camera_Data, 1)
+    (^Camera_Data)(camera_ptr.cpu)^ = cam
 
-    nuppu.cmd_set_cull_mode(cmds, .Back)
-    nuppu.cmd_set_front_face_winding(cmds, .CounterClockwise)
-    nuppu.gpu_temp_malloc(cmds, slice.bytes_from_ptr(&cam, size_of(Camera_Data)), 2, .Vertex)
-    nuppu.cmd_set_texture(cmds, {
-        {curr.texture, 0}
-    }, .Fragment)
-    nuppu.cmd_set_buffers(cmds, {window_app.vertex_gpu, curr.instance_gpu}, {0, 0}, {0, 2}, .Vertex)
-    nuppu.cmd_draw_indiced_primitives(cmds,
+    anim := Anim {
+        frame = curr.animation_index,
+    }
+    animation_ptr := gpu.arena_alloc(frame_arena, Anim, 1)
+    (^Anim)(animation_ptr.cpu)^ = anim
+    
+    gpu.unmap(&frame_arena.ptr)
+
+    gpu.copy(curr.uniform_animation_index, animation_ptr)
+    gpu.copy(curr.instance_gpu, instances)
+    gpu.copy(curr.camera_uniform, camera_ptr)
+    gpu.barrier(.Transfer, .All)
+
+    gpu.set_compute_pipeline(state.compute_pso)
+    gpu.set_buffers({curr.uniform_animation_index}, {0, 1}, .Compute)
+    gpu.set_textures({curr.texture}, {0, 1}, .Compute)
+    gpu.compute_dispatch({TEXTURE_WIDTH, TEXTURE_HEIGHT, 1}, {128, 1, 1})
+    gpu.barrier(.Compute, .All)
+    
+    swapchain := gpu.acquire_next_swapchain()
+
+    gpu.begin_render_pass(
+        {
+            clear_color = {12, 12, 12, 255},
+            load_action = .Clear,
+            store_action = .Store,
+            texture = swapchain,
+        },
+        {
+            load_action = .Clear,
+            store_action = .Store,
+            texture = gpu.depth(),
+        }
+    )
+
+    gpu.set_pipeline(state.pso)
+    gpu.set_depth_stencil_state(state.depth_pso)
+
+    gpu.set_cull_mode(.Back)
+    gpu.set_front_face_winding(.CCW)
+    
+    gpu.set_textures({curr.texture}, {0, 1}, .Fragment)
+    gpu.set_buffers({curr.vertex_gpu, curr.instance_gpu, curr.camera_uniform}, {0, 3}, .Vertex)
+    gpu.set_samplers({curr.sampler}, {0, 1}, .Fragment)
+    
+    gpu.draw_indiced_primitives(
     .Triangle,
-    window_app.index_gpu,
-    nuppu.UNIT_CUBE_INDEX_COUNT,
-    0,
+    curr.index_gpu,
+    6 * 6, 0,
     INSTANCE_COUNT,
-    0)
+    0, 0)
 
-    nuppu.cmd_end_render_pass(cmds)
-    nuppu.cmd_present(cmds, swapchain)
-    nuppu.end_commands(cmds, pass)
+    gpu.end_render_pass()
+    
+    gpu.end_frame()
 }
 
-@export _desc := nuppu.App_Desc {
-    size = size_of(Window),
+desc := nuppu.App_Desc(State) {
+    state = &state,
+    window_size = {1000, 1000},
     init = init,
-    deinit = deinit,
+    update = update,
     render = render,
 }
 
-config :: nuppu.App_Config {
-    window_size = [2]i32{1280, 720},
-    window_title = "Window",
-}
-
 main :: proc() {
-    nuppu.app_init(
-        _desc,
-        &window_app,
-        config
-    )
+    nuppu.run(desc)
 }
