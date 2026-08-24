@@ -53,21 +53,43 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     }
 
     _Texture :: struct {
-        T: union {
-            wgpu.SurfaceTexture,
-            wgpu.Texture,
+        using _ : struct #raw_union {
+            surface_texture: wgpu.SurfaceTexture,
+            texture: wgpu.Texture,
         },
         view: wgpu.TextureView,
     }
 
+    _copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
+        destination := wgpu.TexelCopyTextureInfo {
+            texture  = texture.native.texture,
+            mipLevel = level,
+            origin   = wgpu.Origin3D { u32(origin.x), u32(origin.y), u32(origin.z) },
+            aspect   = .All,
+        }
+        layout := wgpu.TexelCopyBufferLayout {
+            offset       = 0,
+            bytesPerRow  = bytes_per_row,
+            rowsPerImage = u32(size.y),
+        }
+        write_size := wgpu.Extent3D {
+            width              = u32(size.x),
+            height             = u32(size.y),
+            depthOrArrayLayers = u32(size.z),
+        }
+        data_size := u64(bytes_per_row) * u64(size.y) * u64(max(size.z, 1))
+
+        wgpu.QueueWriteTexture(_state.queue, &destination, data, data_size, &layout, &write_size)
+    }
+
+
     _resize_depth_texture :: proc(width, height: i32) {
         x, y := _state.config.width, _state.config.height
-        texture_impl := hm.static_get(&_state.textures, _state.depth_texture)
 
-        wgpu.TextureViewRelease(texture_impl.view)
-        wgpu.TextureRelease(texture_impl.T.(wgpu.Texture))
+        native := _state.depth_texture.native
 
-        hm.static_remove(&_state.textures, _state.depth_texture)
+        wgpu.TextureViewRelease(native.view)
+        wgpu.TextureRelease(native.texture)
 
         _state.depth_texture = texture_depth_init({u32(x), u32(y)}, .Depth32Float)
     }
@@ -144,9 +166,9 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     }
 
-    _acquire_next_swapchain :: proc() -> Texture {
-        tex := wgpu.SurfaceGetCurrentTexture(_state.surface)
-        switch tex.status {
+    _acquire_next_swapchain :: proc() -> _Texture {
+        surface_texture := wgpu.SurfaceGetCurrentTexture(_state.surface)
+        switch surface_texture.status {
         case .SuccessOptimal, .SuccessSuboptimal:
         // All good, could handle suboptimal here.
         case .Timeout, .Outdated, .Lost:
@@ -159,13 +181,13 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             // Window is occluded (e.g. minimized), skip this frame.
             return {}
         case .Error:
-            fmt.panicf("get_current_texture status=%v", tex.status)
+            fmt.panicf("get_current_texture status=%v", surface_texture.status)
         }
 
-        view := wgpu.TextureCreateView(tex.texture, nil)
+        view := wgpu.TextureCreateView(surface_texture.texture, nil)
 
-        result := Texture {
-            T = tex,
+        result := _Texture {
+            surface_texture = surface_texture,
             view = view,
         }
 
@@ -234,8 +256,12 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     //////////////////////////////////////////////////////////////
     // Render loop commands
 
-    _begin_frame :: proc() {
+    _begin_commands :: proc() {
         _state.command_encoder = wgpu.DeviceCreateCommandEncoder(_state.device, nil)
+    }
+
+    _begin_frame :: proc() {
+        _begin_commands()
     }
 
     _semaphore :: proc(value: u64) -> Semaphore {
@@ -249,6 +275,14 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     }
 
     _end_frame :: proc() {
+        finished := wgpu.CommandEncoderFinish(_state.command_encoder, nil)
+        defer {
+            wgpu.CommandBufferRelease(finished)
+            wgpu.CommandEncoderRelease(_state.command_encoder)
+        }
+        wgpu.QueueSubmit(_state.queue, []wgpu.CommandBuffer{finished})
+        _state.command_encoder = nil
+    
         wgpu.SurfacePresent(_state.surface)
     }
 
@@ -266,9 +300,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         res.depthSlice = wgpu.DEPTH_SLICE_UNDEFINED
 
         depth: wgpu.RenderPassDepthStencilAttachment
-        if d_attachment.texture != NIL_TEXTURE_HANDLE {
-            texture_impl := hm.static_get(&_state.textures, d_attachment.texture)
-            depth.view = texture_impl.view
+        if d_attachment.texture.native.view != nil {
+            depth.view = d_attachment.texture.native.view
             depth.depthClearValue = 1
             depth.depthLoadOp = _load_action_interop(d_attachment.load_action)
             depth.depthStoreOp = _store_action_interop(d_attachment.store_action)
@@ -284,7 +317,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         desc := wgpu.RenderPassDescriptor {
             colorAttachmentCount = 1,
             colorAttachments = &res,
-            depthStencilAttachment = nil if d_attachment.texture == NIL_TEXTURE_HANDLE else &depth,
+            depthStencilAttachment = nil if d_attachment.texture.native.view == nil else &depth,
         }
 
         _state.render_pass_encoder = wgpu.CommandEncoderBeginRenderPass(_state.command_encoder, &desc)
@@ -321,6 +354,10 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
             pipe_desc.buffers[i] = buffers[i]
         }
+    }
+
+    _set_textures :: proc(textures: []Texture, range: Range, stage: Shader_Stage) {
+        
     }
 
     _Depth_Stencil_State :: wgpu.DepthStencilState
@@ -384,7 +421,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         view := wgpu.TextureCreateView(texture, nil)
 
         return _Texture {
-            T = texture,
+            texture = texture,
             view = view,
         }
     }
@@ -728,7 +765,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     //////////////////////////////////////////////////////////////
     // Synchronization
 
-    _commit :: proc() {
+    _commit_commands :: proc() {
         finished := wgpu.CommandEncoderFinish(_state.command_encoder, nil)
         defer {
             wgpu.CommandBufferRelease(finished)

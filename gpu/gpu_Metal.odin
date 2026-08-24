@@ -51,7 +51,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         
         _state.queue = _state.device->newCommandQueue()
 
-        for _ in 0 ..< FRAMES_IN_FLIGHT {
+        for i in 0 ..< FRAMES_IN_FLIGHT {
             frame_arena := new(Arena, context.allocator)
             frame_arena^ = arena()
             append(&_state.frame_arenas, frame_arena)
@@ -69,13 +69,12 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
     _deinit :: proc() {
-        // frame arena
         _state.metal_layer->release()
         _state.queue->release()
         _state.device->release()
     }
 
-    _begin_frame :: proc() {
+    _begin_commands :: proc() {
         _state.frame_pool = NS.AutoreleasePool.alloc()->init()
 
         buffer_desc := MTL.CommandBufferDescriptor.alloc()->init()
@@ -85,28 +84,42 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         _state.command_buffer = _state.queue->commandBufferWithDescriptor(buffer_desc)
     }
 
-    
+    _begin_frame :: proc() {
+        if _state.frame_pool != nil {
+            _state.frame_pool->drain()
+            _state.frame_pool = nil  // pool itself is released by drain
+        }
+        _begin_commands()
+    }
+
+    _commit_commands :: proc() {
+        _state.command_buffer->commit()
+        _state.command_buffer = nil
+        
+        if _state.frame_pool != nil {
+            _state.frame_pool->drain()
+            _state.frame_pool = nil
+        }
+    }
 
     _end_frame :: proc() {
-        _state.frame_pool->drain()
-
-        // Hack to signal the event to the next frame
-        _state.frame_pool = NS.AutoreleasePool.alloc()->init()
-        defer _state.frame_pool->drain()
-
-        buffer_desc := MTL.CommandBufferDescriptor.alloc()->init()
-        defer buffer_desc->release()
-        buffer_desc->setErrorOptions({.EncoderExecutionStatus})
-
-        _state.command_buffer = _state.queue->commandBufferWithDescriptor(buffer_desc)
-        _state.command_buffer->encodeSignalEvent((^MTL.SharedEvent)(_state.frame_semaphore), _state.frame_n) // frame_n incremented in gpu.end_frame() after this is called
+        // The render work (begin_frame -> render -> end_render_pass) was
+        // recorded into the command buffer autoreleased into _state.frame_pool.
+        // Now present + signal + commit it, then drain the pool. Metal
+        // retains the buffer post-commit so the autorelease reference can
+        // be safely released by the drain.
+        _state.command_buffer->presentDrawable(_state.curr_drawable.drawable)
+        _state.command_buffer->encodeSignalEvent((^MTL.SharedEvent)(_state.frame_semaphore), _state.frame_n)
         _state.command_buffer->commit()
 
-
-        _state.frame_pool = {}
         _state.command_buffer = {}
         _state.curr_drawable = {}
         _state.render_command_encoder = {}
+
+        if _state.frame_pool != nil {
+            _state.frame_pool->drain()
+            _state.frame_pool = nil
+        }
     }
 
 
@@ -115,6 +128,37 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         using _ : struct {
             texture: ^MTL.Texture,
             drawable: ^CA.MetalDrawable,
+        }
+    }
+
+    _copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
+        native := texture.native
+
+        region := MTL.Region {
+            origin = MTL.Origin {NS.Integer(origin.x), NS.Integer(origin.y), NS.Integer(origin.z)},
+            size = MTL.Size {
+                width = NS.Integer(size.x),
+                height = NS.Integer(size.y),
+                depth = NS.Integer(size.z),
+            },
+        }
+
+        native.texture->replaceRegion(region, NS.UInteger(level), data, NS.UInteger(bytes_per_row))
+    }
+
+    _set_textures :: proc(textures: []Texture, range: Range, stage: Shader_Stage) {
+        mtl_textures := make([]^MTL.Texture, len=len(textures), allocator=context.temp_allocator)
+        for tex, I in textures {
+            mtl_textures[I] = tex.native.texture
+        }
+
+        switch stage {
+        case .Vertex:
+            _state.render_command_encoder->setVertexTextures(mtl_textures, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
+        case .Fragment:
+            _state.render_command_encoder->setFragmentTextures(mtl_textures, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
+        case .Compute:
+            _state.compute_command_encoder->setTextures(mtl_textures, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
         }
     }
 
@@ -249,20 +293,18 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_Attachment) {
         pass_descriptor := MTL.RenderPassDescriptor.renderPassDescriptor()
-        defer pass_descriptor->release()
 
         color_attachment := pass_descriptor->colorAttachments()->object(0)
         color_attachment->setClearColor(_to_clear_color(c_attachment.clear_color))
         color_attachment->setLoadAction(_load_action_interop(c_attachment.load_action))
         color_attachment->setStoreAction(_store_action_interop(c_attachment.store_action))
         color_attachment->setTexture(c_attachment.texture.native.texture)
-        
+
         if d_attachment.texture.native.texture != nil {
             depth_desc := pass_descriptor->depthAttachment()
             depth_desc->setLoadAction(_load_action_interop(d_attachment.load_action))
             depth_desc->setStoreAction(_store_action_interop(d_attachment.store_action))
             depth_desc->setTexture(d_attachment.texture.native.texture)
-            // depth_desc->setClearDepth(1.0)
         }
 
         _state.render_command_encoder = _state.command_buffer->renderCommandEncoderWithDescriptor(pass_descriptor)
@@ -681,11 +723,6 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         }
 
         _ = after
-    }
-
-    _commit :: proc() {
-        _state.command_buffer->presentDrawable(_state.curr_drawable.drawable)
-        _state.command_buffer->commit()
     }
 
     _semaphore :: proc(value: u64) -> Semaphore {

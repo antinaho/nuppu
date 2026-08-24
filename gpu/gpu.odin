@@ -5,7 +5,6 @@ import "base:runtime"
 import "core:mem"
 import "core:log"
 import hm "core:container/handle_map"
-//import "core:slice"
 import "core:strings"
 import "core:fmt"
 
@@ -175,7 +174,10 @@ Render_Stages :: distinct bit_set[Render_Stage; u8]
 
 Texture_Handle :: distinct hm.Handle32
 
-
+// CPU side copy
+copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
+    _copy_to_texture(texture, origin, size, level, data, bytes_per_row)
+}
 
 Color_Attachment :: struct {
     clear_color: Color,
@@ -362,9 +364,20 @@ pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function: string, fra
 }
 
 //////////////////////////////////////////////////////////////
-// Render loop commands
+// Command flow (init, runtime uploads): no swapchain interaction
 
-begin_frame_or_commands :: proc() {
+begin_commands :: proc() {
+    _begin_commands()
+}
+
+commit_commands :: proc() {
+    _commit_commands()
+}
+
+//////////////////////////////////////////////////////////////
+// Frame flow (render loop): owns the swapchain present
+
+begin_frame :: proc() {
     _begin_frame()
 }
 
@@ -387,6 +400,10 @@ set_pipeline :: proc(pipeline: Pipeline_Handle) {
 
 set_buffers :: proc(buffers: []ptr, range: Range, stage: Shader_Stage) {
     _set_buffers(buffers, range, stage)
+}
+
+set_textures :: proc(textures: []Texture, range: Range, stage: Shader_Stage) {
+    _set_textures(textures, range, stage)
 }
 
 Depth_Attachment :: struct {
@@ -640,11 +657,6 @@ recycle_frame_arena :: proc(arena: ^Arena) {
 // Ends before stage
 barrier :: proc(before: Stage, after: Stage) {
     _barrier(before, after)
-}
-
-// Ends command encoder/queue
-commit :: proc() {
-    _commit()
 }
 
 Semaphore :: distinct rawptr
