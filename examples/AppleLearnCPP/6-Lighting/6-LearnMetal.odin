@@ -32,7 +32,7 @@ when ODIN_OS == .Darwin {
     shader_code := #load("lighting.metal", []u8)
 }
 when ODIN_OS == .JS {
-    //shader_code := #load("perspective.wgsl", []u8)
+    shader_code := #load("lighting.wgsl", []u8)
 }
     state.shader = gpu.shader_init("my_shader", shader_code)
     state.pso = gpu.pipeline_init(state.shader, "vertexMain", state.shader, "fragmentMain", .BGRA8Unorm, .Depth32Float)

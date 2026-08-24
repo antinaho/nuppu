@@ -24,8 +24,29 @@ struct CameraData
 @vertex
 fn vertexMain(@builtin(vertex_index)   vertex_index   : u32,
               @builtin(instance_index) instance_index : u32) -> v2f {
+    let pi = vertex_index * 6u;
+
+    let pos = vec4<f32>(
+        a_positions[pi + 0u],
+        a_positions[pi + 1u],
+        a_positions[pi + 2u],
+        1.0,
+    );
+    let normal = vec3<f32>(
+        a_positions[pi + 3u],
+        a_positions[pi + 4u],
+        a_positions[pi + 5u],
+    );
+
+    let inst = a_instances[instance_index];
+
     var out: v2f;
-    
+    out.position = u_camera.perspectiveTransform
+                 * u_camera.worldTransform
+                 * inst.transform
+                 * pos;
+    out.normal = u_camera.worldNormalTransform * inst.normal_transform * normal;
+    out.color  = inst.color.xyz;
     return out;
 }
 
@@ -33,10 +54,10 @@ fn vertexMain(@builtin(vertex_index)   vertex_index   : u32,
 fn fragmentMain(in: v2f) -> @location(0) vec4<f32> {
 
     // assume light coming from front-top-right
-    let l = normalize(float3(1.0, 1.0, 0.6));
+    let l = normalize(vec3<f32>(1.0, 1.0, 0.6));
     let n = normalize(in.normal);
 
-    let ndotl = saturate(dot(n, l));
+    let ndotl = max(0.0, dot(n, l));
 
     return vec4<f32>(in.color * 0.1 + in.color * ndotl, 1.0);
 }
