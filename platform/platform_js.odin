@@ -94,6 +94,11 @@ when PLATFORM_BACKEND == PLATFORM_BACKEND_WEB {
         return u64(time.tick_now()._nsec)
     }
 
+    _window_aspect_ratio :: proc() -> f32 {
+        dims := _window_size_logical()
+        return f32(dims.x) / f32(dims.y)
+    }
+
     _poll_events :: proc() {
         if queue.len(_state.events) == 0 {
             return

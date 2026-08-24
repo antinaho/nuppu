@@ -169,6 +169,10 @@ window_size_pixel :: proc() -> [2]i32 {
 	return _window_size_pixel()
 }
 
+window_aspect_ratio :: proc() -> f32 {
+	return _window_aspect_ratio()
+}
+
 poll_events :: proc() {
 	_poll_events()
 }
