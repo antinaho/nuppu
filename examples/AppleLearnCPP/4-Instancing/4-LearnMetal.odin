@@ -63,11 +63,11 @@ when ODIN_OS == .JS {
     state.index_gpu = gpu.malloc_index(NUM_INDICES, .Uint32, "Indices")    
     state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance_Data), align_of(Instance_Data), "Instances")
 
-    gpu.begin_frame_or_commands()
+    gpu.begin_commands()
     gpu.copy(state.pos_gpu, positions)
     gpu.copy(state.index_gpu, indices)
     gpu.barrier(.Transfer, .All)
-    gpu.commit()
+    gpu.commit_commands()
 }
 
 _update :: proc() {
@@ -75,7 +75,7 @@ _update :: proc() {
 }
 
 _render :: proc(previous, current: ^State, alpha: f32) {
-    gpu.begin_frame_or_commands()
+    gpu.begin_frame()
     frame_arena := gpu.frame_arena()
     scl :: 0.12
 
@@ -96,25 +96,6 @@ _render :: proc(previous, current: ^State, alpha: f32) {
 
     gpu.copy(current.instance_gpu, instances)
     gpu.barrier(.Transfer, .All)
-    
-    // instances_staging := gpu.buffer_init(size_of(Instance_Data) * INSTANCE_COUNT, align_of(Instance_Data), .CPU_GPU)
-    // instances_array := slice.from_ptr((^Instance_Data)(instances_staging.cpu), INSTANCE_COUNT)
-    // 
-    // for &isnt, idx in instances_array {
-    //     i := f32(idx) / f32(INSTANCE_COUNT)
-    //     x_off := (i * 2 - 1) + (1.0 / INSTANCE_COUNT)
-    //     y_off := math.sin((i + current.angle) * 2 * math.PI)
-    //     isnt.transform = linalg.transpose(matrix[4, 4]f32{
-    //         scl * math.sin(current.angle), scl * math.cos(current.angle), 0, 0,
-    //         scl * math.cos(current.angle), -scl * math.sin(current.angle), 0, 0,
-    //         0, 0, scl, 0,
-    //         x_off, y_off, 0, 1
-    //     })
-    //     isnt.color = [4]f32{i, 1 - i, math.sin(math.PI * i), 1}
-    // }
-
-    // gpu.mem_copy(current.instance_gpu, instances_staging, size_of(Instance_Data) * INSTANCE_COUNT)
-    // gpu.barrier(.Transfer, .All)
 
     swapchain := gpu.acquire_next_swapchain()
     gpu.begin_render_pass({
@@ -136,7 +117,6 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     0, 0)
 
     gpu.end_render_pass()
-    gpu.commit()
 
     gpu.end_frame()
 }

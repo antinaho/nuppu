@@ -49,7 +49,7 @@ v2f vertex vertexMain(device const Vertex_Data*   vertex_data   [[buffer(0)]],
 
 half4 fragment fragmentMain(v2f in [[stage_in]]) {
     // assume light coming from front-top-right
-    float3 l = normalize(float3(1.0, 1.0, 0.8));
+    float3 l = normalize(float3(1.0, 1.0, 0.6));
     float3 n = normalize(in.normal);
 
     float ndotl = saturate(dot(n, l));

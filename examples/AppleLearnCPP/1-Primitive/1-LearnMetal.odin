@@ -2,7 +2,6 @@ package lo
 
 import nuppu "../../.."
 import gpu "../../../gpu"
-import "core:fmt"
 import "core:mem"
 
 State :: struct {
@@ -53,25 +52,25 @@ when ODIN_OS == .JS {
     indices := gpu.arena_alloc(&upload, u32, NUM_VERTICES)
     mem.copy_non_overlapping(indices.cpu, &[3]u32{ 0, 1, 2 }, 3 * size_of(u32))
 
-    gpu.unmap(&upload)
+    gpu.unmap(&upload.ptr)
 
     state.pos_gpu   = gpu.malloc(.GPU_Storage, NUM_VERTICES, size_of(Position), align_of(Position), "Positions buffer")
     state.color_gpu = gpu.malloc(.GPU_Storage, NUM_VERTICES, size_of(Color),    align_of(Color),    "Colors buffer")
     state.index_gpu = gpu.malloc_index(NUM_VERTICES, .Uint32, "Indices buffer")
 
-    gpu.begin_frame_or_commands()
+    gpu.begin_commands()
     gpu.copy(state.pos_gpu, positions)
     gpu.copy(state.color_gpu, colors)
     gpu.copy(state.index_gpu, indices)
     gpu.barrier(.Transfer, .All)
-    gpu.commit()
+    gpu.commit_commands()
     //
 }
 
 _update :: proc() {}
 
 _render :: proc(previous, current: ^State, alpha: f32) {
-    gpu.begin_frame_or_commands()
+    gpu.begin_frame()
     frame_arena := gpu.frame_arena()
 
     swapchain := gpu.acquire_next_swapchain()
@@ -87,7 +86,6 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.draw_indiced_primitives(.Triangle, current.index_gpu, 3, 0, 1, 0, 0)
 
     gpu.end_render_pass()
-    gpu.commit()
 
     gpu.end_frame()
 }

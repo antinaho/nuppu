@@ -1,49 +1,40 @@
 package main
 
-import nuppu "../../../"
-import "core:fmt"
-import "core:log"
+import nuppu "../../.."
+import gpu "../../../gpu"
 
-basic_app: ^Basic
+state: ^State
 
-Basic :: struct {
+State :: struct {
 }
 
-render :: proc(prev, curr: rawptr, alpha: f32, arena: ^nuppu.GPU_Arena, pass: nuppu.Frame_Pass) {
-    prev := (^Basic)(prev)
-    curr := (^Basic)(curr)
+update :: proc() {}
 
-    cmds := nuppu.begin_commands()
-    swapchain := nuppu.acquire_next_swapchain(cmds)
+render :: proc(prev, curr: ^State, alpha: f32) {
+    gpu.begin_frame()
+    swapchain := gpu.acquire_next_swapchain()
 
-    nuppu.cmd_begin_render_pass(cmds, {
+    gpu.begin_render_pass(
         {
-            clear_color = {64, 128, 255, 255},
+            clear_color = {12, 12, 12, 255},
             load_action = .Clear,
             store_action = .Store,
             texture = swapchain,
         }
-    })
+    )
 
-    nuppu.cmd_end_render_pass(cmds)
-    nuppu.cmd_present(cmds, swapchain)
-    nuppu.end_commands(cmds, pass)
+    gpu.end_render_pass()
+    
+    gpu.end_frame()
 }
 
-@export _desc := nuppu.App_Desc {
-    size = size_of(Basic),
+desc := nuppu.App_Desc(State) {
+    state = &state,
+    window_size = {1000, 1000},
+    update = update,
     render = render,
 }
 
-config :: nuppu.App_Config {
-    window_size = [2]i32{1280, 720},
-    window_title = "Window",
-}
-
 main :: proc() {
-    nuppu.app_init(
-        _desc,
-        &basic_app,
-        config
-    )
+    nuppu.run(desc)
 }

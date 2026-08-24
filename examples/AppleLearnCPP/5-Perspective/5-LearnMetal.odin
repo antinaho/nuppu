@@ -88,11 +88,11 @@ when ODIN_OS == .JS {
     state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance_Data), align_of(Instance_Data), "Instances")
     state.camera_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Camera_Data), align_of(Camera_Data), "Camera")
     
-    gpu.begin_frame_or_commands()
+    gpu.begin_commands()
     gpu.copy(state.vertex_gpu, verts)
     gpu.copy(state.index_gpu, indices)
     gpu.barrier(.Transfer, .All)
-    gpu.commit()
+    gpu.commit_commands()
 }
 
 INSTANCE_COUNT :: 18
@@ -124,7 +124,7 @@ deinit :: proc() {
 }
 
 render :: proc(prev, curr: ^Window, alpha: f32) {
-    gpu.begin_frame_or_commands()
+    gpu.begin_frame()
     frame_arena := gpu.frame_arena()
 
     instances := gpu.arena_alloc(frame_arena, Instance_Data, INSTANCE_COUNT)
@@ -198,7 +198,6 @@ render :: proc(prev, curr: ^Window, alpha: f32) {
     0, 0)
 
     gpu.end_render_pass()
-    gpu.commit()
 
     gpu.end_frame()    
 }
