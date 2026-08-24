@@ -28,6 +28,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         compute_command_encoder: ^MTL.ComputeCommandEncoder,
 
         curr_pipeline: Pipeline_Handle,
+        curr_compute_pipeline: Compute_Pipeline_Handle,
     }
 
     _init :: proc(native_window: rawptr) -> bool {
@@ -158,9 +159,25 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         case .Fragment:
             _state.render_command_encoder->setFragmentTextures(mtl_textures, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
         case .Compute:
+            if _state.compute_command_encoder == nil {
+                _state.compute_command_encoder = _state.command_buffer->computeCommandEncoder()
+            }
             _state.compute_command_encoder->setTextures(mtl_textures, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
         }
     }
+
+
+    _Sampler :: struct {}
+
+    _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
+        // TODO
+        return {}
+    }
+
+    _set_samplers :: proc(samplers: []Sampler, range: Range, stage: Shader_Stage) {
+        // TODO
+    }
+
 
     _map :: proc(ptr: ^_ptr) -> (cpu: rawptr, gpu: rawptr) {
         assert(ptr.offset % 8 == 0)
@@ -232,14 +249,16 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         unreachable()
     }
 
-    _texture_usage_interop :: proc(usage: Texture_Usage_Flags) -> MTL.TextureUsageFlag {
+    _texture_usage_interop :: proc(usage: Texture_Usage) -> MTL.TextureUsage {
         switch usage {
-        case .ShaderRead:
-            return .ShaderRead
-        case .ShaderWrite:
-            return .ShaderWrite
-        case .RenderTarget:
-            return .RenderTarget
+        case .Sampled:
+            return {.ShaderRead}
+        case .Storage:
+            return {.ShaderRead, .ShaderWrite}
+        case .Color_Attachment:
+            return {.RenderTarget, .ShaderRead}
+        case .Depth_Attachment:
+            return {.RenderTarget}
         }
         unreachable()
     }
@@ -261,7 +280,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         desc->setWidth(NS.UInteger(texture_descriptor.dimensions.x))
         desc->setHeight(NS.UInteger(texture_descriptor.dimensions.y))
         desc->setPixelFormat(_pixel_format_interop(texture_descriptor.format))
-        desc->setUsage(bit_set_to_another(texture_descriptor.usage, MTL.TextureUsage, _texture_usage_interop))
+        desc->setUsage(_texture_usage_interop(texture_descriptor.usage))
         desc->setStorageMode(_storage_mode_interop(texture_descriptor.storage))
         desc->setTextureType(_texture_type_interop(texture_descriptor.type))
 
@@ -455,6 +474,48 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         // color_attachment->setDestinationAlphaBlendFactor(_blend_factor_interop(desc.blend.alpha.dstFactor))
     }
 
+    _Compute_Pipeline :: ^MTL.ComputePipelineState
+    _compute_pipeline_init :: proc(shader: Shader_Handle, entry_point: string) -> Compute_Pipeline_Handle {
+
+        shader_impl := hm.static_get(&_state.shaders, shader)
+
+        entry_ns_str := NS.String.alloc()->initWithOdinString(entry_point)
+        defer entry_ns_str->release()
+    
+        function := shader_impl.library->newFunctionWithName(entry_ns_str)
+        defer function->release()
+
+        kernel, k_err := _state.device->newComputePipelineStateWithFunction(function)
+        if k_err != nil {
+            log.panicf("Failed to create pipeline state: %v", k_err->localizedDescription()->odinString())
+        }
+
+        handle := hm.static_add(&_state.compute_pipelines, Compute_Pipeline_Descriptor {
+            native = _Compute_Pipeline(kernel)
+        })
+
+        return handle
+    }
+
+    _set_compute_pipeline :: proc(pipeline: Compute_Pipeline_Handle) {
+        _state.curr_compute_pipeline = pipeline
+    }
+
+    _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
+        size_grid := MTL.Size{NS.Integer(num_groups.x), NS.Integer(num_groups.y), NS.Integer(num_groups.z)}
+	    size_group := MTL.Size{NS.Integer(num_threads_per_group.x), NS.Integer(num_threads_per_group.y), NS.Integer(num_threads_per_group.z)}
+        
+        compute_pipeline := hm.static_get(&_state.compute_pipelines, _state.curr_compute_pipeline)
+
+        if _state.compute_command_encoder == nil {
+            _state.compute_command_encoder = _state.command_buffer->computeCommandEncoder()
+        }
+
+        _state.compute_command_encoder->setComputePipelineState(compute_pipeline.native)
+        _state.compute_command_encoder->dispatchThreads(size_grid, size_group)
+    }
+
+
     _pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function_entry: string, fragment_shader: Shader_Handle, fragment_function_entry: string, format: Pixel_Format, depth_format: Pixel_Format) -> Pipeline_Handle {
         desc := MTL.RenderPipelineDescriptor.alloc()->init()
 	    defer desc->release()
@@ -533,7 +594,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         case .Fragment:
             _state.render_command_encoder->setFragmentBuffers(mtl_buffers, transmute([]NS.UInteger)buffer_offsets, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
         case .Compute:
-            //_state.compute_command_encoder->setBuffers(mtl_buffers, transmute([]NS.UInteger)buffer_offsets, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
+            _state.compute_command_encoder->setBuffers(mtl_buffers, transmute([]NS.UInteger)buffer_offsets, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
         }
     }
 
