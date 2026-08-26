@@ -118,11 +118,12 @@ is_init :: proc() -> bool {
 }
 
 
-resize_swapchain :: proc(width, height: i32) -> bool {
-    ok := _resize_swapchain(width, height)
-    if !ok {return false}
+resize_swapchain :: proc(width, height: u32) {
+    _resize_swapchain(width, height)
+}
+
+resize_depth :: proc(width, height: u32) {
     _resize_depth_texture(width, height)
-    return ok
 }
 
 

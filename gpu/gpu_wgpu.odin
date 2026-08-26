@@ -84,14 +84,13 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
 
     _resize_depth_texture :: proc(width, height: i32) {
-        x, y := _state.config.width, _state.config.height
-
-        native := _state.depth_texture.native
-
-        wgpu.TextureViewRelease(native.view)
-        wgpu.TextureRelease(native.texture)
-
-        _state.depth_texture = texture_depth_init({u32(x), u32(y)}, .Depth32Float)
+        if _state.depth_texture.native.view == nil {
+            _state.depth_texture = texture_depth_init({u32(width), u32(height)}, .Depth32Float)    
+        } else {
+            _state.depth_texture.native.view->release()
+            _state.depth_texture.native.texture->release()
+            _state.depth_texture = texture_depth_init({u32(width), u32(height)}, .Depth32Float)    
+        }
     }
 
     _init :: proc(native_window: rawptr) -> bool {
@@ -143,7 +142,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
     }
 
-    _resize_swapchain :: proc(width, height: i32) -> bool {
+    _resize_swapchain :: proc(width, height: u32) -> bool {
         _state.config = wgpu.SurfaceConfiguration {
             device = _state.device,
             usage = {.RenderAttachment},

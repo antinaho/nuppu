@@ -63,12 +63,6 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return true
     }
 
-    _resize_depth_texture :: proc(width, height: i32) {
-        swapchain_dims := _state.metal_layer->drawableSize()
-        _state.depth_texture.native.texture->release()
-        _state.depth_texture = texture_depth_init({u32(swapchain_dims.width), u32(swapchain_dims.height)}, .Depth32Float)
-    }
-
     _deinit :: proc() {
         _state.metal_layer->release()
         _state.queue->release()
@@ -198,7 +192,16 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return rawptr(uintptr(p.buffer->gpuAddress()))
     }
 
-    _resize_swapchain :: proc(width, height: i32) -> bool {
+    _resize_depth_texture :: proc(width, height: u32) {
+        if _state.depth_texture.native.texture == nil {
+            _state.depth_texture = texture_depth_init({u32(width), u32(height)}, .Depth32Float)    
+        } else {
+            _state.depth_texture.native.texture->release()
+            _state.depth_texture = texture_depth_init({u32(width), u32(height)}, .Depth32Float)
+        }
+    }
+
+    _resize_swapchain :: proc(width, height: u32) -> bool {
         drawable_size := NS.Size {
             width  = NS.Float(width),
             height = NS.Float(height),
