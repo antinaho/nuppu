@@ -5,10 +5,9 @@ import gpu "../../../gpu"
 
 state: ^State
 
-State :: struct {
-}
+State :: struct { }
 
-update :: proc() {}
+update :: proc() { }
 
 render :: proc(prev, curr: ^State, alpha: f32) {
     gpu.begin_frame()
@@ -16,7 +15,7 @@ render :: proc(prev, curr: ^State, alpha: f32) {
 
     gpu.begin_render_pass(
         {
-            clear_color = {12, 12, 12, 255},
+            clear_color = {24, 24, 24, 255},
             load_action = .Clear,
             store_action = .Store,
             texture = swapchain,

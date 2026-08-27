@@ -29,14 +29,16 @@ else {
 FRAMES_IN_FLIGHT :: 3
 FRAME_ARENA_SIZE :: 4 * 1024 * 1024
 
-MAX_PIPELINES :: 64
-MAX_SHADERS :: 64
-
 Parameter_Block :: struct {
     constants: [MAX_CONSTANTS]ptr,
-    read_resources: [MAX_READ_RESOURCE]ptr,
+    read_resources: [MAX_READ_RESOURCE]Parameter_Resource,
     read_write_resources: [MAX_READ_WRITE_RESOURCES]ptr,
     samplers: [MAX_SAMPLERS]Sampler,
+}
+
+Parameter_Resource :: union {
+    ptr,
+    Texture,
 }
 
 use_parameter_block :: proc(block: ^Parameter_Block) {
@@ -57,9 +59,6 @@ MAX_SAMPLERS :: 16
 
 MAX_LAYOUT_BINDINGS :: MAX_CONSTANTS + MAX_STORAGE_BUFFERS + READ_TEXTURES + READ_WRITE_TEXTURES + MAX_SAMPLERS
 
-Shader_Handle :: distinct hm.Handle32
-Pipeline_Handle :: distinct hm.Handle32
-
 State :: struct #align(64) {
     using impl: _State,
 
@@ -71,9 +70,6 @@ State :: struct #align(64) {
     frame_n: u64,
 
     depth_texture: Texture,
-
-    shaders: hm.Static_Handle_Map(MAX_SHADERS, Shader, Shader_Handle),
-    depth_stencil_states: hm.Static_Handle_Map(MAX_DEPTH_STENCIL_STATES, Depth_Stencil_State, Depth_Stencil_Handle),
 }
 
 Depth_Stencil_Handle :: distinct hm.Handle16
@@ -89,22 +85,8 @@ Metadata :: struct
 }
 
 Shader :: struct {
-    handle: Shader_Handle,
     using native: _Shader,
 }
-
-Shader_Resource :: struct {
-    ptr: ptr,
-    usage: Resource_Usage,
-    stage: Render_Stages,
-}
-
-Resource_Usage_Flag :: enum u64 {
-	Read   = 0,
-	Write  = 1,
-	Sample = 2,
-}
-Resource_Usage :: distinct bit_set[Resource_Usage_Flag; u64]
 
 depth :: proc() -> Texture {
     return _state.depth_texture
@@ -140,7 +122,6 @@ is_init :: proc() -> bool {
     return _state.is_init
 }
 
-
 resize_swapchain :: proc(width, height: u32) {
     _resize_swapchain(width, height)
 }
@@ -148,9 +129,6 @@ resize_swapchain :: proc(width, height: u32) {
 resize_depth :: proc(width, height: u32) {
     _resize_depth_texture(width, height)
 }
-
-
-
 
 
 Pixel_Format :: enum u8 {
@@ -188,17 +166,6 @@ Shader_Stage :: enum u8 {
     Compute,
 }
 
-Render_Stage :: enum u8 {
-    Vertex,
-    Fragment,
-    Tile,
-    Object,
-    Mesh,
-}
-Render_Stages :: distinct bit_set[Render_Stage; u8]
-
-Texture_Handle :: distinct hm.Handle32
-
 // CPU side copy
 copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
     _copy_to_texture(texture, origin, size, level, data, bytes_per_row)
@@ -212,9 +179,8 @@ Color_Attachment :: struct {
     resolve_texture: Texture,
 }
 
-NIL_SHADER_HANDLE :: Shader_Handle {}
 Shader_IR :: struct {
-    shader: Shader_Handle,
+    shader: Shader,
     entry_point: string,
 }
 
@@ -232,12 +198,10 @@ Pipeline_Descriptor :: struct {
     // index_buffer: ptr,
 
 Depth_Stencil_State :: struct {
-    handle: Depth_Stencil_Handle,
     using native: _Depth_Stencil_State,
 }   
 
 Depth_Stencil_State_Descriptor :: struct {
-    
 	write_enabled: bool,
 	compare: Compare_Function,
 	// stencilFront: StencilFaceState,
@@ -319,14 +283,12 @@ Blend_Factor :: enum i32 {
 	OneMinusSrc1Alpha = 0x00000011,
 }
 
-depth_stencil_state_init :: proc(desc: Depth_Stencil_State_Descriptor) -> Depth_Stencil_Handle {
+depth_stencil_state_init :: proc(desc: Depth_Stencil_State_Descriptor) -> Depth_Stencil_State {
     _depth_pso := _depth_stencil_state_init(desc)
 
-    handle := hm.static_add(&_state.depth_stencil_states, Depth_Stencil_State {
+    return Depth_Stencil_State {
         native = _depth_pso,
-    })
-
-    return handle
+    }
 }
 
 Stage :: enum u8 {
@@ -375,28 +337,22 @@ ptr :: struct #all_or_none {
 //////////////////////////////////////////////////////////////
 // Render primitive initialization
 
-shader_init :: proc(name: string, code: []u8) -> Shader_Handle {
+shader_init :: proc(name: string, code: []u8) -> Shader {
     native := _shader_init(name, code)
 
-    handle := hm.static_add(&_state.shaders, Shader {
+    return Shader {
         native = native,
-    })
-
-    return handle
+    }
 }
 
-compute_shader_init :: proc(name: string, code: []u8) -> Shader_Handle {
+compute_shader_init :: proc(name: string, code: []u8) -> Shader {
     return {}
     //return _shader_init(name, code)
 }
 
 pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> Pipeline {
-    assert(vertex.shader != NIL_SHADER_HANDLE)
     assert(vertex.entry_point != "")
-
-    assert(fragment.shader != NIL_SHADER_HANDLE)
     assert(fragment.entry_point != "")
-
     assert(pipeline_descriptor.color_format != .None)
 
     native := _pipeline_init(vertex, fragment, pipeline_descriptor)
@@ -410,13 +366,11 @@ Pipeline :: struct {
     using native: _Pipeline,
 }
 
-Compute_Pipeline_Handle :: distinct hm.Handle32
 Compute_Pipeline_Descriptor :: struct {
-    handle: Compute_Pipeline_Handle,
     using native: _Compute_Pipeline,
 }
-compute_pipeline_init :: proc(shader: Shader_Handle, entry_point: string) -> Compute_Pipeline_Handle {
-    return _compute_pipeline_init(shader, entry_point)
+compute_pipeline_init :: proc(shader: Shader, entry_point: string) {
+    // return _compute_pipeline_init(shader, entry_point)
 }
 
 //////////////////////////////////////////////////////////////
@@ -454,8 +408,8 @@ compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
     _compute_dispatch(num_groups, num_threads_per_group)
 }
 
-set_compute_pipeline :: proc(pipeline: Compute_Pipeline_Handle) {
-    _set_compute_pipeline(pipeline)
+set_compute_pipeline :: proc() {
+    // _set_compute_pipeline(pipeline)
 }
 
 set_pipeline :: proc(pipeline: Pipeline) {
@@ -565,7 +519,7 @@ texture_init :: proc(desc: Texture_Descriptor) -> Texture {
     return tex
 }
 
-set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_Handle) {
+set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
     _set_depth_stencil_state(depth_stencil_state)
 }
 
@@ -589,11 +543,6 @@ when ODIN_OS != .JS {
 // Push struct to buffer
 temp_malloc :: proc(bytes: []u8, buffer_index: u32, shader_stage: Shader_Stage) {
     _temp_malloc(bytes, buffer_index, shader_stage)       
-}
-
-// If buffers arent directly mapped
-use_resources :: proc(resource_list: []Shader_Resource) {
-    _use_resources(resource_list)
 }
 }
 
@@ -623,9 +572,7 @@ malloc :: proc(
     name:        string     = "",
     loc:                    = #caller_location,
 ) -> ptr {
-    size := runtime.align_forward_int(el_size * el_count, alignment)
-
-    _ptr := _malloc(type, size, alignment, name)
+    _ptr := _malloc(type, el_count, el_size, alignment, name)
 
     if type == .Staging {
         cpu_ptr, gpu_ptr := _map(&_ptr)
@@ -648,11 +595,6 @@ malloc :: proc(
             name = strings.clone(name, context.allocator),
             created_at = loc,
         },
-    }
-
-    // Assumes this field is present in wgpu and metal. Maybe just add parameter to malloc for the type of buffer?
-    if type == .GPU_Index {
-        result.index_bytes = u8(el_size)
     }
 
     return result
@@ -699,7 +641,7 @@ arena :: proc(
     arena: Arena
 
     bytes := runtime.align_forward_uint(size, alignment)
-    _ptr := _malloc(.Staging, bytes, alignment, "ARENA")
+    _ptr := _malloc(.Staging, 1, bytes, alignment, "ARENA")
     cpu_ptr, gpu_ptr := _map(&_ptr)
 
     arena.ptr = {

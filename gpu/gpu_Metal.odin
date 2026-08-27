@@ -29,7 +29,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         compute_command_encoder: ^MTL.ComputeCommandEncoder,
 
         curr_pipeline: Pipeline,
-        curr_compute_pipeline: Compute_Pipeline_Handle,
+        //curr_compute_pipeline: Compute_Pipeline_Handle,
     }
 
     _init :: proc(native_window: rawptr) -> bool {
@@ -73,9 +73,16 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         }
 
         for R in block.read_resources {
-            if R.native.buffer == nil { continue }            
-            _state.render_command_encoder->useResourceWithStages(R.native.buffer, {.Read}, {.Vertex})
-            append(&data, uintptr(R.gpu))
+            switch res in R {
+            case ptr:
+                if res.native.buffer == nil { continue }            
+                _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex})
+                append(&data, uintptr(res.gpu))
+            case Texture:
+                if res.native.texture == nil { continue }
+                _state.render_command_encoder->useResourceWithStages(res.native.texture, {.Read}, {.Vertex})
+                append(&data, uintptr(res.native.texture->gpuResourceID()))
+            }
         }
 
         for RW in block.read_write_resources {
@@ -335,9 +342,8 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return native
     }
 
-    _set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_Handle) {
-        impl := hm.static_get(&_state.depth_stencil_states, depth_stencil_state)
-        _state.render_command_encoder->setDepthStencilState(impl.native)
+    _set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
+        _state.render_command_encoder->setDepthStencilState(depth_stencil_state)
     }
 
     _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_Attachment) {
@@ -469,27 +475,6 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return _Depth_Stencil_State(depth_state)
     }
 
-    __Pipeline_Descriptor :: struct {
-        handle: Pipeline_Handle,
-
-        vertex_shader:   Shader_Handle, vertex_function:   string,
-        fragment_shader: Shader_Handle, fragment_function: string, 
-    
-        multisample: Multisample_State,
-
-        blend: Blend_State,
-    
-        depth_format: Pixel_Format,
-        format: Pixel_Format,
-
-        primitive: Primitive_State,
-
-        buffers: [8]ptr,
-
-        index_buffer: ptr,
-    }
-
-
     _set_blend :: proc() {
         // color_attachment->setBlendingEnabled(true)
         // color_attachment->setRgbBlendOperation(_blend_operation_interop(desc.blend.color.operation))
@@ -501,7 +486,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
     _Compute_Pipeline :: ^MTL.ComputePipelineState
-    _compute_pipeline_init :: proc(shader: Shader_Handle, entry_point: string) -> Compute_Pipeline_Handle {
+    _compute_pipeline_init :: proc(shader: Shader, entry_point: string) {
 
         // shader_impl := hm.static_get(&_state.shaders, shader)
 
@@ -521,11 +506,11 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         // })
 
         // return handle
-        return {}
+        
     }
 
-    _set_compute_pipeline :: proc(pipeline: Compute_Pipeline_Handle) {
-        _state.curr_compute_pipeline = pipeline
+    _set_compute_pipeline :: proc() {
+        //_state.curr_compute_pipeline = pipeline
     }
 
     _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
@@ -552,14 +537,12 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
         vertex_entry := NS.String.alloc()->initWithOdinString(vertex.entry_point)
         defer vertex_entry->release()
-        vertex_shader := hm.static_get(&_state.shaders, vertex.shader)
-        vertex_function := vertex_shader.library->newFunctionWithName(vertex_entry)
+        vertex_function := vertex.shader.library->newFunctionWithName(vertex_entry)
         defer vertex_function->release()
 
         fragment_entry := NS.String.alloc()->initWithOdinString(fragment.entry_point)
         defer fragment_entry->release()
-        fragment_shader := hm.static_get(&_state.shaders, fragment.shader)
-        fragment_function := fragment_shader.library->newFunctionWithName(fragment_entry)
+        fragment_function := fragment.shader.library->newFunctionWithName(fragment_entry)
         defer fragment_function->release()
 
         desc->setVertexFunction(vertex_function)
@@ -633,45 +616,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         unreachable()
     }
 
-    _resource_usage_interop :: proc(flag: Resource_Usage_Flag) -> MTL.ResourceUsageFlag {
-        switch flag {
-        case .Read:
-            return .Read
-        case .Write:
-            return .Write
-        case .Sample:
-            return .Sample
-        }
-        unreachable()
-    }
-
-    _render_stage_interop :: proc(state: Render_Stage) -> MTL.RenderStage {
-        switch state {
-        case .Vertex:
-            return .Vertex
-        case .Fragment:
-            return .Fragment
-        case .Tile:
-            return .Tile
-        case .Object:
-            return .Object
-        case .Mesh:
-            return .Mesh
-        }
-        unreachable()
-    }
-
     _unmap :: proc(ptr: ^_ptr) { /* no op in Metal */ }
-
-    _use_resources :: proc(resource_list: []Shader_Resource) {
-        for res in resource_list {
-            usage_flags := bit_set_to_another(res.usage, MTL.ResourceUsage, _resource_usage_interop)
-            stages := bit_set_to_another(res.stage, MTL.RenderStages, _render_stage_interop)
-            _state.render_command_encoder->useResourceWithStages(
-                res.ptr.native.buffer, usage_flags, stages,
-            )
-        }
-    }
 
     _temp_malloc :: proc(bytes: []u8, index: u32, shader_stage: Shader_Stage) {
         switch shader_stage {
@@ -745,11 +690,12 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _malloc :: proc(
         type: Buffer_Type,
-        #any_int size: uint,
+        #any_int el_count: uint,
+        #any_int el_size: uint,
         #any_int alignment: uint,
         name: string,
     ) -> _ptr {
-        bytes := runtime.align_forward_uint(size, alignment)
+        bytes := runtime.align_forward_uint(el_count * el_size, alignment)
 
         options: MTL.ResourceOptions
         switch type {
@@ -774,6 +720,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             buffer = buffer,
             offset = 0,
             capacity = uint(bytes),
+            index_bytes = u8(el_size) if type == .GPU_Index else 0,
         }
     }
 
