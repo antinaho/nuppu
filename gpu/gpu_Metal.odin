@@ -30,7 +30,14 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         compute_command_encoder: ^MTL.ComputeCommandEncoder,
 
         curr_pipeline: Pipeline,
-        //curr_compute_pipeline: Compute_Pipeline_Handle,
+        curr_compute_pipeline: Compute_Pipeline,
+    }
+
+    _compute_command_encoder :: proc() -> ^MTL.ComputeCommandEncoder {
+        if _state.compute_command_encoder == nil {
+            _state.compute_command_encoder = _state.command_buffer->computeCommandEncoder()
+        }
+        return _state.compute_command_encoder
     }
 
     _init :: proc(native_window: rawptr) -> bool {
@@ -65,53 +72,99 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return true
     }
 
-    _use_parameter_block :: proc(block: ^Parameter_Block) {
+    _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Destination) {
         data := make([dynamic]uintptr, context.temp_allocator)
         offset := 0
 
-        for C, idx in block.constants {
-            if C.native.buffer == nil { continue }
-            _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex, .Fragment})
-            fmt.printf("  constants[%d] -> offset=%d  gpu=0x%x\n", idx, offset, uintptr(C.gpu))
-            append(&data, uintptr(C.gpu))
-            offset += size_of(uintptr)
-        }
-
-        for R, idx in block.read_resources {
-            switch res in R {
-            case ptr:
-                if res.native.buffer == nil { continue }
-                _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex, .Fragment})
-                fmt.printf("  read[%d](ptr)   -> offset=%d  gpu=0x%x\n", idx, offset, uintptr(res.gpu))
-                append(&data, uintptr(res.gpu))
-                offset += size_of(uintptr)
-            case Texture:
-                if res.native.texture == nil { continue }
-                _state.render_command_encoder->useResourceWithStages(res.native.texture, {.Read}, {.Vertex, .Fragment})
-                fmt.printf("  read[%d](tex)   -> offset=%d  gpuResourceID=0x%x\n", idx, offset, uintptr(res.native.texture->gpuResourceID()))
-                append(&data, uintptr(res.native.texture->gpuResourceID()))
-                offset += size_of(uintptr)
+        if destination == .Graphics {
+            for C, idx in block.constants {
+                if C.native.buffer == nil { continue }
+                _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex, .Fragment})
+                append(&data, uintptr(C.gpu))
             }
+    
+            for R, idx in block.read_resources {
+                switch res in R {
+                case ptr:
+                    if res.native.buffer == nil { continue }
+                    _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex, .Fragment})
+                    append(&data, uintptr(res.gpu))
+                case Texture:
+                    if res.native.texture == nil { continue }
+                    _state.render_command_encoder->useResourceWithStages(res.native.texture, {.Read, .Sample}, {.Vertex, .Fragment})
+                    append(&data, uintptr(res.native.texture->gpuResourceID()))
+                }
+            }
+    
+            for RW in block.read_write_resources {
+                switch res in RW {
+                case ptr:
+                    if res.native.buffer == nil { continue }
+                    _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read, .Write}, {.Vertex, .Fragment})
+                    append(&data, uintptr(res.gpu))
+                case Texture:
+                    if res.native.texture == nil { continue }
+                    _state.render_command_encoder->useResourceWithStages(res.native.texture, {.Read, .Write, .Sample}, {.Vertex, .Fragment})
+                    append(&data, uintptr(res.native.texture->gpuResourceID()))
+                }
+            }
+    
+            for S, idx in block.samplers {
+                if S.native == nil { continue }
+                append(&data, uintptr(S.native->gpuResourceID()))
+            }
+    
+            MAX_PUSH_BYTE_SIZE :: 64 * 64
+            assert(len(data) <= 64)
+    
+            // Just pushing same to both stages since all resources are
+            _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Vertex)
+            _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Fragment)
+        } else {
+            
+            for C, idx in block.constants {
+                if C.native.buffer == nil { continue }
+                _compute_command_encoder()->useResource(C.native.buffer, {.Read})
+                append(&data, uintptr(C.gpu))
+            }
+    
+            for R, idx in block.read_resources {
+                switch res in R {
+                case ptr:
+                    if res.native.buffer == nil { continue }
+                    _compute_command_encoder()->useResource(res.native.buffer, {.Read})
+                    append(&data, uintptr(res.gpu))
+                case Texture:
+                    if res.native.texture == nil { continue }
+                    _compute_command_encoder()->useResource(res.native.texture, {.Read, .Sample})
+                    append(&data, uintptr(res.native.texture->gpuResourceID()))
+                }
+            }
+    
+            for RW in block.read_write_resources {
+                switch res in RW {
+                case ptr:
+                    if res.native.buffer == nil { continue }
+                    _compute_command_encoder()->useResource(res.native.buffer, {.Read, .Write})
+                    append(&data, uintptr(res.gpu))
+                case Texture:
+                    if res.native.texture == nil { continue }
+                    _compute_command_encoder()->useResource(res.native.texture, {.Read, .Write, .Sample})
+                    append(&data, uintptr(res.native.texture->gpuResourceID()))
+                }
+            }
+    
+            for S, idx in block.samplers {
+                if S.native == nil { continue }
+                append(&data, uintptr(S.native->gpuResourceID()))
+            }
+    
+            MAX_PUSH_BYTE_SIZE :: 64 * 64
+            assert(len(data) <= 64)
+    
+            _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Compute)
         }
 
-        for RW in block.read_write_resources {
-        }
-
-        for S, idx in block.samplers {
-            if S.native == nil { continue }
-            fmt.printf("  sampler[%d]     -> offset=%d  gpuResourceID=0x%x\n", idx, offset, uintptr(S.native->gpuResourceID()))
-            append(&data, uintptr(S.native->gpuResourceID()))
-            offset += size_of(uintptr)
-        }
-
-        fmt.printf("parameter_block: %d entries, %d bytes\n", len(data), len(data) * size_of(uintptr))
-
-        MAX_PUSH_BYTE_SIZE :: 64 * 64
-        assert(len(data) <= 64)
-
-        // Just pushing same to both stages since all resources are
-        _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Vertex)
-        _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Fragment)
     }
 
 
@@ -522,31 +575,24 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
     _Compute_Pipeline :: ^MTL.ComputePipelineState
-    _compute_pipeline_init :: proc(shader: Shader, entry_point: string) {
-
-        // shader_impl := hm.static_get(&_state.shaders, shader)
-
-        // entry_ns_str := NS.String.alloc()->initWithOdinString(entry_point)
-        // defer entry_ns_str->release()
     
-        // function := shader_impl.library->newFunctionWithName(entry_ns_str)
-        // defer function->release()
+    _compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> _Compute_Pipeline {
+        entry_ns_str := NS.String.alloc()->initWithOdinString(entry_point)
+        defer entry_ns_str->release()
+    
+        function := shader.library->newFunctionWithName(entry_ns_str)
+        defer function->release()
 
-        // kernel, k_err := _state.device->newComputePipelineStateWithFunction(function)
-        // if k_err != nil {
-        //     log.panicf("Failed to create pipeline state: %v", k_err->localizedDescription()->odinString())
-        // }
+        kernel, k_err := _state.device->newComputePipelineStateWithFunction(function)
+        if k_err != nil {
+            log.panicf("Failed to create pipeline state: %v", k_err->localizedDescription()->odinString())
+        }
 
-        // handle := hm.static_add(&_state.compute_pipelines, Compute_Pipeline_Descriptor {
-        //     native = _Compute_Pipeline(kernel)
-        // })
-
-        // return handle
-        
+        return kernel
     }
 
-    _set_compute_pipeline :: proc() {
-        //_state.curr_compute_pipeline = pipeline
+    _set_compute_pipeline :: proc(compute_pipeline: Compute_Pipeline) {
+        _state.curr_compute_pipeline = compute_pipeline
     }
 
     _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
@@ -642,10 +688,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         case .Fragment:
             _state.render_command_encoder->setFragmentBytes(bytes, NS.UInteger(index))
         case .Compute:
-            // if _state.compute_command_encoder == nil {
-            //     _state.compute_command_encoder = _state.command_buffer->computeCommandEncoder()
-            // }
-            // _state.compute_command_encoder->setBytes(bytes, NS.UInteger(index))
+            _compute_command_encoder()->setBytes(bytes, NS.UInteger(index))
         }
     }
 

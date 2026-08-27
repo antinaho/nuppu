@@ -32,10 +32,10 @@ FRAME_ARENA_SIZE :: 4 * 1024 * 1024
 // Resources inside arrays need to be declared in the same order
 // as they are in the shader
 Parameter_Block :: struct {
-    constants: [MAX_CONSTANTS]ptr,
-    read_resources: [MAX_READ_RESOURCE]Parameter_Resource,
-    read_write_resources: [MAX_READ_WRITE_RESOURCES]ptr,
-    samplers: [MAX_SAMPLERS]Sampler,
+    constants           : [MAX_CONSTANTS]ptr,
+    read_resources      : [MAX_READ_RESOURCE]Parameter_Resource,
+    read_write_resources: [MAX_READ_WRITE_RESOURCES]Parameter_Resource,
+    samplers            : [MAX_SAMPLERS]Sampler,
 }
 
 Parameter_Resource :: union {
@@ -43,8 +43,13 @@ Parameter_Resource :: union {
     Texture,
 }
 
-use_parameter_block :: proc(block: ^Parameter_Block) {
-    _use_parameter_block(block)
+Parameter_Destination :: enum {
+    Graphics,
+    Compute,
+}
+
+use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Destination = .Graphics) {
+    _use_parameter_block(block, destination)
 }
 
 // Limits based of WGSL https://www.w3.org/TR/WGSL/#limits
@@ -348,8 +353,7 @@ shader_init :: proc(name: string, code: []u8) -> Shader {
 }
 
 compute_shader_init :: proc(name: string, code: []u8) -> Shader {
-    return {}
-    //return _shader_init(name, code)
+    return shader_init(name, code)
 }
 
 pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> Pipeline {
@@ -368,11 +372,19 @@ Pipeline :: struct {
     using native: _Pipeline,
 }
 
-Compute_Pipeline_Descriptor :: struct {
+
+Compute_Pipeline :: struct {
     using native: _Compute_Pipeline,
 }
-compute_pipeline_init :: proc(shader: Shader, entry_point: string) {
-    // return _compute_pipeline_init(shader, entry_point)
+
+compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> Compute_Pipeline {
+    native := _compute_pipeline_init(shader, entry_point)
+
+    result := Compute_Pipeline {
+        native = native,
+    }
+
+    return result
 }
 
 //////////////////////////////////////////////////////////////
@@ -410,8 +422,8 @@ compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
     _compute_dispatch(num_groups, num_threads_per_group)
 }
 
-set_compute_pipeline :: proc() {
-    // _set_compute_pipeline(pipeline)
+set_compute_pipeline :: proc(compute_pipeline: Compute_Pipeline) {
+    _set_compute_pipeline(compute_pipeline)
 }
 
 set_pipeline :: proc(pipeline: Pipeline) {
