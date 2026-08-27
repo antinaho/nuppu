@@ -29,6 +29,8 @@ else {
 FRAMES_IN_FLIGHT :: 3
 FRAME_ARENA_SIZE :: 4 * 1024 * 1024
 
+// Resources inside arrays need to be declared in the same order
+// as they are in the shader
 Parameter_Block :: struct {
     constants: [MAX_CONSTANTS]ptr,
     read_resources: [MAX_READ_RESOURCE]Parameter_Resource,
@@ -414,18 +416,6 @@ set_compute_pipeline :: proc() {
 
 set_pipeline :: proc(pipeline: Pipeline) {
     _set_pipeline(pipeline)
-}
-
-set_buffers :: proc(buffers: []ptr, range: Range, stage: Shader_Stage) {
-    _set_buffers(buffers, range, stage)
-}
-
-set_textures :: proc(textures: []Texture, range: Range, stage: Shader_Stage) {
-    _set_textures(textures, range, stage)
-}
-
-set_samplers :: proc(samplers: []Sampler, range: Range, stage: Shader_Stage) {
-    _set_samplers(samplers, range, stage)
 }
 
 Sampler :: struct {

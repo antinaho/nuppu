@@ -9,6 +9,7 @@ import "base:runtime"
 import hm "core:container/handle_map"
 import "core:time"
 import "core:slice"
+import "core:fmt"
 
 when GPU_BACKEND == GPU_BACKEND_METAL {
 
@@ -66,37 +67,49 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _use_parameter_block :: proc(block: ^Parameter_Block) {
         data := make([dynamic]uintptr, context.temp_allocator)
-        for C in block.constants {
+        offset := 0
+
+        for C, idx in block.constants {
             if C.native.buffer == nil { continue }
             _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex, .Fragment})
+            fmt.printf("  constants[%d] -> offset=%d  gpu=0x%x\n", idx, offset, uintptr(C.gpu))
             append(&data, uintptr(C.gpu))
+            offset += size_of(uintptr)
         }
 
-        for R in block.read_resources {
+        for R, idx in block.read_resources {
             switch res in R {
             case ptr:
-                if res.native.buffer == nil { continue }            
+                if res.native.buffer == nil { continue }
                 _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex, .Fragment})
+                fmt.printf("  read[%d](ptr)   -> offset=%d  gpu=0x%x\n", idx, offset, uintptr(res.gpu))
                 append(&data, uintptr(res.gpu))
+                offset += size_of(uintptr)
             case Texture:
                 if res.native.texture == nil { continue }
                 _state.render_command_encoder->useResourceWithStages(res.native.texture, {.Read}, {.Vertex, .Fragment})
+                fmt.printf("  read[%d](tex)   -> offset=%d  gpuResourceID=0x%x\n", idx, offset, uintptr(res.native.texture->gpuResourceID()))
                 append(&data, uintptr(res.native.texture->gpuResourceID()))
+                offset += size_of(uintptr)
             }
         }
 
         for RW in block.read_write_resources {
         }
 
-        for S in block.samplers {
+        for S, idx in block.samplers {
             if S.native == nil { continue }
+            fmt.printf("  sampler[%d]     -> offset=%d  gpuResourceID=0x%x\n", idx, offset, uintptr(S.native->gpuResourceID()))
             append(&data, uintptr(S.native->gpuResourceID()))
+            offset += size_of(uintptr)
         }
+
+        fmt.printf("parameter_block: %d entries, %d bytes\n", len(data), len(data) * size_of(uintptr))
 
         MAX_PUSH_BYTE_SIZE :: 64 * 64
         assert(len(data) <= 64)
 
-        // Just pushing same to both stages since all resources are 
+        // Just pushing same to both stages since all resources are
         _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Vertex)
         _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Fragment)
     }
@@ -175,26 +188,6 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         native.texture->replaceRegion(region, NS.UInteger(level), data, NS.UInteger(bytes_per_row))
     }
 
-    _set_textures :: proc(textures: []Texture, range: Range, stage: Shader_Stage) {
-        mtl_textures := make([]^MTL.Texture, len=len(textures), allocator=context.temp_allocator)
-        for tex, I in textures {
-            mtl_textures[I] = tex.native.texture
-        }
-
-        switch stage {
-        case .Vertex:
-            _state.render_command_encoder->setVertexTextures(mtl_textures, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
-        case .Fragment:
-            _state.render_command_encoder->setFragmentTextures(mtl_textures, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
-        case .Compute:
-            if _state.compute_command_encoder == nil {
-                _state.compute_command_encoder = _state.command_buffer->computeCommandEncoder()
-            }
-            _state.compute_command_encoder->setTextures(mtl_textures, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
-        }
-    }
-
-
     _Sampler :: ^MTL.SamplerState
 
     _sampler_filter_min_mag_interop :: proc(filter: Sampler_Min_Mag_Filter) -> MTL.SamplerMinMagFilter {
@@ -235,6 +228,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         sampler_desc := MTL.SamplerDescriptor.alloc()->init()
         defer sampler_desc->release()
 
+        sampler_desc->setSupportArgumentBuffers(true)
         sampler_desc->setMinFilter(_sampler_filter_min_mag_interop(desc.min_filter))
         sampler_desc->setMagFilter(_sampler_filter_min_mag_interop(desc.mag_filter))
         sampler_desc->setMipFilter(_sampler_filter_mip_interop(desc.mip_filter))
@@ -244,11 +238,6 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
         return _state.device->newSamplerState(sampler_desc)
     }
-
-    _set_samplers :: proc(samplers: []Sampler, range: Range, stage: Shader_Stage) {
-        // TODO
-    }
-
 
     _map :: proc(ptr: ^_ptr) -> (cpu: rawptr, gpu: rawptr) {
         assert(ptr.offset % 8 == 0)
@@ -634,26 +623,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         _state.curr_pipeline = pipeline
     }
 
-    _set_buffers :: proc(buffers: []ptr, range: Range, stage: Shader_Stage) {
-        assert(len(buffers) > 0)
-        assert(len(buffers) == int(range.length))
-
-        mtl_buffers := make([]^MTL.Buffer, len=len(buffers), allocator=context.temp_allocator)
-        buffer_offsets := make([]uint, len=len(buffers), allocator=context.temp_allocator)
-        for b, I in buffers {
-            mtl_buffers[I] = b.native.buffer
-            buffer_offsets[I] = 0
-        }
-
-        switch stage {
-        case .Vertex:
-            _state.render_command_encoder->setVertexBuffers(mtl_buffers, transmute([]NS.UInteger)buffer_offsets, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
-        case .Fragment:
-            _state.render_command_encoder->setFragmentBuffers(mtl_buffers, transmute([]NS.UInteger)buffer_offsets, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
-        case .Compute:
-            _state.compute_command_encoder->setBuffers(mtl_buffers, transmute([]NS.UInteger)buffer_offsets, NS.Range{NS.UInteger(range.location), NS.UInteger(range.length)})
-        }
-    }
+    
 
     _primitive_type_interop :: proc(primitive: Primitive_Type) -> MTL.PrimitiveType {
         switch primitive {
