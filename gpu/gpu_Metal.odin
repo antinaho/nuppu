@@ -596,17 +596,11 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
     _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
-        // size_grid := MTL.Size{NS.Integer(num_groups.x), NS.Integer(num_groups.y), NS.Integer(num_groups.z)}
-	    // size_group := MTL.Size{NS.Integer(num_threads_per_group.x), NS.Integer(num_threads_per_group.y), NS.Integer(num_threads_per_group.z)}
+        size_grid := MTL.Size{NS.Integer(num_groups.x), NS.Integer(num_groups.y), NS.Integer(num_groups.z)}
+	    size_group := MTL.Size{NS.Integer(num_threads_per_group.x), NS.Integer(num_threads_per_group.y), NS.Integer(num_threads_per_group.z)}
         
-        // compute_pipeline := hm.static_get(&_state.compute_pipelines, _state.curr_compute_pipeline)
-
-        // if _state.compute_command_encoder == nil {
-        //     _state.compute_command_encoder = _state.command_buffer->computeCommandEncoder()
-        // }
-
-        // _state.compute_command_encoder->setComputePipelineState(compute_pipeline.native)
-        // _state.compute_command_encoder->dispatchThreads(size_grid, size_group)
+        _compute_command_encoder()->setComputePipelineState(_state.curr_compute_pipeline.native)
+        _compute_command_encoder()->dispatchThreads(size_grid, size_group)
     }
 
     _Pipeline :: struct {
