@@ -13,57 +13,85 @@ state: ^State
 
 State :: struct {
     angle: f32,
-
-    shader: gpu.Shader_Handle,
     
     vertex_gpu: gpu.ptr,
     index_gpu: gpu.ptr,
     instance_gpu: gpu.ptr,
     camera_uniform: gpu.ptr,
 
-    depth_pso: gpu.Depth_Stencil_Handle,
-    pso: gpu.Pipeline_Handle,
+    depth_pso: gpu.Depth_Stencil_State,
+    pso: gpu.Pipeline,
     
     texture: gpu.Texture,
 
     sampler: gpu.Sampler,
+
+    compute_pso: gpu.Compute_Pipeline,
+    kernel: gpu.Shader,
+}
+
+Vertex :: struct #align(4) {
+	position: glm.vec3, 
+	normal:   glm.vec3, 
+    tex_coord: glm.vec2,
+}
+
+Instance :: struct #align(4) {
+	transform:        glm.mat4,
+	color:            glm.vec4,
+	normal_transform: glm.mat3,
+}
+
+Camera :: struct #align(4) {
+    perspective_transform:  glm.mat4,
+    world_transform:        glm.mat4,
+    world_normal_transform: glm.mat3,
 }
 
 init :: proc() {
 when ODIN_OS == .Darwin {
-    shader_code := #load("texturing.metal", []u8)
+    vertex_code := #load("compute.vs.metal", []u8)
+    fragment_code := #load("compute.ps.metal", []u8)
+    compute_code := #load("mandelbrot.metal", []u8)
 }
 when ODIN_OS == .JS {
-    shader_code := #load("texturing.wgsl", []u8)
+    // WGSL uses same shader for vertex and fragment
+    vertex_code := #load("compute.wgsl", []u8)
+    fragment_code := vertex_code 
+    compute_code := #load("mandelbrot.wgsl", []u8)
 }
 
-    state.shader = gpu.shader_init("my_shader", shader_code)
-    state.pso = gpu.pipeline_init(state.shader, "vertexMain", state.shader, "fragmentMain", .BGRA8Unorm, .Depth32Float)
+    shader_vs := gpu.shader_init("my_vert_shader", vertex_code)
+    shader_ps := gpu.shader_init("my_frag_shader", fragment_code)
+
+    vertex_shader := gpu.Shader_IR {
+        shader = shader_vs,
+        entry_point = "vertexMain",
+    }
+
+    fragment_shader := gpu.Shader_IR {
+        shader = shader_ps,
+        entry_point = "fragmentMain",
+    }
+
+    state.pso = gpu.pipeline_init(vertex_shader, fragment_shader, {
+        color_format = .BGRA8Unorm,
+        depth_format = .Depth32Float,
+    })
+    
     state.depth_pso = gpu.depth_stencil_state_init({compare = .Less, write_enabled = true})
 
-    TW :: 128
-    TH :: 128
     state.texture = gpu.texture_init({
-        dimensions = {TW, TH},
+        dimensions = {TEXTURE_WIDTH, TEXTURE_HEIGHT},
         format = .BGRA8Unorm,
         type = ._2D,
-        storage = .Shared,
-        usage = .Sampled,
+        storage = .Private,
+        usage = .Storage,
     })
 
-    pixels := make([][4]u8, TW * TH, context.temp_allocator)
-    for y in 0..< TH {
-		for x in 0..< TW {
-			is_white := ((x~y) & 0b0100_0000) != 0
-			c: u8 = 0xff if is_white else 0x0a
-			i := y * TW + x
-			pixels[i].rgb = c
-			pixels[i].a = 0xff
-		}
-	}
-
-    gpu.copy_to_texture(state.texture, {}, {TW, TH, 1}, 0, raw_data(pixels), TW * 4)
-
+    state.kernel = gpu.compute_shader_init("my_compute_shader", compute_code)
+    state.compute_pso = gpu.compute_pipeline_init(state.kernel, "mandelbrot_set")
+    
     upload := gpu.arena()
     //defer nuppu.gpu_arena_deinit(&upload_arena)
 
@@ -73,37 +101,37 @@ when ODIN_OS == .JS {
 
     verts := gpu.arena_alloc(&upload, Vertex, VERT_COUNT)
     vs := [VERT_COUNT]Vertex {
-        //                               Texture
-        //   Positions      Normals    Coordinates
-        { { -s, -s, +s }, {  0,  0,  1 }, { 0, 1 } },
-        { { +s, -s, +s }, {  0,  0,  1 }, { 1, 1 } },
-        { { +s, +s, +s }, {  0,  0,  1 }, { 1, 0 } },
-        { { -s, +s, +s }, {  0,  0,  1 }, { 0, 0 } },
+		//                                                       Texture
+		//   Positions (.xyz)        Normals (.xyz)            Coordinates
+		{{-s, -s, +s}, { 0,  0,  1}, {0, 1}},
+		{{+s, -s, +s}, { 0,  0,  1}, {1, 1}},
+		{{+s, +s, +s}, { 0,  0,  1}, {1, 0}},
+		{{-s, +s, +s}, { 0,  0,  1}, {0, 0}},
 
-        { { +s, -s, +s }, {  1,  0,  0 }, { 0, 1 } },
-        { { +s, -s, -s }, {  1,  0,  0 }, { 1, 1 } },
-        { { +s, +s, -s }, {  1,  0,  0 }, { 1, 0 } },
-        { { +s, +s, +s }, {  1,  0,  0 }, { 0, 0 } },
+		{{+s, -s, +s}, { 1,  0,  0}, {0, 1}},
+		{{+s, -s, -s}, { 1,  0,  0}, {1, 1}},
+		{{+s, +s, -s}, { 1,  0,  0}, {1, 0}},
+		{{+s, +s, +s}, { 1,  0,  0}, {0, 0}},
 
-        { { +s, -s, -s }, {  0,  0, -1 }, { 0, 1 } },
-        { { -s, -s, -s }, {  0,  0, -1 }, { 1, 1 } },
-        { { -s, +s, -s }, {  0,  0, -1 }, { 1, 0 } },
-        { { +s, +s, -s }, {  0,  0, -1 }, { 0, 0 } },
+		{{+s, -s, -s}, { 0,  0, -1}, {0, 1}},
+		{{-s, -s, -s}, { 0,  0, -1}, {1, 1}},
+		{{-s, +s, -s}, { 0,  0, -1}, {1, 0}},
+		{{+s, +s, -s}, { 0,  0, -1}, {0, 0}},
 
-        { { -s, -s, -s }, { -1,  0,  0 }, { 0, 1 } },
-        { { -s, -s, +s }, { -1,  0,  0 }, { 1, 1 } },
-        { { -s, +s, +s }, { -1,  0,  0 }, { 1, 0 } },
-        { { -s, +s, -s }, { -1,  0,  0 }, { 0, 0 } },
+		{{-s, -s, -s}, {-1,  0,  0}, {0, 1}},
+		{{-s, -s, +s}, {-1,  0,  0}, {1, 1}},
+		{{-s, +s, +s}, {-1,  0,  0}, {1, 0}},
+		{{-s, +s, -s}, {-1,  0,  0}, {0, 0}},
 
-        { { -s, +s, +s }, {  0,  1,  0 }, { 0, 1 } },
-        { { +s, +s, +s }, {  0,  1,  0 }, { 1, 1 } },
-        { { +s, +s, -s }, {  0,  1,  0 }, { 1, 0 } },
-        { { -s, +s, -s }, {  0,  1,  0 }, { 0, 0 } },
+		{{-s, +s, +s}, { 0,  1,  0}, {0, 1}},
+		{{+s, +s, +s}, { 0,  1,  0}, {1, 1}},
+		{{+s, +s, -s}, { 0,  1,  0}, {1, 0}},
+		{{-s, +s, -s}, { 0,  1,  0}, {0, 0}},
 
-        { { -s, -s, -s }, {  0, -1,  0 }, { 0, 1 } },
-        { { +s, -s, -s }, {  0, -1,  0 }, { 1, 1 } },
-        { { +s, -s, +s }, {  0, -1,  0 }, { 1, 0 } },
-        { { -s, -s, +s }, {  0, -1,  0 }, { 0, 0 } }
+		{{-s, -s, -s}, { 0, -1,  0}, {0, 1}},
+		{{+s, -s, -s}, { 0, -1,  0}, {1, 1}},
+		{{+s, -s, +s}, { 0, -1,  0}, {1, 0}},
+		{{-s, -s, +s}, { 0, -1,  0}, {0, 0}},
     }
     runtime.mem_copy_non_overlapping(verts.cpu, &vs, size_of(Vertex) * VERT_COUNT)
 
@@ -117,18 +145,39 @@ when ODIN_OS == .JS {
 		20, 21, 22, 22, 23, 20, // bottom
     }
     runtime.mem_copy_non_overlapping(indices.cpu, &is, size_of(u32) * INDEX_COUNT)
+    
+    grid_size := gpu.arena_alloc(&upload, [2]u32, 1)
+    (^[2]u32)(grid_size.cpu)^ = {TEXTURE_WIDTH, TEXTURE_HEIGHT}
+
     gpu.unmap(&upload.ptr)
 
     state.vertex_gpu = gpu.malloc(.GPU_Storage, VERT_COUNT, size_of(Vertex), align_of(Vertex), "Vertices")
     state.index_gpu = gpu.malloc_index(INDEX_COUNT, .Uint32, "Indices")
-    state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance_Data), align_of(Instance_Data), "Instances")
-    state.camera_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Camera_Data), align_of(Camera_Data), "Camera")
+    state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance), align_of(Instance), "Instances")
+    state.camera_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Camera), align_of(Camera), "Camera")
+    grid_size_uniform := gpu.malloc(.GPU_Constant, 1, size_of([2]uint), align_of([2]uint), "Grid_Size")
 
     gpu.begin_commands()
     gpu.copy(state.vertex_gpu, verts)
     gpu.copy(state.index_gpu, indices)
+    gpu.copy(grid_size_uniform, grid_size)
     gpu.barrier(.Transfer, .All)
     gpu.commit_commands()
+
+    gpu.begin_commands()
+    gpu.set_compute_pipeline(state.compute_pso)
+
+    compute_block := gpu.Parameter_Block {
+        constants = { 0 = grid_size_uniform },
+        read_resources = { },
+        read_write_resources = { 0 = state.texture },
+        samplers = { },
+    }
+    gpu.use_parameter_block(&compute_block, .Compute)
+    
+    gpu.compute_dispatch({TEXTURE_WIDTH, TEXTURE_HEIGHT, 1}, {128, 1, 1})
+    gpu.barrier(.Compute, .All)
+    gpu.commit_commands()   
 
     state.sampler = gpu.sampler_init({
         min_filter = .Linear,
@@ -140,30 +189,15 @@ when ODIN_OS == .JS {
     })
 }
 
-Vertex :: struct {
-	position: glm.vec3,
-	normal:   glm.vec3,
-    tex_coord: glm.vec2,
-}
-
 INSTANCE_WIDTH  :: 10
 INSTANCE_HEIGHT :: 10
 INSTANCE_DEPTH  :: 10
 INSTANCE_COUNT   :: INSTANCE_WIDTH*INSTANCE_HEIGHT*INSTANCE_DEPTH
-Instance_Data :: struct #align(16) {
-	transform:        glm.mat4,
-	color:            glm.vec4,
-	normal_transform: glm.mat3,
-}
 
-Camera_Data :: struct #align(16) {
-    perspective_transform:  glm.mat4,
-    world_transform:        glm.mat4,
-    world_normal_transform: glm.mat3,
-}
+TEXTURE_WIDTH  :: 128
+TEXTURE_HEIGHT :: 128
 
-deinit :: proc() {
-}
+deinit :: proc() { }
 
 update :: proc() {
     state.angle += nuppu.sim_delta_time() * 0.45
@@ -173,20 +207,20 @@ render :: proc(prev, curr: ^State, alpha: f32) {
     gpu.begin_frame()
     frame_arena := gpu.frame_arena()
 
-    instances := gpu.arena_alloc(frame_arena, Instance_Data, INSTANCE_COUNT)
-    
+    instances := gpu.arena_alloc(frame_arena, Instance, INSTANCE_COUNT)
+
     angle := math.lerp(prev.angle, curr.angle, alpha)
-    scl :: 0.2
-    object_position := glm.vec3{0, 0, -7}
+    object_position := glm.vec3{0, 0, -10}
     rt := glm.mat4Translate(object_position)
     rr1 := glm.mat4Rotate({0, 1, 0}, -angle)
     rr0 := glm.mat4Rotate({1, 0, 0}, angle*0.5)
     rt_inv := glm.mat4Translate(-object_position)
     full_obj_rot := rt * rr1 * rr0 * rt_inv
 
+
     ix, iy, iz := 0, 0, 0
 
-    for &instance, idx in ([^]Instance_Data)(instances.cpu)[:INSTANCE_COUNT] {
+    for &instance, idx in ([^]Instance)(instances.cpu)[:INSTANCE_COUNT] {
         if ix == INSTANCE_WIDTH {
             ix = 0
             iy += 1
@@ -218,18 +252,18 @@ render :: proc(prev, curr: ^State, alpha: f32) {
         instance.color = {r, 1-r, math.sin(math.TAU * r), 1}
     }
 
-    cam_ptr := gpu.arena_alloc(frame_arena, Camera_Data, 1)
-    
-    cam := Camera_Data {
+    cam := Camera {
 		perspective_transform = glm.mat4Perspective(glm.radians_f32(45), nuppu.aspect_ratio(), 0.03, 500),
 		world_transform = 1,
 		world_normal_transform = glm.mat3(1)
     }
-    (^Camera_Data)(cam_ptr.cpu)^ = cam
+    cam_ptr := gpu.arena_alloc(frame_arena, Camera, 1)
+    (^Camera)(cam_ptr.cpu)^ = cam
 
     gpu.unmap(&frame_arena.ptr)
-    gpu.copy(curr.camera_uniform, cam_ptr)
+
     gpu.copy(curr.instance_gpu, instances)
+    gpu.copy(curr.camera_uniform, cam_ptr)
     gpu.barrier(.Transfer, .All)
 
     swapchain := gpu.acquire_next_swapchain()
@@ -251,16 +285,19 @@ render :: proc(prev, curr: ^State, alpha: f32) {
     gpu.set_pipeline(curr.pso)
     gpu.set_depth_stencil_state(curr.depth_pso)
 
-
-
     gpu.set_cull_mode(.Back)
     gpu.set_front_face_winding(.CCW)
+
     //gpu.gpu_temp_malloc(cmds, slice.bytes_from_ptr(&cam, size_of(Camera_Data)), 2, .Vertex)
     
-    gpu.set_samplers({curr.sampler}, {0, 1}, .Fragment)
-    gpu.set_textures({curr.texture}, {0, 1}, .Fragment)
-    
-    gpu.set_buffers({curr.vertex_gpu, curr.instance_gpu, curr.camera_uniform}, {0, 3}, .Vertex)
+    block := gpu.Parameter_Block {
+        constants = { 0 = curr.camera_uniform },
+        read_resources = { 0 = curr.vertex_gpu, 1 = curr.instance_gpu, 2 = curr.texture },
+        read_write_resources = {},
+        samplers = { 0 = curr.sampler },
+    }
+
+    gpu.use_parameter_block(&block)
     
     gpu.draw_indiced_primitives(
     .Triangle,

@@ -58,3 +58,30 @@ float4 fragmentMain(v2f in) : SV_Target
 //     -fvk-t-shift 50 all \
 //     -fvk-u-shift 100 all \
 //     -fvk-s-shift 150 all
+
+
+// slangc examples/AppleLearnCPP/7-Compute-to-render/compute.slang \
+//     -target metal \
+//     -entry vertexMain \
+//     -stage vertex \
+//     -o examples/AppleLearnCPP/7-Compute-to-render/compute.vs.metal \
+
+// slangc examples/AppleLearnCPP/7-Compute-to-render/compute.slang \
+//     -target metal \
+//     -entry fragmentMain \
+//     -stage fragment \
+//     -o examples/AppleLearnCPP/7-Compute-to-render/compute.ps.metal \
+
+// slangc examples/AppleLearnCPP/7-Compute-to-render/mandelbrot.slang \
+//     -target metal \
+//     -entry mandelbrot_set \
+//     -stage compute \
+//     -o examples/AppleLearnCPP/7-Compute-to-render/mandelbrot.metal
+
+
+
+// slangc examples/AppleLearnCPP/7-Compute-to-render/mandelbrot.slang \
+//     -target wgsl \
+//     -entry mandelbrot_set \
+//     -stage compute \
+//     -o examples/AppleLearnCPP/7-Compute-to-render/mandelbrot.wgsl
