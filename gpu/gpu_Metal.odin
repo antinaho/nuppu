@@ -68,7 +68,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         data := make([dynamic]uintptr, context.temp_allocator)
         for C in block.constants {
             if C.native.buffer == nil { continue }
-            _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex})
+            _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex, .Fragment})
             append(&data, uintptr(C.gpu))
         }
 
@@ -76,25 +76,29 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             switch res in R {
             case ptr:
                 if res.native.buffer == nil { continue }            
-                _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex})
+                _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex, .Fragment})
                 append(&data, uintptr(res.gpu))
             case Texture:
                 if res.native.texture == nil { continue }
-                _state.render_command_encoder->useResourceWithStages(res.native.texture, {.Read}, {.Vertex})
+                _state.render_command_encoder->useResourceWithStages(res.native.texture, {.Read}, {.Vertex, .Fragment})
                 append(&data, uintptr(res.native.texture->gpuResourceID()))
             }
         }
 
         for RW in block.read_write_resources {
-            if RW.native.buffer == nil { continue }
-            _state.render_command_encoder->useResourceWithStages(RW.native.buffer, {.Read}, {.Vertex})
-            append(&data, uintptr(RW.gpu))
+        }
+
+        for S in block.samplers {
+            if S.native == nil { continue }
+            append(&data, uintptr(S.native->gpuResourceID()))
         }
 
         MAX_PUSH_BYTE_SIZE :: 64 * 64
         assert(len(data) <= 64)
 
+        // Just pushing same to both stages since all resources are 
         _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Vertex)
+        _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Fragment)
     }
 
 
@@ -191,11 +195,54 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
 
-    _Sampler :: struct {}
+    _Sampler :: ^MTL.SamplerState
+
+    _sampler_filter_min_mag_interop :: proc(filter: Sampler_Min_Mag_Filter) -> MTL.SamplerMinMagFilter {
+        switch filter {
+        case .Nearest:
+            return .Nearest
+        case .Linear:
+            return .Linear
+        }
+        unreachable()
+    }
+
+    _sampler_filter_mip_interop :: proc(filter: Sampler_Mip_Filter) -> MTL.SamplerMipFilter {
+        switch filter {
+        case .NotMipmapped:
+            return .NotMipmapped
+        case .Nearest:
+            return .Nearest
+        case .Linear:
+            return .Linear
+        }
+        unreachable()
+    }
+
+    _sampler_wrap_interop :: proc(wrap: Sampler_Address_Mode) -> MTL.SamplerAddressMode {
+        switch wrap {
+        case .ClampToEdge:
+            return .ClampToEdge
+        case .MirrorRepeat:
+            return .MirrorRepeat
+        case .Repeat:
+            return .Repeat
+        }
+        unreachable()
+    }
 
     _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
-        // TODO
-        return {}
+        sampler_desc := MTL.SamplerDescriptor.alloc()->init()
+        defer sampler_desc->release()
+
+        sampler_desc->setMinFilter(_sampler_filter_min_mag_interop(desc.min_filter))
+        sampler_desc->setMagFilter(_sampler_filter_min_mag_interop(desc.mag_filter))
+        sampler_desc->setMipFilter(_sampler_filter_mip_interop(desc.mip_filter))
+        sampler_desc->setSAddressMode(_sampler_wrap_interop(desc.wrap_s))
+        sampler_desc->setTAddressMode(_sampler_wrap_interop(desc.wrap_t))
+        sampler_desc->setRAddressMode(_sampler_wrap_interop(desc.wrap_r))
+
+        return _state.device->newSamplerState(sampler_desc)
     }
 
     _set_samplers :: proc(samplers: []Sampler, range: Range, stage: Shader_Stage) {
