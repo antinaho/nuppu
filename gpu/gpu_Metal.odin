@@ -8,6 +8,7 @@ import "core:log"
 import "base:runtime"
 import hm "core:container/handle_map"
 import "core:time"
+import "core:slice"
 
 when GPU_BACKEND == GPU_BACKEND_METAL {
 
@@ -27,7 +28,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         blit_command_encoder: ^MTL.BlitCommandEncoder,
         compute_command_encoder: ^MTL.ComputeCommandEncoder,
 
-        curr_pipeline: Pipeline_Handle,
+        curr_pipeline: Pipeline,
         curr_compute_pipeline: Compute_Pipeline_Handle,
     }
 
@@ -63,6 +64,33 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return true
     }
 
+    _use_parameter_block :: proc(block: ^Parameter_Block) {
+        data := make([dynamic]uintptr, context.temp_allocator)
+        for C in block.constants {
+            if C.native.buffer == nil { continue }
+            _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex})
+            append(&data, uintptr(C.gpu))
+        }
+
+        for R in block.read_resources {
+            if R.native.buffer == nil { continue }            
+            _state.render_command_encoder->useResourceWithStages(R.native.buffer, {.Read}, {.Vertex})
+            append(&data, uintptr(R.gpu))
+        }
+
+        for RW in block.read_write_resources {
+            if RW.native.buffer == nil { continue }
+            _state.render_command_encoder->useResourceWithStages(RW.native.buffer, {.Read}, {.Vertex})
+            append(&data, uintptr(RW.gpu))
+        }
+
+        MAX_PUSH_BYTE_SIZE :: 64 * 64
+        assert(len(data) <= 64)
+
+        _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Vertex)
+    }
+
+
     _deinit :: proc() {
         _state.metal_layer->release()
         _state.queue->release()
@@ -80,21 +108,16 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
     _begin_frame :: proc() {
-        if _state.frame_pool != nil {
-            _state.frame_pool->drain()
-            _state.frame_pool = nil  // pool itself is released by drain
-        }
         _begin_commands()
     }
 
     _commit_commands :: proc() {
-        _state.command_buffer->commit()
-        _state.command_buffer = nil
-        
-        if _state.frame_pool != nil {
+        defer {
             _state.frame_pool->drain()
             _state.frame_pool = nil
-        }
+        } 
+        _state.command_buffer->commit()
+        _state.command_buffer = nil
     }
 
     _end_frame :: proc() {
@@ -103,6 +126,10 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         // Now present + signal + commit it, then drain the pool. Metal
         // retains the buffer post-commit so the autorelease reference can
         // be safely released by the drain.
+        defer {
+            _state.frame_pool->drain()
+            _state.frame_pool = nil
+        } 
         _state.command_buffer->presentDrawable(_state.curr_drawable.drawable)
         _state.command_buffer->encodeSignalEvent((^MTL.SharedEvent)(_state.frame_semaphore), _state.frame_n)
         _state.command_buffer->commit()
@@ -111,10 +138,6 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         _state.curr_drawable = {}
         _state.render_command_encoder = {}
 
-        if _state.frame_pool != nil {
-            _state.frame_pool->drain()
-            _state.frame_pool = nil
-        }
     }
 
 
@@ -186,6 +209,10 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _mapped :: proc(ptr: ptr) -> bool {
         return ptr.cpu != nil
+    }
+
+    _cpu_address :: proc(p: _ptr) -> rawptr {
+        return rawptr(uintptr(p.buffer->contentsPointer()))
     }
 
     _gpu_address :: proc(p: _ptr) -> rawptr {
@@ -349,7 +376,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         library: ^MTL.Library,
     }
 
-    _shader_init :: proc(name: string, code: []u8) -> Shader_Handle {
+    _shader_init :: proc(name: string, code: []u8) -> _Shader {
         library: ^MTL.Library
         err: ^NS.Error
 
@@ -366,15 +393,11 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             log.panicf("Failed to create shader library: %v", err->localizedDescription()->odinString())
         }
 
-        handle := hm.static_add(&_state.shaders, Shader {
+        result := _Shader {
             library = library,
-        })
+        }
 
-        return handle
-    }
-
-    _Pipeline :: struct {
-        pso: ^MTL.RenderPipelineState
+        return result
     }
 
     _cull_mode_interop :: proc(cull_mode: Cull_Mode) -> MTL.CullMode {
@@ -480,24 +503,25 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     _Compute_Pipeline :: ^MTL.ComputePipelineState
     _compute_pipeline_init :: proc(shader: Shader_Handle, entry_point: string) -> Compute_Pipeline_Handle {
 
-        shader_impl := hm.static_get(&_state.shaders, shader)
+        // shader_impl := hm.static_get(&_state.shaders, shader)
 
-        entry_ns_str := NS.String.alloc()->initWithOdinString(entry_point)
-        defer entry_ns_str->release()
+        // entry_ns_str := NS.String.alloc()->initWithOdinString(entry_point)
+        // defer entry_ns_str->release()
     
-        function := shader_impl.library->newFunctionWithName(entry_ns_str)
-        defer function->release()
+        // function := shader_impl.library->newFunctionWithName(entry_ns_str)
+        // defer function->release()
 
-        kernel, k_err := _state.device->newComputePipelineStateWithFunction(function)
-        if k_err != nil {
-            log.panicf("Failed to create pipeline state: %v", k_err->localizedDescription()->odinString())
-        }
+        // kernel, k_err := _state.device->newComputePipelineStateWithFunction(function)
+        // if k_err != nil {
+        //     log.panicf("Failed to create pipeline state: %v", k_err->localizedDescription()->odinString())
+        // }
 
-        handle := hm.static_add(&_state.compute_pipelines, Compute_Pipeline_Descriptor {
-            native = _Compute_Pipeline(kernel)
-        })
+        // handle := hm.static_add(&_state.compute_pipelines, Compute_Pipeline_Descriptor {
+        //     native = _Compute_Pipeline(kernel)
+        // })
 
-        return handle
+        // return handle
+        return {}
     }
 
     _set_compute_pipeline :: proc(pipeline: Compute_Pipeline_Handle) {
@@ -505,56 +529,56 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
     _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
-        size_grid := MTL.Size{NS.Integer(num_groups.x), NS.Integer(num_groups.y), NS.Integer(num_groups.z)}
-	    size_group := MTL.Size{NS.Integer(num_threads_per_group.x), NS.Integer(num_threads_per_group.y), NS.Integer(num_threads_per_group.z)}
+        // size_grid := MTL.Size{NS.Integer(num_groups.x), NS.Integer(num_groups.y), NS.Integer(num_groups.z)}
+	    // size_group := MTL.Size{NS.Integer(num_threads_per_group.x), NS.Integer(num_threads_per_group.y), NS.Integer(num_threads_per_group.z)}
         
-        compute_pipeline := hm.static_get(&_state.compute_pipelines, _state.curr_compute_pipeline)
+        // compute_pipeline := hm.static_get(&_state.compute_pipelines, _state.curr_compute_pipeline)
 
-        if _state.compute_command_encoder == nil {
-            _state.compute_command_encoder = _state.command_buffer->computeCommandEncoder()
-        }
+        // if _state.compute_command_encoder == nil {
+        //     _state.compute_command_encoder = _state.command_buffer->computeCommandEncoder()
+        // }
 
-        _state.compute_command_encoder->setComputePipelineState(compute_pipeline.native)
-        _state.compute_command_encoder->dispatchThreads(size_grid, size_group)
+        // _state.compute_command_encoder->setComputePipelineState(compute_pipeline.native)
+        // _state.compute_command_encoder->dispatchThreads(size_grid, size_group)
     }
 
+    _Pipeline :: struct {
+        pso: ^MTL.RenderPipelineState,
+    }
 
-    _pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function_entry: string, fragment_shader: Shader_Handle, fragment_function_entry: string, format: Pixel_Format, depth_format: Pixel_Format) -> Pipeline_Handle {
+    _pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> _Pipeline {
         desc := MTL.RenderPipelineDescriptor.alloc()->init()
 	    defer desc->release()
 
-        vertex_entry := NS.String.alloc()->initWithOdinString(vertex_function_entry)
+        vertex_entry := NS.String.alloc()->initWithOdinString(vertex.entry_point)
         defer vertex_entry->release()
-        fragment_entry := NS.String.alloc()->initWithOdinString(fragment_function_entry)
-        defer fragment_entry->release()
-
-        vertex_shader_m := hm.static_get(&_state.shaders, vertex_shader)
-        fragment_shader_m := hm.static_get(&_state.shaders, fragment_shader)
-
-        vertex_function := vertex_shader_m.library->newFunctionWithName(vertex_entry)
+        vertex_shader := hm.static_get(&_state.shaders, vertex.shader)
+        vertex_function := vertex_shader.library->newFunctionWithName(vertex_entry)
         defer vertex_function->release()
-        fragment_function := fragment_shader_m.library->newFunctionWithName(fragment_entry)
+
+        fragment_entry := NS.String.alloc()->initWithOdinString(fragment.entry_point)
+        defer fragment_entry->release()
+        fragment_shader := hm.static_get(&_state.shaders, fragment.shader)
+        fragment_function := fragment_shader.library->newFunctionWithName(fragment_entry)
         defer fragment_function->release()
 
         desc->setVertexFunction(vertex_function)
         desc->setFragmentFunction(fragment_function)
-        desc->setDepthAttachmentPixelFormat(_pixel_format_interop(depth_format))
+        desc->setDepthAttachmentPixelFormat(_pixel_format_interop(pipeline_descriptor.depth_format))
 
         color_attachment := desc->colorAttachments()->object(0)
-        color_attachment->setPixelFormat(_pixel_format_interop(format))
+        color_attachment->setPixelFormat(_pixel_format_interop(pipeline_descriptor.color_format))
         
         pso, err := _state.device->newRenderPipelineStateWithDescriptor(desc)
         if err != nil {
             log.panicf("Failed to create pipeline state: %v", err->localizedDescription()->odinString())
         }
 
-        handle := hm.static_add(&_state.pipelines, Pipeline_Descriptor {
-            native = _Pipeline {
-                pso = pso
-            }
-        })
+        result := _Pipeline {
+            pso = pso,
+        }
 
-        return handle
+        return result
     }
 
     _pixel_format_interop :: proc(format: Pixel_Format) -> MTL.PixelFormat {
@@ -576,7 +600,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         index_bytes: u8
     }
 
-    _set_pipeline :: proc(pipeline: Pipeline_Handle) {
+    _set_pipeline :: proc(pipeline: Pipeline) {
         _state.curr_pipeline = pipeline
     }
 
@@ -664,8 +688,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
     _draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
-        pipeline := hm.static_get(&_state.pipelines, _state.curr_pipeline)
-        _state.render_command_encoder->setRenderPipelineState(pipeline.pso)
+        _state.render_command_encoder->setRenderPipelineState(_state.curr_pipeline.pso)
 
         if instance_count == 0 {
             return

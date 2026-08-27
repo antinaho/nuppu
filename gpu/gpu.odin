@@ -32,6 +32,31 @@ FRAME_ARENA_SIZE :: 4 * 1024 * 1024
 MAX_PIPELINES :: 64
 MAX_SHADERS :: 64
 
+Parameter_Block :: struct {
+    constants: [MAX_CONSTANTS]ptr,
+    read_resources: [MAX_READ_RESOURCE]ptr,
+    read_write_resources: [MAX_READ_WRITE_RESOURCES]ptr,
+    samplers: [MAX_SAMPLERS]Sampler,
+}
+
+use_parameter_block :: proc(block: ^Parameter_Block) {
+    _use_parameter_block(block)
+}
+
+// Limits based of WGSL https://www.w3.org/TR/WGSL/#limits
+// Should be good for rest of the APIs?
+
+MAX_STORAGE_BUFFERS :: 8 // Shared between read + read_write
+READ_TEXTURES :: 16
+READ_WRITE_TEXTURES :: 4
+
+MAX_CONSTANTS :: 12
+MAX_READ_RESOURCE :: MAX_STORAGE_BUFFERS + READ_TEXTURES
+MAX_READ_WRITE_RESOURCES :: MAX_STORAGE_BUFFERS + READ_WRITE_TEXTURES
+MAX_SAMPLERS :: 16
+
+MAX_LAYOUT_BINDINGS :: MAX_CONSTANTS + MAX_STORAGE_BUFFERS + READ_TEXTURES + READ_WRITE_TEXTURES + MAX_SAMPLERS
+
 Shader_Handle :: distinct hm.Handle32
 Pipeline_Handle :: distinct hm.Handle32
 
@@ -47,8 +72,6 @@ State :: struct #align(64) {
 
     depth_texture: Texture,
 
-    pipelines: hm.Static_Handle_Map(MAX_PIPELINES, Pipeline_Descriptor, Pipeline_Handle), // holds descriptor and native pso object for now
-    compute_pipelines: hm.Static_Handle_Map(16, Compute_Pipeline_Descriptor, Compute_Pipeline_Handle),
     shaders: hm.Static_Handle_Map(MAX_SHADERS, Shader, Shader_Handle),
     depth_stencil_states: hm.Static_Handle_Map(MAX_DEPTH_STENCIL_STATES, Depth_Stencil_State, Depth_Stencil_Handle),
 }
@@ -67,7 +90,7 @@ Metadata :: struct
 
 Shader :: struct {
     handle: Shader_Handle,
-    using impl: _Shader,
+    using native: _Shader,
 }
 
 Shader_Resource :: struct {
@@ -189,31 +212,24 @@ Color_Attachment :: struct {
     resolve_texture: Texture,
 }
 
-
-// Note cut into Desctiptor + implementation later
-Pipeline_Descriptor :: struct {
-    handle: Pipeline_Handle,
-
-    vertex_shader:   Shader_Handle, vertex_function:   string,
-    fragment_shader: Shader_Handle, fragment_function: string, 
-  
-    multisample: Multisample_State,
-
-    blend: Blend_State,
- 
-    depth_format: Pixel_Format,
-    format: Pixel_Format,
-
-    primitive: Primitive_State,
-
-    buffers: [8]ptr,
-    textures: [8]Texture,
-    samplers: [8]Sampler,
-
-    index_buffer: ptr,
-
-    using native: _Pipeline,
+NIL_SHADER_HANDLE :: Shader_Handle {}
+Shader_IR :: struct {
+    shader: Shader_Handle,
+    entry_point: string,
 }
+
+Pipeline_Descriptor :: struct {
+    color_format: Pixel_Format,
+    depth_format: Pixel_Format,
+}
+
+    // multisample: Multisample_State,
+    // blend: Blend_State,
+    // primitive: Primitive_State,
+    // buffers: [8]ptr,
+    // textures: [8]Texture,
+    // samplers: [8]Sampler,
+    // index_buffer: ptr,
 
 Depth_Stencil_State :: struct {
     handle: Depth_Stencil_Handle,
@@ -360,16 +376,40 @@ ptr :: struct #all_or_none {
 // Render primitive initialization
 
 shader_init :: proc(name: string, code: []u8) -> Shader_Handle {
-    return _shader_init(name, code)
+    native := _shader_init(name, code)
+
+    handle := hm.static_add(&_state.shaders, Shader {
+        native = native,
+    })
+
+    return handle
 }
 
 compute_shader_init :: proc(name: string, code: []u8) -> Shader_Handle {
-    return _shader_init(name, code)
+    return {}
+    //return _shader_init(name, code)
 }
 
-pipeline_init :: proc(vertex_shader: Shader_Handle, vertex_function: string, fragment_shader: Shader_Handle, fragment_function: string, format: Pixel_Format, depth_format: Pixel_Format = .None) -> Pipeline_Handle {
-    return _pipeline_init(vertex_shader, vertex_function, fragment_shader, fragment_function, format, depth_format)
+pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> Pipeline {
+    assert(vertex.shader != NIL_SHADER_HANDLE)
+    assert(vertex.entry_point != "")
+
+    assert(fragment.shader != NIL_SHADER_HANDLE)
+    assert(fragment.entry_point != "")
+
+    assert(pipeline_descriptor.color_format != .None)
+
+    native := _pipeline_init(vertex, fragment, pipeline_descriptor)
+
+    return Pipeline {
+        native = native,
+    }
 }
+
+Pipeline :: struct {
+    using native: _Pipeline,
+}
+
 Compute_Pipeline_Handle :: distinct hm.Handle32
 Compute_Pipeline_Descriptor :: struct {
     handle: Compute_Pipeline_Handle,
@@ -418,7 +458,7 @@ set_compute_pipeline :: proc(pipeline: Compute_Pipeline_Handle) {
     _set_compute_pipeline(pipeline)
 }
 
-set_pipeline :: proc(pipeline: Pipeline_Handle) {
+set_pipeline :: proc(pipeline: Pipeline) {
     _set_pipeline(pipeline)
 }
 
@@ -568,6 +608,12 @@ draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, in
 //   - .Staging     returns ptr with valid .cpu; caller fills data then calls copy() + unmap()
 //   - .GPU_*       returns ptr with .cpu=nil; receive data via copy() from a Staging buffer
 //   - .Readback    returns ptr with .cpu=nil; receive data via copy()
+
+when ODIN_OS == .Darwin {
+    BUFFER_PTR :: true
+} else {
+    BUFFER_PTR :: false
+}
 
 malloc :: proc(
     type:        Buffer_Type,
