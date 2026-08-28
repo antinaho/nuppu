@@ -13,10 +13,7 @@ State :: struct {
     vertices: gpu.ptr,
 }
 
-Position :: [4]f32
-Color :: [4]f32
-
-Vertex :: struct {
+Vertex :: struct #align(16) {
     pos: [4]f32,
     color: [4]f32,
 }
@@ -29,7 +26,6 @@ when ODIN_OS == .Darwin {
     fragment_code := #load("triangle.ps.metal", []u8)
 }
 when ODIN_OS == .JS {
-    // WGSL uses same shader for vertex and fragment
     vertex_code := #load("triangle.wgsl", []u8)
     fragment_code := vertex_code 
 }

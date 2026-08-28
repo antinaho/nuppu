@@ -2,12 +2,11 @@ package main
 
 import nuppu "../../.."
 import gpu "../../../gpu"
-import "core:log"
 import "core:math"
-import "core:slice"
-import "core:mem"
 import glm "core:math/linalg/glsl"
 import "base:runtime"
+import "base:intrinsics"
+import "core:fmt"
 
 state: ^State
 
@@ -31,15 +30,16 @@ State :: struct {
 }
 
 Vertex :: struct #align(4) {
-	position: glm.vec3, 
-	normal:   glm.vec3, 
+	position: glm.vec4, 
+	normal:   glm.vec4, 
     tex_coord: glm.vec2,
+    _pad: [2]u32,
 }
 
 Instance :: struct #align(4) {
 	transform:        glm.mat4,
 	color:            glm.vec4,
-	normal_transform: glm.mat3,
+	normal_transform: [16]f32,
 }
 
 Camera :: struct #align(4) {
@@ -83,9 +83,9 @@ when ODIN_OS == .JS {
 
     state.texture = gpu.texture_init({
         dimensions = {TEXTURE_WIDTH, TEXTURE_HEIGHT},
-        format = .BGRA8Unorm,
+        format = .RGBA8Unorm,
         type = ._2D,
-        storage = .Private,
+        storage = .Shared,
         usage = .Storage,
     })
 
@@ -103,35 +103,35 @@ when ODIN_OS == .JS {
     vs := [VERT_COUNT]Vertex {
 		//                                                       Texture
 		//   Positions (.xyz)        Normals (.xyz)            Coordinates
-		{{-s, -s, +s}, { 0,  0,  1}, {0, 1}},
-		{{+s, -s, +s}, { 0,  0,  1}, {1, 1}},
-		{{+s, +s, +s}, { 0,  0,  1}, {1, 0}},
-		{{-s, +s, +s}, { 0,  0,  1}, {0, 0}},
+		{{-s, -s, +s, 1}, { 0, 0, 1, 1}, {0, 1}, {}},
+		{{+s, -s, +s, 1}, { 0, 0, 1, 1}, {1, 1}, {}},
+		{{+s, +s, +s, 1}, { 0, 0, 1, 1}, {1, 0}, {}},
+		{{-s, +s, +s, 1}, { 0, 0, 1, 1}, {0, 0}, {}},
 
-		{{+s, -s, +s}, { 1,  0,  0}, {0, 1}},
-		{{+s, -s, -s}, { 1,  0,  0}, {1, 1}},
-		{{+s, +s, -s}, { 1,  0,  0}, {1, 0}},
-		{{+s, +s, +s}, { 1,  0,  0}, {0, 0}},
+		{{+s, -s, +s, 1}, { 1, 0, 0, 1}, {0, 1}, {}},
+		{{+s, -s, -s, 1}, { 1, 0, 0, 1}, {1, 1}, {}},
+		{{+s, +s, -s, 1}, { 1, 0, 0, 1}, {1, 0}, {}},
+		{{+s, +s, +s, 1}, { 1, 0, 0, 1}, {0, 0}, {}},
 
-		{{+s, -s, -s}, { 0,  0, -1}, {0, 1}},
-		{{-s, -s, -s}, { 0,  0, -1}, {1, 1}},
-		{{-s, +s, -s}, { 0,  0, -1}, {1, 0}},
-		{{+s, +s, -s}, { 0,  0, -1}, {0, 0}},
+		{{+s, -s, -s, 1}, { 0, 0, -1, 1}, {0, 1}, {}},
+		{{-s, -s, -s, 1}, { 0, 0, -1, 1}, {1, 1}, {}},
+		{{-s, +s, -s, 1}, { 0, 0, -1, 1}, {1, 0}, {}},
+		{{+s, +s, -s, 1}, { 0, 0, -1, 1}, {0, 0}, {}},
 
-		{{-s, -s, -s}, {-1,  0,  0}, {0, 1}},
-		{{-s, -s, +s}, {-1,  0,  0}, {1, 1}},
-		{{-s, +s, +s}, {-1,  0,  0}, {1, 0}},
-		{{-s, +s, -s}, {-1,  0,  0}, {0, 0}},
+		{{-s, -s, -s, 1}, {-1, 0, 0, 1}, {0, 1}, {}},
+		{{-s, -s, +s, 1}, {-1, 0, 0, 1}, {1, 1}, {}},
+		{{-s, +s, +s, 1}, {-1, 0, 0, 1}, {1, 0}, {}},
+		{{-s, +s, -s, 1}, {-1, 0, 0, 1}, {0, 0}, {}},
 
-		{{-s, +s, +s}, { 0,  1,  0}, {0, 1}},
-		{{+s, +s, +s}, { 0,  1,  0}, {1, 1}},
-		{{+s, +s, -s}, { 0,  1,  0}, {1, 0}},
-		{{-s, +s, -s}, { 0,  1,  0}, {0, 0}},
+		{{-s, +s, +s, 1}, { 0, 1, 0, 1}, {0, 1}, {}},
+		{{+s, +s, +s, 1}, { 0, 1, 0, 1}, {1, 1}, {}},
+		{{+s, +s, -s, 1}, { 0, 1, 0, 1}, {1, 0}, {}},
+		{{-s, +s, -s, 1}, { 0, 1, 0, 1}, {0, 0}, {}},
 
-		{{-s, -s, -s}, { 0, -1,  0}, {0, 1}},
-		{{+s, -s, -s}, { 0, -1,  0}, {1, 1}},
-		{{+s, -s, +s}, { 0, -1,  0}, {1, 0}},
-		{{-s, -s, +s}, { 0, -1,  0}, {0, 0}},
+		{{-s, -s, -s, 1}, { 0, -1, 0, 1}, {0, 1}, {}},
+		{{+s, -s, -s, 1}, { 0, -1, 0, 1}, {1, 1}, {}},
+		{{+s, -s, +s, 1}, { 0, -1, 0, 1}, {1, 0}, {}},
+		{{-s, -s, +s, 1}, { 0, -1, 0, 1}, {0, 0}, {}},
     }
     runtime.mem_copy_non_overlapping(verts.cpu, &vs, size_of(Vertex) * VERT_COUNT)
 
@@ -145,9 +145,6 @@ when ODIN_OS == .JS {
 		20, 21, 22, 22, 23, 20, // bottom
     }
     runtime.mem_copy_non_overlapping(indices.cpu, &is, size_of(u32) * INDEX_COUNT)
-    
-    grid_size := gpu.arena_alloc(&upload, [2]u32, 1)
-    (^[2]u32)(grid_size.cpu)^ = {TEXTURE_WIDTH, TEXTURE_HEIGHT}
 
     gpu.unmap(&upload.ptr)
 
@@ -155,12 +152,10 @@ when ODIN_OS == .JS {
     state.index_gpu = gpu.malloc_index(INDEX_COUNT, .Uint32, "Indices")
     state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance), align_of(Instance), "Instances")
     state.camera_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Camera), align_of(Camera), "Camera")
-    grid_size_uniform := gpu.malloc(.GPU_Constant, 1, size_of([2]uint), align_of([2]uint), "Grid_Size")
-
+ 
     gpu.begin_commands()
     gpu.copy(state.vertex_gpu, verts)
     gpu.copy(state.index_gpu, indices)
-    gpu.copy(grid_size_uniform, grid_size)
     gpu.barrier(.Transfer, .All)
     gpu.commit_commands()
 
@@ -168,7 +163,7 @@ when ODIN_OS == .JS {
     gpu.set_compute_pipeline(state.compute_pso)
 
     compute_block := gpu.Parameter_Block {
-        constants = { 0 = grid_size_uniform },
+        constants = { },
         read_resources = { },
         read_write_resources = { 0 = state.texture },
         samplers = { },
@@ -246,7 +241,7 @@ render :: proc(prev, curr: ^State, alpha: f32) {
         translate := glm.mat4Translate(object_position + pos)
 
         instance.transform = full_obj_rot * translate * yrot * zrot * scale
-        instance.normal_transform = glm.mat3(instance.transform)
+        instance.normal_transform = intrinsics.matrix_flatten(glm.mat4(glm.mat3(instance.transform)))
 
         r := f32(idx) / INSTANCE_COUNT
         instance.color = {r, 1-r, math.sin(math.TAU * r), 1}
@@ -287,8 +282,6 @@ render :: proc(prev, curr: ^State, alpha: f32) {
 
     gpu.set_cull_mode(.Back)
     gpu.set_front_face_winding(.CCW)
-
-    //gpu.gpu_temp_malloc(cmds, slice.bytes_from_ptr(&cam, size_of(Camera_Data)), 2, .Vertex)
     
     block := gpu.Parameter_Block {
         constants = { 0 = curr.camera_uniform },

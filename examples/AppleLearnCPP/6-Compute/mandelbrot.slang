@@ -1,6 +1,5 @@
 struct ComputeData {
-    ConstantBuffer<uint2> grid_size;
-    RWTexture2D texture;
+    [format("rgba8")] RWTexture2D texture;
 };
 
 ParameterBlock<ComputeData> data;
@@ -9,8 +8,12 @@ ParameterBlock<ComputeData> data;
 [numthreads(128, 1, 1)]
 void mandelbrot_set(
     uint2 index : SV_DispatchThreadID,
-) {
-    uint2 grid_size = data.grid_size;
+) { 
+
+    uint w, h;
+    data.texture.GetDimensions(w, h);
+
+    uint2 grid_size = uint2(w, h);
 
     float x0 = 2.0 * index.x / grid_size.x - 1.5;
     float y0 = 2.0 * index.y / grid_size.y - 1.0;
@@ -27,6 +30,6 @@ void mandelbrot_set(
         iteration += 1;
     }
 
-    half color = half(0.5 + 0.5 * cos(3.0 + float(iteration) * 0.15));
-    data.texture[index] = half4(color, color, color, half(1.0));
+    float color = float(0.5 + 0.5 * cos(3.0 + float(iteration) * 0.15));
+    data.texture[index] = float4(color, color, color, float(1.0));
 }

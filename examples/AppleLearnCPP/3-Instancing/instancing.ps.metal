@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 1 "examples/AppleLearnCPP/4-Instancing/instancing.slang"
+#line 1 "examples/AppleLearnCPP/3-Instancing/instancing.slang"
 struct pixelOutput_0
 {
     float4 output_0 [[color(0)]];

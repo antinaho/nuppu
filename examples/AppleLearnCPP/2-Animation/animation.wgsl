@@ -1,6 +1,9 @@
 struct Animation_std140_0
 {
     @align(16) angle_0 : f32,
+    @align(4) _pad_0 : f32,
+    @align(8) _pad2_0 : f32,
+    @align(4) _pad3_0 : f32,
 };
 
 @binding(0) @group(0) var<uniform> data_uniform_data_0 : Animation_std140_0;

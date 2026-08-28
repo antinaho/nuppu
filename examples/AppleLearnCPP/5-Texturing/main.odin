@@ -7,6 +7,7 @@ import "core:math"
 import "core:slice"
 import "core:mem"
 import glm "core:math/linalg/glsl"
+import "core:math/linalg"
 import "base:runtime"
 
 state: ^State
@@ -27,21 +28,22 @@ State :: struct {
     sampler: gpu.Sampler,
 }
 
-Vertex :: struct #align(4) {
-	position: glm.vec3,
-	normal:   glm.vec3,
-    tex_coord: glm.vec2,
+Vertex :: struct #align(16) {
+	position: [4]f32,
+	normal:   [4]f32,
+    tex_coord: [2]f32,
+    _pad: [2]u32,
 }
 
-Instance :: struct #align(4) {
-	transform:        glm.mat4,
-	color:            glm.vec4,
-	normal_transform: glm.mat3,
+Instance :: struct #align(16) {
+	transform:        matrix[4, 4]f32,
+	color:            [4]f32,
+    normal_transform: [16]f32,
 }
 
-Camera :: struct #align(4) {
-    perspective_transform:  glm.mat4,
-    world_transform:        glm.mat4,
+Camera :: struct #align(16) {
+    perspective_transform:  matrix[4, 4]f32,
+    world_transform:        matrix[4, 4]f32,
     world_normal_transform: glm.mat3,
 }
 
@@ -111,30 +113,30 @@ when ODIN_OS == .JS {
     vs := [VERT_COUNT]Vertex {
         //                               Texture
         //   Positions      Normals    Coordinates
-        { { -s, -s, +s }, {  0,  0,  1 }, { 0, 1 } },
-        { { +s, -s, +s }, {  0,  0,  1 }, { 1, 1 } },
-        { { +s, +s, +s }, {  0,  0,  1 }, { 1, 0 } },
-        { { -s, +s, +s }, {  0,  0,  1 }, { 0, 0 } },
-        { { +s, -s, +s }, {  1,  0,  0 }, { 0, 1 } },
-        { { +s, -s, -s }, {  1,  0,  0 }, { 1, 1 } },
-        { { +s, +s, -s }, {  1,  0,  0 }, { 1, 0 } },
-        { { +s, +s, +s }, {  1,  0,  0 }, { 0, 0 } },
-        { { +s, -s, -s }, {  0,  0, -1 }, { 0, 1 } },
-        { { -s, -s, -s }, {  0,  0, -1 }, { 1, 1 } },
-        { { -s, +s, -s }, {  0,  0, -1 }, { 1, 0 } },
-        { { +s, +s, -s }, {  0,  0, -1 }, { 0, 0 } },
-        { { -s, -s, -s }, { -1,  0,  0 }, { 0, 1 } },
-        { { -s, -s, +s }, { -1,  0,  0 }, { 1, 1 } },
-        { { -s, +s, +s }, { -1,  0,  0 }, { 1, 0 } },
-        { { -s, +s, -s }, { -1,  0,  0 }, { 0, 0 } },
-        { { -s, +s, +s }, {  0,  1,  0 }, { 0, 1 } },
-        { { +s, +s, +s }, {  0,  1,  0 }, { 1, 1 } },
-        { { +s, +s, -s }, {  0,  1,  0 }, { 1, 0 } },
-        { { -s, +s, -s }, {  0,  1,  0 }, { 0, 0 } },
-        { { -s, -s, -s }, {  0, -1,  0 }, { 0, 1 } },
-        { { +s, -s, -s }, {  0, -1,  0 }, { 1, 1 } },
-        { { +s, -s, +s }, {  0, -1,  0 }, { 1, 0 } },
-        { { -s, -s, +s }, {  0, -1,  0 }, { 0, 0 } }
+        { { -s, -s, +s, 1.0 }, {  0,  0,  1, 0 }, { 0, 1 }, {}},
+        { { +s, -s, +s, 1.0 }, {  0,  0,  1, 0 }, { 1, 1 }, {}},
+        { { +s, +s, +s, 1.0 }, {  0,  0,  1, 0 }, { 1, 0 }, {}},
+        { { -s, +s, +s, 1.0 }, {  0,  0,  1, 0 }, { 0, 0 }, {}},
+        { { +s, -s, +s, 1.0 }, {  1,  0,  0, 0 }, { 0, 1 }, {}},
+        { { +s, -s, -s, 1.0 }, {  1,  0,  0, 0 }, { 1, 1 }, {}},
+        { { +s, +s, -s, 1.0 }, {  1,  0,  0, 0 }, { 1, 0 }, {}},
+        { { +s, +s, +s, 1.0 }, {  1,  0,  0, 0 }, { 0, 0 }, {}},
+        { { +s, -s, -s, 1.0 }, {  0,  0, -1, 0 }, { 0, 1 }, {}},
+        { { -s, -s, -s, 1.0 }, {  0,  0, -1, 0 }, { 1, 1 }, {}},
+        { { -s, +s, -s, 1.0 }, {  0,  0, -1, 0 }, { 1, 0 }, {}},
+        { { +s, +s, -s, 1.0 }, {  0,  0, -1, 0 }, { 0, 0 }, {}},
+        { { -s, -s, -s, 1.0 }, { -1,  0,  0, 0 }, { 0, 1 }, {}},
+        { { -s, -s, +s, 1.0 }, { -1,  0,  0, 0 }, { 1, 1 }, {}},
+        { { -s, +s, +s, 1.0 }, { -1,  0,  0, 0 }, { 1, 0 }, {}},
+        { { -s, +s, -s, 1.0 }, { -1,  0,  0, 0 }, { 0, 0 }, {}},
+        { { -s, +s, +s, 1.0 }, {  0,  1,  0, 0 }, { 0, 1 }, {}},
+        { { +s, +s, +s, 1.0 }, {  0,  1,  0, 0 }, { 1, 1 }, {}},
+        { { +s, +s, -s, 1.0 }, {  0,  1,  0, 0 }, { 1, 0 }, {}},
+        { { -s, +s, -s, 1.0 }, {  0,  1,  0, 0 }, { 0, 0 }, {}},
+        { { -s, -s, -s, 1.0 }, {  0, -1,  0, 0 }, { 0, 1 }, {}},
+        { { +s, -s, -s, 1.0 }, {  0, -1,  0, 0 }, { 1, 1 }, {}},
+        { { +s, -s, +s, 1.0 }, {  0, -1,  0, 0 }, { 1, 0 }, {}},
+        { { -s, -s, +s, 1.0 }, {  0, -1,  0, 0 }, { 0, 0 }, {}}
     }
     runtime.mem_copy_non_overlapping(verts.cpu, &vs, size_of(Vertex) * VERT_COUNT)
 
@@ -228,7 +230,17 @@ render :: proc(prev, curr: ^State, alpha: f32) {
         translate := glm.mat4Translate(object_position + pos)
 
         instance.transform = full_obj_rot * translate * yrot * zrot * scale
-        instance.normal_transform = glm.mat3(instance.transform)
+
+        mat3_to_padded_mat4 :: proc(m: glm.mat3) -> glm.mat4 {
+            return glm.mat4{
+                m[0][0], m[0][1], m[0][2], 0,
+                m[1][0], m[1][1], m[1][2], 0,
+                m[2][0], m[2][1], m[2][2], 0,
+                0,       0,       0,       1,
+            }
+        }
+
+        instance.normal_transform = linalg.matrix_flatten(glm.mat4(glm.mat3(instance.transform)))
 
         r := f32(idx) / INSTANCE_COUNT
         instance.color = {r, 1-r, math.sin(math.TAU * r), 1}

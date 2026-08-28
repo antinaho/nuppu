@@ -43,6 +43,6 @@ void mandelbrot_set(
         iteration += 1;
     }
 
-    half color = half(0.5 + 0.5 * cos(3.0 + float(iteration) * 0.15));
-    data.texture[index] = half4(color, color, color, half(1.0));
+    float color = float(0.5 + 0.5 * cos(3.0 + float(iteration) * 0.15));
+    data.texture[index] = float4(color, color, color, 1.0);
 }

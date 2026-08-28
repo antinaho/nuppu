@@ -15,13 +15,14 @@ State :: struct {
     angle_buf: gpu.ptr,
 }
 
-Vertex :: struct {
+Vertex :: struct #align(16) {
     pos: [4]f32,
     color: [4]f32,
 }
 
-Animation :: struct {
+Animation :: struct #align(16) {
     angle: f32,
+    _pad: [3]u32,
 }
 
 state: ^State

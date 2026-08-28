@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 1 "examples/AppleLearnCPP/5-Perspective/perspective.slang"
+#line 1 "examples/AppleLearnCPP/4-Perspective/perspective.slang"
 struct vertexMain_Result_0
 {
     float4 position_0 [[position]];

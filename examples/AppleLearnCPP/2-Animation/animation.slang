@@ -5,6 +5,9 @@ struct v2f {
 
 struct Animation {
     float angle;
+    float _pad;
+    float _pad2;
+    float _pad3;
 };
 
 struct Vertex {

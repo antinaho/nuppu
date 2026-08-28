@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 1 "examples/AppleLearnCPP/3-Animation/animation.slang"
+#line 1 "examples/AppleLearnCPP/2-Animation/animation.slang"
 struct vertexMain_Result_0
 {
     float4 position_0 [[position]];
@@ -15,6 +15,9 @@ struct vertexMain_Result_0
 struct Animation_0
 {
     float angle_0;
+    float _pad_0;
+    float _pad2_0;
+    float _pad3_0;
 };
 
 
@@ -46,31 +49,31 @@ struct v2f_0
 [[vertex]] vertexMain_Result_0 vertexMain(uint vertexID_0 [[vertex_id]], VertexData_default_0 constant* data_0 [[buffer(0)]])
 {
 
-#line 26
+#line 29
     Vertex_natural_0 v_0 = data_0->verts_0[vertexID_0];
 
-#line 31
+#line 34
     float _S1 = sin((*data_0->uniform_data_0).angle_0);
 
-#line 31
+#line 34
     float _S2 = cos((*data_0->uniform_data_0).angle_0);
 
-#line 36
+#line 39
     thread v2f_0 o_0;
 
     (&o_0)->position_2 = float4(((((float4(v_0.position_1) ).xyz) * (matrix<float,int(3),int(3)> (_S1, _S2, 0.0f, _S2, - _S1, 0.0f, 0.0f, 0.0f, 1.0f)))), 1.0f);
     (&o_0)->color_2 = (float4(v_0.color_1) ).xyz;
 
-#line 39
+#line 42
     thread vertexMain_Result_0 _S3;
 
-#line 39
+#line 42
     (&_S3)->position_0 = o_0.position_2;
 
-#line 39
+#line 42
     (&_S3)->color_0 = o_0.color_2;
 
-#line 39
+#line 42
     return _S3;
 }
 

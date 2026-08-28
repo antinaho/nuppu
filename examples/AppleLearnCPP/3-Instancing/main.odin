@@ -17,7 +17,7 @@ State :: struct {
     pso: gpu.Pipeline,
 }
 
-Vertex :: struct {
+Vertex :: struct #align(16) {
     pos: [4]f32,
 }
 

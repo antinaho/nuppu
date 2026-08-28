@@ -6,15 +6,16 @@ struct v2f {
 };
 
 struct Vertex {
-    float3 position;
-    float3 normal;
+    float4 position;
+    float4 normal;
     float2 tex_coord;
+    float2 _pad;
 };
 
 struct Instance {
     float4x4 transform;
     float4 color;
-    float3x3 normalTransform;
+    float4x4 normalTransform;
 };
 
 struct CameraData {
@@ -35,6 +36,7 @@ struct FrameData {
 
 ParameterBlock<FrameData> data;
 
+
 [shader("vertex")]
 v2f vertexMain(
     uint vertexID : SV_VertexID,
@@ -47,8 +49,8 @@ v2f vertexMain(
     pos = mul(i.transform, pos);
     pos = mul(data.camera.worldTransform, pos);
     pos = mul(data.camera.perspectiveTransform, pos);
-
-    float3 normal = mul(i.normalTransform, v.normal.xyz);
+    
+    float3 normal = mul(float3x3(i.normalTransform), v.normal.xyz);
     normal = mul(data.camera.worldNormalTransform, normal);
     
     v2f o;

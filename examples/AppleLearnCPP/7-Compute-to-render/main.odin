@@ -77,7 +77,7 @@ when ODIN_OS == .JS {
     }
 
     state.pso = gpu.pipeline_init(vertex_shader, fragment_shader, {
-        color_format = .BGRA8Unorm,
+        color_format = .RGBA8Unorm,
         depth_format = .Depth32Float,
     })
     
@@ -85,7 +85,7 @@ when ODIN_OS == .JS {
 
      state.texture = gpu.texture_init({
         dimensions = {TEXTURE_WIDTH, TEXTURE_HEIGHT},
-        format = .BGRA8Unorm,
+        format = .RGBA8Unorm,
         type = ._2D,
         storage = .Private,
         usage = .Storage,
