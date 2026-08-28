@@ -86,7 +86,7 @@ when ODIN_OS == .JS {
         format = .RGBA8Unorm,
         type = ._2D,
         storage = .Shared,
-        usage = .Storage,
+        usage = {.Write, .Sampled},
     })
 
     state.kernel = gpu.compute_shader_init("my_compute_shader", compute_code)

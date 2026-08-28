@@ -1,4 +1,4 @@
-@binding(0) @group(0) var data_texture_0 : texture_storage_2d<rgba8unorm, read_write>;
+@binding(0) @group(0) var data_texture_0 : texture_storage_2d<rgba8unorm, write>;
 
 @compute
 @workgroup_size(128, 1, 1)

@@ -1,6 +1,5 @@
-@binding(0) @group(0) var<uniform> data_grid_size_0 : vec2<u32>;
-@binding(1) @group(0) var<uniform> data_frame_0 : u32;
-@binding(2) @group(0) var data_texture_0 : texture_storage_2d<rgba32float, read_write>;
+@binding(0) @group(0) var<uniform> data_frame_0 : u32;
+@binding(1) @group(0) var data_texture_0 : texture_storage_2d<rgba8unorm, write>;
 
 @compute
 @workgroup_size(128, 1, 1)
@@ -8,8 +7,11 @@ fn mandelbrot_set(@builtin(global_invocation_id) index_0 : vec3<u32>)
 {
     var index_1 : vec2<u32> = index_0.xy;
     var zoom_0 : f32 = pow(0.62000000476837158f + 0.37999999523162842f * cos(0.00999999977648258f * f32(data_frame_0)), 4.0f);
-    var _S1 : f32 = zoom_0 * 2.20000004768371582f * (f32(index_1.x) / f32(data_grid_size_0.x) + -0.20000000298023224f) + -1.20000004768371582f;
-    var _S2 : f32 = zoom_0 * 2.0f * (f32(index_1.y) / f32(data_grid_size_0.y) + -0.34999999403953552f) + -0.31999999284744263f;
+    var w_0 : u32;
+    var h_0 : u32;
+    {var dim = textureDimensions((data_texture_0));((w_0)) = dim.x;((h_0)) = dim.y;};
+    var _S1 : f32 = zoom_0 * 2.20000004768371582f * (f32(index_1.x) / f32(w_0) + -0.20000000298023224f) + -1.20000004768371582f;
+    var _S2 : f32 = zoom_0 * 2.0f * (f32(index_1.y) / f32(h_0) + -0.34999999403953552f) + -0.31999999284744263f;
     var x_0 : f32 = 0.0f;
     var y_0 : f32 = 0.0f;
     var iteration_0 : u32 = u32(0);

@@ -1,7 +1,6 @@
 struct ComputeData {
-    ConstantBuffer<uint2> grid_size;
     ConstantBuffer<uint> frame;
-    RWTexture2D texture;
+    [format("rgba8")] WTexture2D texture;
 };
 
 ParameterBlock<ComputeData> data;
@@ -25,7 +24,10 @@ void mandelbrot_set(
     // Speed up zooming
     zoom = pow(zoom, ANIMATION_SPEED);
 
-    uint2 grid_size = data.grid_size;
+    uint w, h;
+    data.texture.GetDimensions(w, h);
+
+    uint2 grid_size = uint2(w, h);
 
     //Scale
     float x0 = zoom * MANDELBROT_SCALE.x * ((float)index.x / grid_size.x + MANDELBROT_PIXEL_OFFSET.x) + MANDELBROT_ORIGIN.x;
@@ -44,5 +46,5 @@ void mandelbrot_set(
     }
 
     float color = float(0.5 + 0.5 * cos(3.0 + float(iteration) * 0.15));
-    data.texture[index] = float4(color, color, color, 1.0);
+    data.texture.Store(index, float4(color, color, color, float(1.0)));
 }

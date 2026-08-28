@@ -86,7 +86,7 @@ when ODIN_OS == .JS {
         format = .BGRA8Unorm,
         type = ._2D,
         storage = .Shared,
-        usage = .Sampled,
+        usage = {.Sampled},
     })
 
     pixels := make([][4]u8, TW * TH, context.temp_allocator)

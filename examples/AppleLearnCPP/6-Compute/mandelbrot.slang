@@ -1,5 +1,5 @@
 struct ComputeData {
-    [format("rgba8")] RWTexture2D texture;
+    [format("rgba8")] WTexture2D texture;
 };
 
 ParameterBlock<ComputeData> data;
@@ -31,5 +31,5 @@ void mandelbrot_set(
     }
 
     float color = float(0.5 + 0.5 * cos(3.0 + float(iteration) * 0.15));
-    data.texture[index] = float4(color, color, color, float(1.0));
+    data.texture.Store(index, float4(color, color, color, float(1.0)));
 }

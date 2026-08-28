@@ -11,6 +11,8 @@ update :: proc() { }
 
 render :: proc(prev, curr: ^State, alpha: f32) {
     gpu.begin_frame()
+    frame_arena := gpu.frame_arena()
+
     swapchain := gpu.acquire_next_swapchain()
 
     gpu.begin_render_pass(

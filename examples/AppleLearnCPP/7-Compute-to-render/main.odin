@@ -8,6 +8,7 @@ import "core:slice"
 import "core:mem"
 import glm "core:math/linalg/glsl"
 import "base:runtime"
+import "base:intrinsics"
 
 state: ^State
 
@@ -20,7 +21,6 @@ State :: struct {
     instance_gpu: gpu.ptr,
     camera_uniform: gpu.ptr,
     animation_uniform: gpu.ptr,
-    grid_uniform: gpu.ptr,
 
     depth_pso: gpu.Depth_Stencil_State,
     pso: gpu.Pipeline,
@@ -34,15 +34,20 @@ State :: struct {
 }
 
 Vertex :: struct #align(4) {
-	position: glm.vec3, 
-	normal:   glm.vec3, 
+	position: glm.vec4, 
+	normal:   glm.vec4, 
     tex_coord: glm.vec2,
+    _pad: [2]u32,
 }
 
 Instance :: struct #align(4) {
 	transform:        glm.mat4,
 	color:            glm.vec4,
-	normal_transform: glm.mat3,
+	normal_transform: [16]f32,
+}
+
+pad_zero :: proc(v: [3]f32) -> [4]f32 {
+    return [4]f32{ v[0], v[1], v[2], 0 }
 }
 
 Camera :: struct #align(4) {
@@ -63,6 +68,7 @@ when ODIN_OS == .JS {
     fragment_code := vertex_code 
     compute_code := #load("mandelbrot.wgsl", []u8)
 }
+
     shader_vs := gpu.shader_init("my_vert_shader", vertex_code)
     shader_ps := gpu.shader_init("my_frag_shader", fragment_code)
 
@@ -77,18 +83,18 @@ when ODIN_OS == .JS {
     }
 
     state.pso = gpu.pipeline_init(vertex_shader, fragment_shader, {
-        color_format = .RGBA8Unorm,
+        color_format = .BGRA8Unorm,
         depth_format = .Depth32Float,
     })
     
     state.depth_pso = gpu.depth_stencil_state_init({compare = .Less, write_enabled = true})
 
-     state.texture = gpu.texture_init({
+    state.texture = gpu.texture_init({
         dimensions = {TEXTURE_WIDTH, TEXTURE_HEIGHT},
         format = .RGBA8Unorm,
         type = ._2D,
-        storage = .Private,
-        usage = .Storage,
+        storage = .Shared,
+        usage = {.Write, .Sampled},
     })
 
     state.kernel = gpu.compute_shader_init("my_compute_shader", compute_code)
@@ -103,14 +109,11 @@ when ODIN_OS == .JS {
     verts := gpu.arena_alloc(&upload, Vertex, VERT_COUNT)
     vs: [VERT_COUNT]Vertex
     for &v, idx in vs {
-        v.position = nuppu.UNIT_CUBE_VERTICES[idx]
-        v.normal = nuppu.UNIT_CUBE_NORMALS[idx]
+        v.position = pad_zero(nuppu.UNIT_CUBE_VERTICES[idx])
+        v.normal = pad_zero(nuppu.UNIT_CUBE_NORMALS[idx])
         v.tex_coord = nuppu.UNIT_CUBE_TEXCOORDS[idx]
     }
     runtime.mem_copy_non_overlapping(verts.cpu, &vs, size_of(Vertex) * VERT_COUNT)
-
-    grid_size := gpu.arena_alloc(&upload, [2]u32, 1)
-    (^[2]u32)(grid_size.cpu)^ = {TEXTURE_WIDTH, TEXTURE_HEIGHT}
 
     indices := gpu.arena_alloc(&upload, u32, INDEX_COUNT)
     runtime.mem_copy_non_overlapping(indices.cpu, &nuppu.UNIT_CUBE_INDICES, size_of(u32) * INDEX_COUNT)
@@ -120,14 +123,12 @@ when ODIN_OS == .JS {
     state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance), align_of(Instance), "Instances")
     state.camera_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Camera), align_of(Camera), "Camera")
     state.animation_uniform = gpu.malloc(.GPU_Constant, 1, size_of(u32), align_of(u32), "Animation")
-    state.grid_uniform = gpu.malloc(.GPU_Constant, 1, size_of([2]u32), align_of([2]u32), "Grid_Size")
 
     gpu.unmap(&upload.ptr)
 
     gpu.begin_commands()
     gpu.copy(state.vertex_gpu, verts)
     gpu.copy(state.index_gpu, indices)
-    gpu.copy(state.grid_uniform, grid_size)
     gpu.barrier(.Transfer, .All)
     gpu.commit_commands()
 
@@ -201,7 +202,7 @@ render :: proc(prev, curr: ^State, alpha: f32) {
         translate := glm.mat4Translate(object_position + pos)
 
         instance.transform = full_obj_rot * translate * yrot * zrot * scale
-        instance.normal_transform = glm.mat3(instance.transform)
+        instance.normal_transform = intrinsics.matrix_flatten(glm.mat4(glm.mat3(instance.transform)))
 
         r := f32(idx) / INSTANCE_COUNT
         instance.color = {r, 1-r, math.sin(math.TAU * r), 1}
@@ -230,8 +231,7 @@ render :: proc(prev, curr: ^State, alpha: f32) {
 
     compute_block := gpu.Parameter_Block {
         constants = {
-            0 = curr.grid_uniform,
-            1 = curr.animation_uniform,
+            0 = curr.animation_uniform,
         },
         read_resources = {},
         read_write_resources = {0 = curr.texture},
