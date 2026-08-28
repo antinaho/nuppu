@@ -489,9 +489,12 @@ StorageMode :: enum u8 {
 	Private    = 2,
 }
 
-Texture_Usage :: enum u8 {
+Texture_Usage :: bit_set[Texture_Usage_Flag; u8]
+
+Texture_Usage_Flag :: enum {
     Sampled,
-    Storage,
+    Read,
+    Write,
     Color_Attachment,
     Depth_Attachment,
 }
@@ -508,7 +511,7 @@ texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture 
     desc := Texture_Descriptor {
         dimensions = dimensions,
         format = format,
-        usage = .Depth_Attachment,
+        usage = {.Depth_Attachment},
         storage = .Private,
         type = ._2D,
     }

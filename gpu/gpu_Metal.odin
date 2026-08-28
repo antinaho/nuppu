@@ -20,7 +20,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         //
         frame_pool: ^NS.AutoreleasePool,
         command_buffer: ^MTL.CommandBuffer,
-        curr_drawable: _Texture, // Swapchain
+        curr_drawable: ^CA.MetalDrawable, // Swapchain
         render_command_encoder: ^MTL.RenderCommandEncoder,
 
         
@@ -91,11 +91,11 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
                     append(&data, uintptr(res.gpu))
                 case Texture:
                     if res.native.texture == nil { continue }
-                    _state.render_command_encoder->useResourceWithStages(res.native.texture, {.Read, .Sample}, {.Vertex, .Fragment})
+                    _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
                     append(&data, uintptr(res.native.texture->gpuResourceID()))
                 }
             }
-    
+
             for RW in block.read_write_resources {
                 switch res in RW {
                 case ptr:
@@ -104,7 +104,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
                     append(&data, uintptr(res.gpu))
                 case Texture:
                     if res.native.texture == nil { continue }
-                    _state.render_command_encoder->useResourceWithStages(res.native.texture, {.Read, .Write, .Sample}, {.Vertex, .Fragment})
+                    _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
                     append(&data, uintptr(res.native.texture->gpuResourceID()))
                 }
             }
@@ -136,11 +136,11 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
                     append(&data, uintptr(res.gpu))
                 case Texture:
                     if res.native.texture == nil { continue }
-                    _compute_command_encoder()->useResource(res.native.texture, {.Read, .Sample})
+                    _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
                     append(&data, uintptr(res.native.texture->gpuResourceID()))
                 }
             }
-    
+
             for RW in block.read_write_resources {
                 switch res in RW {
                 case ptr:
@@ -149,7 +149,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
                     append(&data, uintptr(res.gpu))
                 case Texture:
                     if res.native.texture == nil { continue }
-                    _compute_command_encoder()->useResource(res.native.texture, {.Read, .Write, .Sample})
+                    _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
                     append(&data, uintptr(res.native.texture->gpuResourceID()))
                 }
             }
@@ -207,7 +207,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             _state.frame_pool->drain()
             _state.frame_pool = nil
         } 
-        _state.command_buffer->presentDrawable(_state.curr_drawable.drawable)
+        _state.command_buffer->presentDrawable(_state.curr_drawable)
         _state.command_buffer->encodeSignalEvent((^MTL.SharedEvent)(_state.frame_semaphore), _state.frame_n)
         _state.command_buffer->commit()
 
@@ -219,11 +219,9 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
 
 
-    _Texture :: struct #raw_union {
-        using _ : struct {
-            texture: ^MTL.Texture,
-            drawable: ^CA.MetalDrawable,
-        }
+    _Texture :: struct {
+        texture: ^MTL.Texture,
+        usage: Texture_Usage,
     }
 
     _copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
@@ -376,17 +374,21 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
     _texture_usage_interop :: proc(usage: Texture_Usage) -> MTL.TextureUsage {
-        switch usage {
-        case .Sampled:
-            return {.ShaderRead}
-        case .Storage:
-            return {.ShaderRead, .ShaderWrite}
-        case .Color_Attachment:
-            return {.RenderTarget, .ShaderRead}
-        case .Depth_Attachment:
-            return {.RenderTarget}
-        }
-        unreachable()
+        flags: MTL.TextureUsage
+        if .Sampled          in usage { flags += {.ShaderRead} }
+        if .Read             in usage { flags += {.ShaderRead} }
+        if .Write            in usage { flags += {.ShaderWrite} }
+        if .Color_Attachment in usage { flags += {.RenderTarget, .ShaderRead} }
+        if .Depth_Attachment in usage { flags += {.RenderTarget} }
+        return flags
+    }
+
+    _texture_resource_usage_interop :: proc(usage: Texture_Usage) -> MTL.ResourceUsage {
+        flags: MTL.ResourceUsage
+        if .Sampled in usage { flags += {.Sample} }
+        if .Read    in usage { flags += {.Read} }
+        if .Write   in usage { flags += {.Write} }
+        return flags
     }
 
     _storage_mode_interop :: proc(storage_mode: StorageMode) -> MTL.StorageMode {
@@ -415,7 +417,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             log.panic("gpu_MTL.odin: MTL_texture_init: failed to create texture")
         }
 
-        return _Texture { texture = texture }
+        return _Texture { texture = texture, usage = texture_descriptor.usage }
     }
 
     _acquire_next_swapchain :: proc() -> _Texture {
@@ -424,9 +426,12 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             panic("In gpu_Metal.odin: _acquire_next_swapchain: Couldn't acquire next drawable")
         }
 
-        native := _Texture { drawable = drawable, texture = drawable->texture() }
+        native := _Texture { 
+            texture = drawable->texture(),
+            usage = {.Color_Attachment},
+        }
         
-        _state.curr_drawable = native
+        _state.curr_drawable = drawable
 
         return native
     }

@@ -78,7 +78,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             surface_texture: wgpu.SurfaceTexture,
             texture: wgpu.Texture,
         },
-        view: wgpu.TextureView,
+        view:   wgpu.TextureView,
+        access: wgpu.StorageTextureAccess,
     }
 
     _copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
@@ -448,20 +449,26 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     _texture_usage_interop :: proc(usage: Texture_Usage, storage: StorageMode) -> wgpu.TextureUsageFlags {
         flags: wgpu.TextureUsageFlags
-        switch usage {
-        case .Sampled:
-            flags = {.TextureBinding}
-        case .Storage:
-            flags = {.StorageBinding, .TextureBinding}
-        case .Color_Attachment:
-            flags = {.RenderAttachment, .TextureBinding}
-        case .Depth_Attachment:
-            flags = {.RenderAttachment}
-        }
-        if storage == .Shared && (usage == .Sampled || usage == .Storage) {
+        if .Sampled          in usage { flags += {.TextureBinding} }
+        if .Read             in usage { flags += {.StorageBinding} }
+        if .Write            in usage { flags += {.StorageBinding} }
+        if .Color_Attachment in usage { flags += {.RenderAttachment, .TextureBinding} }
+        if .Depth_Attachment in usage { flags += {.RenderAttachment} }
+        if storage == .Shared && (.Sampled in usage || .Read in usage || .Write in usage) {
             flags += {.CopyDst}
         }
         return flags
+    }
+
+    _texture_access_interop :: proc(usage: Texture_Usage) -> wgpu.StorageTextureAccess {
+        read  := .Read in usage
+        write := .Write in usage
+        switch {
+        case read && write:  return .ReadWrite
+        case write:          return .WriteOnly
+        case read:           return .ReadOnly
+        }
+        return .WriteOnly
     }
     
     _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
@@ -483,6 +490,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         return _Texture {
             texture = texture,
             view = view,
+            access = _texture_access_interop(texture_descriptor.usage),
         }
     }
 
@@ -924,7 +932,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
                 bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
                     binding    = u32(count),
-                    visibility = {.Vertex, .Fragment, .Compute},
+                    visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
                     buffer = wgpu.BufferBindingLayout{
                         type             = .Storage,
                         hasDynamicOffset = false,
@@ -945,9 +953,9 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
                 bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
                     binding = u32(count),
-                    visibility = {.Vertex, .Fragment, .Compute},
+                    visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
                     storageTexture = wgpu.StorageTextureBindingLayout{
-                        access = .ReadWrite,
+                        access = res.native.access,
                         format = wgpu.TextureGetFormat(res.native.texture),
                         viewDimension = ._2D,
                     },
@@ -967,7 +975,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
             bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
                 binding = u32(count),
-                visibility = {.Vertex, .Fragment, .Compute},
+                visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
                 sampler = wgpu.SamplerBindingLayout{
                     type = .Filtering,
                 },
