@@ -26,12 +26,38 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
         command_encoder: wgpu.CommandEncoder,
         render_pass_encoder: wgpu.RenderPassEncoder,
+        compute_pass_encoder: wgpu.ComputePassEncoder,
 
         curr_pipeline: Pipeline,
-        curr_depth_stencil_state: Depth_Stencil_Handle,
+        curr_compute_pipeline: Compute_Pipeline,
+        curr_depth_stencil_state: Depth_Stencil_State,
         uniform_offset_align: u32,
 
         settings: Pipeline_Settings, 
+    }
+
+    DEFAULT_PIPELINE_SETTINGS :: Pipeline_Settings {
+        multisample = {
+            count = 1,
+            mask = 0xFFFFFFFF,
+        },
+        blend = {
+            alpha = {
+                srcFactor = .SrcAlpha,
+                dstFactor = .OneMinusSrcAlpha,
+                operation = .Add,
+            },
+            color = {
+                srcFactor = .SrcAlpha,
+                dstFactor = .OneMinusSrcAlpha,
+                operation = .Add,
+            },
+        },
+        primitive = {
+            topology = .TriangleList,
+            cullMode = .None,
+            frontFace = .CCW,
+        }
     }
 
     _Shader :: struct {
@@ -131,30 +157,10 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
                 panic("Failed to get limits")
             }
 
+
+
             _state.uniform_offset_align = limits.minUniformBufferOffsetAlignment
-            _state.settings = {
-                multisample = {
-                    count = 1,
-                    mask = 0xFFFFFFFF,
-                },
-                blend = {
-                    alpha = {
-                        srcFactor = .SrcAlpha,
-                        dstFactor = .OneMinusSrcAlpha,
-                        operation = .Add,
-                    },
-                    color = {
-                        srcFactor = .SrcAlpha,
-                        dstFactor = .OneMinusSrcAlpha,
-                        operation = .Add,
-                    },
-                },
-                primitive = {
-                    topology = .TriangleList,
-                    cullMode = .None,
-                    frontFace = .CCW,
-                },
-            }
+            _state.settings = DEFAULT_PIPELINE_SETTINGS
 
             _state.is_init = true
         }
@@ -213,12 +219,68 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     //////////////////////////////////////////////////////////////
     // Render primitive initialization
-    _Compute_Pipeline :: struct {}
-    _compute_pipeline_init :: proc(shader: Shader_Handle, entry_point: string) -> Compute_Pipeline_Handle {
-        return {}
+    _Compute_Pipeline :: struct {
+        shader: Shader,
+        entry: string,
     }
-    _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {}
-    _set_compute_pipeline :: proc(pipeline: Compute_Pipeline_Handle) {}
+
+    _compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> _Compute_Pipeline {
+        return _Compute_Pipeline {
+            shader = shader,
+            entry  = strings.clone(entry_point),
+        }
+    }
+    _compute_pass_encoder :: proc() -> wgpu.ComputePassEncoder {
+        if _state.compute_pass_encoder == nil {
+            _state.compute_pass_encoder = wgpu.CommandEncoderBeginComputePass(_state.command_encoder, nil)
+        }
+        return _state.compute_pass_encoder
+    }
+
+    _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
+        pipeline := _state.curr_compute_pipeline
+
+        bg_layout := wgpu.DeviceCreateBindGroupLayout(_state.device, &wgpu.BindGroupLayoutDescriptor{
+            entryCount = uint(_state.parameter_count),
+            entries    = raw_data(_state.bg_layout_entries[:_state.parameter_count]),
+        })
+
+        pso_layout := wgpu.DeviceCreatePipelineLayout(_state.device, &wgpu.PipelineLayoutDescriptor{
+            bindGroupLayoutCount = 1,
+            bindGroupLayouts    = &bg_layout,
+        })
+
+        pso := wgpu.DeviceCreateComputePipeline(_state.device, &wgpu.ComputePipelineDescriptor{
+            layout  = pso_layout,
+            compute = wgpu.ComputeState {
+                module     = pipeline.shader.module,
+                entryPoint = pipeline.entry,
+            },
+        })
+
+        bg := wgpu.DeviceCreateBindGroup(_state.device, &wgpu.BindGroupDescriptor{
+            layout     = bg_layout,
+            entryCount = uint(_state.parameter_count),
+            entries    = raw_data(_state.bg_entries[:_state.parameter_count]),
+        })
+
+        pass := _compute_pass_encoder()
+        wgpu.ComputePassEncoderSetPipeline(pass, pso)
+        wgpu.ComputePassEncoderSetBindGroup(pass, 0, bg, nil)
+        wgpu.ComputePassEncoderDispatchWorkgroups(pass, num_groups.x, num_groups.y, num_groups.z)
+
+        wgpu.ComputePassEncoderEnd(pass)
+        wgpu.ComputePassEncoderRelease(pass)
+        wgpu.ComputePipelineRelease(pso)
+        wgpu.BindGroupRelease(bg)
+        wgpu.BindGroupLayoutRelease(bg_layout)
+        wgpu.PipelineLayoutRelease(pso_layout)
+        _state.compute_pass_encoder = nil
+    }
+    
+    _set_compute_pipeline :: proc(pipeline: Compute_Pipeline) {
+        _state.curr_compute_pipeline = pipeline
+    }
 
     _shader_init :: proc(name: string, code: []u8) -> _Shader {
         module := wgpu.DeviceCreateShaderModule(_state.device, &{
@@ -236,9 +298,9 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     }
 
     _Pipeline :: struct {
-        vertex_shader: Shader_Handle,
+        vertex_shader: Shader,
         vertex_function: string,
-        fragment_shader: Shader_Handle,
+        fragment_shader: Shader,
         fragment_function: string,
         
         color_format: Pixel_Format,
@@ -344,52 +406,13 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         _state.curr_pipeline = pipeline
     }
 
-    _set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_Handle) {
+    _set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
         _state.curr_depth_stencil_state = depth_stencil_state
     }
 
     _set_cull_mode :: proc(cull_mode: Cull_Mode) {
     }
 
-    _set_buffers :: proc(buffers: []ptr, range: Range, stage: Shader_Stage) {
-        assert(len(buffers) > 0)
-        assert(len(buffers) == int(range.length))
-
-        // pipe_desc := hm.static_get(&_state.pipelines, _state.curr_pipeline)
-
-        // for slot in range.location ..< range.location + range.length {
-        //     i := slot - range.location
-
-        //     ptr := buffers[i]
-        //     assert(ptr.index_bytes == 0) // index buffers go through SetIndexBuffer, not bind groups
-
-        //     pipe_desc.buffers[i] = buffers[i]
-        // }
-    }
-
-    _set_textures :: proc(textures: []Texture, range: Range, stage: Shader_Stage) {
-        // assert(len(textures) > 0)
-        // assert(len(textures) == int(range.length))
-
-        // pipe_desc := hm.static_get(&_state.pipelines, _state.curr_pipeline)
-
-        // for slot in range.location ..< range.location + range.length {
-        //     i := slot - range.location
-        //     pipe_desc.textures[i] = textures[i]
-        // }
-    }
-
-    _set_samplers :: proc(samplers: []Sampler, range: Range, stage: Shader_Stage) {
-        // assert(len(samplers) > 0)
-        // assert(len(samplers) == int(range.length))
-
-        // pipe_desc := hm.static_get(&_state.pipelines, _state.curr_pipeline)
-
-        // for slot in range.location ..< range.location + range.length {
-        //     i := slot - range.location
-        //     pipe_desc.samplers[i] = samplers[i]
-        // }
-    }
 
     _Depth_Stencil_State :: wgpu.DepthStencilState
 
@@ -429,7 +452,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         case .Sampled:
             flags = {.TextureBinding}
         case .Storage:
-            flags = {.StorageBinding}
+            flags = {.StorageBinding, .TextureBinding}
         case .Color_Attachment:
             flags = {.RenderAttachment, .TextureBinding}
         case .Depth_Attachment:
@@ -491,7 +514,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     }
 
     _Sampler :: struct {
-        sampler: wgpu.Sampler,
+        s: wgpu.Sampler,
     }
 
     _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
@@ -536,7 +559,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         sampler := wgpu.DeviceCreateSampler(_state.device, &wgpu_desc)
 
         return _Sampler {
-            sampler = sampler,
+            s = sampler,
         }
     }
 
@@ -559,8 +582,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             writeMask = wgpu.ColorWriteMaskFlags_All,
         }
 
-        v_shader := hm.static_get(&_state.shaders, pipeline.vertex_shader)
-        f_shader := hm.static_get(&_state.shaders, pipeline.fragment_shader)
+        v_shader := pipeline.vertex_shader
+        f_shader := pipeline.fragment_shader
 
         v_state := wgpu.VertexState{
             module      = v_shader.module,
@@ -575,12 +598,12 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             targets     = &target,
         }
 
-        depth_stencil_state_impl, depth_set := hm.static_get(&_state.depth_stencil_states, _state.curr_depth_stencil_state)
-
+        
+        depth_format := _pixel_format_interop(pipeline.depth_format)
         dpso: wgpu.DepthStencilState
-        if depth_set {
-            dpso = depth_stencil_state_impl.native
-            dpso.format = _pixel_format_interop(pipeline.depth_format)
+        if depth_format != .Undefined {
+            dpso = _state.curr_depth_stencil_state.native
+            dpso.format = depth_format
         } 
 
         pso := wgpu.DeviceCreateRenderPipeline(_state.device, &wgpu.RenderPipelineDescriptor{
@@ -589,7 +612,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             primitive    = _state.settings.primitive,
             multisample  = _state.settings.multisample,
             fragment     = &f_state,
-            depthStencil = nil if !depth_set else &dpso,
+            depthStencil = nil if depth_format == .Undefined else &dpso,
         })
 
         frame_bg := wgpu.DeviceCreateBindGroup(_state.device, &wgpu.BindGroupDescriptor{
@@ -631,11 +654,12 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     _malloc :: proc(
         type: Buffer_Type,
-        #any_int size: uint,
+        #any_int el_count: uint,
+        #any_int el_size: uint,
         #any_int alignment: uint,
         name: string
     ) -> _ptr {
-        bytes := runtime.align_forward_uint(size, alignment)
+        bytes := runtime.align_forward_uint(el_count * el_size, alignment)
 
         usage: wgpu.BufferUsageFlags
         mapped: b32
@@ -654,6 +678,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             usage  = {.CopyDst, .Uniform}
             mapped = false
             binding_type = .Uniform
+            bytes = max(bytes, uint(_state.uniform_offset_align))
         case .GPU_Index:
             usage  = {.CopyDst, .Index}
             mapped = false
@@ -664,14 +689,10 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             binding_type = .ReadOnlyStorage
         }
 
-        size := u64(bytes)
-        if binding_type == .Uniform {
-            size = max(size, u64(_state.uniform_offset_align))
-        }
         buffer := wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor {
             label = name,
             usage = usage,
-            size = size,
+            size = u64(bytes),
             mappedAtCreation = mapped,
         })
 
@@ -681,6 +702,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             is_mapped = bool(mapped),
             capacity = uint(bytes),
             binding_type = binding_type,
+            index_bytes = u8(el_size) if type == .GPU_Index else 0,
         }
     }
 
@@ -790,6 +812,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             return .Undefined
         case .BGRA8Unorm:
             return .BGRA8Unorm
+        case .RGBA8Unorm:
+            return .RGBA8Unorm
         case .Depth32Float:
             return .Depth32Float
         }
@@ -818,7 +842,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         unreachable()
     }
 
-    _use_parameter_block :: proc(block: ^Parameter_Block) {
+    _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Destination) {
         bg_layout_entries := &_state.bg_layout_entries
         bg_entries := &_state.bg_entries
         count: u32
@@ -828,9 +852,9 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
             bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
                 binding    = u32(count),
-                visibility = {.Vertex},
+                visibility = {.Vertex, .Fragment, .Compute},
                 buffer = wgpu.BufferBindingLayout{
-                    type             = C.binding_type,
+                    type             = .Uniform,
                     hasDynamicOffset = false,
                     minBindingSize   = 0,
                 },
@@ -847,30 +871,113 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
 
         for R in block.read_resources {
-            if R.native.buffer == nil { continue }
+            switch res in R {
+            case ptr:
+                if res.native.buffer == nil { continue }
+
+                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                    binding    = u32(count),
+                    visibility = {.Vertex, .Fragment, .Compute},
+                    buffer = wgpu.BufferBindingLayout{
+                        type             = .ReadOnlyStorage,
+                        hasDynamicOffset = false,
+                        minBindingSize   = 0,
+                    },
+                }
+
+                bg_entries[count] = wgpu.BindGroupEntry{
+                    binding = u32(count),
+                    buffer  = res.buffer,
+                    offset  = u64(res.offset),
+                    size    = u64(res.capacity),
+                }
+
+                count += 1
+            case Texture:
+                if res.native.texture == nil { continue }
+
+                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                    binding = u32(count),
+                    visibility = {.Vertex, .Fragment, .Compute},
+                    texture = wgpu.TextureBindingLayout{
+                        sampleType = .Float,
+                        viewDimension = ._2D,
+                        multisampled = false,
+                    },
+                }
+
+                bg_entries[count] = wgpu.BindGroupEntry{
+                    binding = u32(count),
+                    textureView = res.native.view,
+                }
+
+                count += 1
+            }            
+        }
+
+        for RW in block.read_write_resources {
+            switch res in RW {
+            case ptr:
+                if res.native.buffer == nil { continue }
+
+                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                    binding    = u32(count),
+                    visibility = {.Vertex, .Fragment, .Compute},
+                    buffer = wgpu.BufferBindingLayout{
+                        type             = .Storage,
+                        hasDynamicOffset = false,
+                        minBindingSize   = 0,
+                    },
+                }
+
+                bg_entries[count] = wgpu.BindGroupEntry{
+                    binding = u32(count),
+                    buffer  = res.buffer,
+                    offset  = u64(res.offset),
+                    size    = u64(res.capacity),
+                }
+
+                count += 1
+            case Texture:
+                if res.native.texture == nil { continue }
+
+                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                    binding = u32(count),
+                    visibility = {.Vertex, .Fragment, .Compute},
+                    storageTexture = wgpu.StorageTextureBindingLayout{
+                        access = .ReadWrite,
+                        format = .RGBA8Unorm,
+                        viewDimension = ._2D,
+                    },
+                }
+
+                bg_entries[count] = wgpu.BindGroupEntry{
+                    binding = u32(count),
+                    textureView = res.native.view,
+                }
+
+                count += 1
+            }   
+        }
+        
+        for S in block.samplers {
+            if S.native.s == nil { continue }
 
             bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                binding    = u32(count),
-                visibility = {.Vertex},
-                buffer = wgpu.BufferBindingLayout{
-                    type             = R.binding_type,
-                    hasDynamicOffset = false,
-                    minBindingSize   = 0,
+                binding = u32(count),
+                visibility = {.Vertex, .Fragment, .Compute},
+                sampler = wgpu.SamplerBindingLayout{
+                    type = .Filtering,
                 },
             }
 
             bg_entries[count] = wgpu.BindGroupEntry{
                 binding = u32(count),
-                buffer  = R.buffer,
-                offset  = u64(R.offset),
-                size    = u64(R.capacity),
+                sampler = S.native.s,
             }
 
             count += 1
         }
-
-        for RW in block.read_write_resources {}
-        for S in block.samplers {}
 
         _state.parameter_count = count
     }

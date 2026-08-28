@@ -141,6 +141,7 @@ resize_depth :: proc(width, height: u32) {
 Pixel_Format :: enum u8 {
     None,
     BGRA8Unorm,
+    RGBA8Unorm,
     Depth32Float,
 }
 
