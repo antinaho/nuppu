@@ -1,27 +1,23 @@
 *
-
 !.gitignore
+
+!build_web.sh
+!built_in.odin
+!comm.odin
+!loader.odin
+!nuppu.odin
+
+!gpu/
+!gpu/**
 
 !examples/
 !examples/**
 
-!app.odin
-
-!platform.odin
-!platform_choser.odin
-!platform_glfw.odin
-
-!default_renderer.odin
-!built_in.odin
-
-!gpu.odin
-!gpu_chooser.odin
-!gpu_MTL.odin
-!loader.odin
+!platform/
+!platform/**
 
 !web/
 !web/index.html
-!build_web.sh
 
 *.obj
 *.mtl
