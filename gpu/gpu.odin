@@ -142,6 +142,7 @@ Pixel_Format :: enum u8 {
     None,
     BGRA8Unorm,
     RGBA8Unorm,
+    RGBA32Float,
     Depth32Float,
 }
 

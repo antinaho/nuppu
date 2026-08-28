@@ -814,6 +814,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             return .BGRA8Unorm
         case .RGBA8Unorm:
             return .RGBA8Unorm
+        case .RGBA32Float:
+            return .RGBA32Float
         case .Depth32Float:
             return .Depth32Float
         }
@@ -946,7 +948,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
                     visibility = {.Vertex, .Fragment, .Compute},
                     storageTexture = wgpu.StorageTextureBindingLayout{
                         access = .ReadWrite,
-                        format = .RGBA8Unorm,
+                        format = wgpu.TextureGetFormat(res.native.texture),
                         viewDimension = ._2D,
                     },
                 }
