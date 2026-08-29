@@ -97,7 +97,7 @@ when ODIN_OS == .JS {
         usage = {.Write, .Sampled},
     })
 
-    state.kernel = gpu.compute_shader_init("my_compute_shader", compute_code)
+    state.kernel = gpu.shader_init("my_compute_shader", compute_code)
     state.compute_pso = gpu.compute_pipeline_init(state.kernel, "mandelbrot_set")
 
     upload := gpu.arena()
