@@ -4,7 +4,6 @@ package nuppu_gpu
 import "base:runtime"
 import "core:mem"
 import "core:log"
-import hm "core:container/handle_map"
 import "core:strings"
 import "core:fmt"
 
@@ -29,42 +28,46 @@ else {
 FRAMES_IN_FLIGHT :: 3
 FRAME_ARENA_SIZE :: 4 * 1024 * 1024
 
-// Resources inside arrays need to be declared in the same order
-// as they are in the shader
-Parameter_Block :: struct {
-    constants           : [MAX_CONSTANTS]ptr,
-    read_resources      : [MAX_READ_RESOURCE]Parameter_Resource,
-    read_write_resources: [MAX_READ_WRITE_RESOURCES]Parameter_Resource,
-    samplers            : [MAX_SAMPLERS]Sampler,
-}
-
-Parameter_Resource :: union {
-    ptr,
-    Texture,
-}
-
-Parameter_Destination :: enum {
-    Graphics,
-    Compute,
-}
-
-use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Destination = .Graphics) {
-    _use_parameter_block(block, destination)
-}
-
 // Limits based of WGSL https://www.w3.org/TR/WGSL/#limits
-// Should be good for rest of the APIs?
+__MAX_CONSTANT_BUFFERS     :: 12 // Seperate limit from MAX_BUFFERS
+__MAX_BUFFERS              :: 8  // 8 in total between read + read_write
+__MAX_SAMPLED_TEXTURES     :: 16
+__MAX_READ_WRITE_TEXTURES  :: 4
+__MAX_SAMPLERS             :: 16
 
-MAX_STORAGE_BUFFERS :: 8 // Shared between read + read_write
-READ_TEXTURES :: 16
-READ_WRITE_TEXTURES :: 4
+__MAX_READ_RESOURCE        :: __MAX_BUFFERS + __MAX_SAMPLED_TEXTURES
+__MAX_READ_WRITE_RESOURCES :: __MAX_BUFFERS + __MAX_READ_WRITE_TEXTURES
 
-MAX_CONSTANTS :: 12
-MAX_READ_RESOURCE :: MAX_STORAGE_BUFFERS + READ_TEXTURES
-MAX_READ_WRITE_RESOURCES :: MAX_STORAGE_BUFFERS + READ_WRITE_TEXTURES
-MAX_SAMPLERS :: 16
+__MAX_LAYOUT_BINDINGS      :: __MAX_CONSTANT_BUFFERS + __MAX_BUFFERS + __MAX_SAMPLED_TEXTURES + __MAX_READ_WRITE_TEXTURES + __MAX_SAMPLERS
 
-MAX_LAYOUT_BINDINGS :: MAX_CONSTANTS + MAX_STORAGE_BUFFERS + READ_TEXTURES + READ_WRITE_TEXTURES + MAX_SAMPLERS
+// Nuppu limits that make sense for the API. These can be changed if you need more
+MAX_CONSTANT_BUFFERS      :: 4
+MAX_BUFFERS               :: 4
+MAX_SAMPLED_TEXTURES      :: 4
+MAX_READ_WRITE_TEXTURES   :: 4
+MAX_SAMPLERS              :: 4
+
+MAX_READ_RESOURCE         :: MAX_BUFFERS + MAX_SAMPLED_TEXTURES
+MAX_READ_WRITE_RESOURCES  :: MAX_BUFFERS + MAX_READ_WRITE_TEXTURES
+
+MAX_LAYOUT_BINDINGS       :: MAX_CONSTANT_BUFFERS + MAX_BUFFERS + MAX_SAMPLED_TEXTURES + MAX_READ_WRITE_TEXTURES + MAX_SAMPLERS
+
+#assert(MAX_CONSTANT_BUFFERS <= __MAX_CONSTANT_BUFFERS)
+#assert(MAX_BUFFERS <= __MAX_BUFFERS)
+#assert(MAX_SAMPLED_TEXTURES <= __MAX_SAMPLED_TEXTURES)
+#assert(MAX_READ_WRITE_TEXTURES <= __MAX_READ_WRITE_TEXTURES)
+#assert(MAX_SAMPLERS <= __MAX_SAMPLERS)
+#assert(MAX_READ_RESOURCE <= __MAX_READ_RESOURCE)
+#assert(MAX_READ_WRITE_RESOURCES <= __MAX_READ_WRITE_RESOURCES)
+#assert(MAX_LAYOUT_BINDINGS <= __MAX_LAYOUT_BINDINGS)
+
+MAX_TEXTURE_SIZE :: 4096
+
+///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+
+_state: ^State
 
 State :: struct #align(64) {
     using impl: _State,
@@ -79,11 +82,46 @@ State :: struct #align(64) {
     depth_texture: Texture,
 }
 
-Depth_Stencil_Handle :: distinct hm.Handle16
-MAX_DEPTH_STENCIL_STATES :: 8
+// Resources inside arrays need to be declared in the same order as they are in the shader
+// ConstantBuffer -> Texture/StructuredBuffer -> R/W/RWTexture -> Sampler
+Parameter_Block :: struct {
+    constants           : [MAX_CONSTANT_BUFFERS]ptr,
+    read_resources      : [MAX_READ_RESOURCE]Parameter_Resource,
+    read_write_resources: [MAX_READ_WRITE_RESOURCES]Parameter_Resource,
+    samplers            : [MAX_SAMPLERS]Sampler,
+}
 
-_state: ^State
+Parameter_Resource :: union {
+    ptr,
+    Texture,
+}
 
+Parameter_Block_Destination :: enum {
+    Graphics,
+    Compute,
+}
+
+ptr :: struct #all_or_none {
+    cpu: rawptr,
+    gpu: rawptr,
+
+    meta: Metadata,
+
+    using native: _ptr,
+}
+
+Buffer_Type :: enum u8 {
+    Staging,       // CPU visible, mapped at creation; GPU reads as copy source
+    GPU_Storage,   // Device-local; bindable as storage buffer
+    GPU_Constant,  // Device-local; bindable as uniform buffer
+    GPU_Index,     // Device-local; bindable as index buffer
+    Readback,      // CPU visible; GPU writes via copy; CPU reads after fence
+}
+
+Index__Buffer_Type :: enum u8 {
+    Uint16,
+    Uint32,
+}
 
 Metadata :: struct
 {
@@ -91,12 +129,221 @@ Metadata :: struct
     created_at: runtime.Source_Code_Location,
 }
 
+Arena :: struct {
+    ptr: ptr,
+    offset: uint,
+    capacity: uint,
+}
+
 Shader :: struct {
     using native: _Shader,
 }
 
-depth :: proc() -> Texture {
-    return _state.depth_texture
+Shader_IR :: struct {
+    shader: Shader,
+    entry_point: string,
+}
+
+Shader_Stage :: enum u8 {
+    Vertex,
+    Fragment,
+    Compute,
+}
+
+Sampler :: struct {
+    using native: _Sampler,
+}
+
+Sampler_Min_Mag_Filter :: enum u8 {
+	Nearest = 0,
+	Linear,
+}
+
+Sampler_Mip_Filter :: enum u8 {
+	NotMipmapped = 0,
+	Nearest,
+	Linear,
+}
+
+Sampler_Address_Mode :: enum u8 {
+	ClampToEdge  = 0,
+	MirrorRepeat,
+	Repeat,
+}
+
+Sampler_Descriptor :: struct {
+    min_filter: Sampler_Min_Mag_Filter,
+    mag_filter: Sampler_Min_Mag_Filter,
+    mip_filter: Sampler_Mip_Filter,
+    wrap_s: Sampler_Address_Mode,
+    wrap_t: Sampler_Address_Mode,
+    wrap_r: Sampler_Address_Mode,
+}
+
+Texture :: struct {
+    using native: _Texture,
+}
+
+Texture_Type :: enum u8 {
+    _2D,
+}
+
+Texture_Descriptor :: struct #all_or_none {
+    dimensions: [2]u32,
+    format: Pixel_Format,
+    storage: StorageMode,
+    usage: Texture_Usage,
+    type: Texture_Type,
+}
+
+StorageMode :: enum u8 {
+	Shared     = 0,
+	Private    = 2,
+}
+
+Texture_Usage_Flag :: enum {
+    Sampled,
+    Read,
+    Write,
+    Color_Attachment,
+    Depth_Attachment,
+}
+Texture_Usage :: bit_set[Texture_Usage_Flag; u8]
+
+Color :: [4]u8
+
+Pixel_Format :: enum u8 {
+    None,
+    BGRA8Unorm,
+    RGBA8Unorm,
+    RGBA32Float,
+    Depth32Float,
+}
+
+Semaphore :: distinct rawptr
+
+Stage :: enum u8 {
+    Transfer         = 0,
+    Compute          = 1,
+    All              = 6,
+}
+
+Color_Attachment :: struct {
+    clear_color: Color,
+    load_action: Load_Action,
+    store_action: Store_Action,
+    texture: Texture,
+    resolve_texture: Texture,
+}
+
+Depth_Attachment :: struct {
+    load_action: Load_Action,
+    store_action: Store_Action,
+    texture: Texture,
+}
+
+Depth_Stencil_State :: struct {
+    using native: _Depth_Stencil_State,
+}   
+
+Depth_Stencil_State_Descriptor :: struct {
+	write_enabled: bool,
+	compare: Compare_Function,
+}
+
+Compare_Function :: enum u8 {
+    Never = 0x00000001,
+    Less = 0x00000002,
+    Equal = 0x00000003,
+    LessEqual = 0x00000004,
+    Greater = 0x00000005,
+    NotEqual = 0x00000006,
+    GreaterEqual = 0x00000007,
+    Always = 0x00000008,
+}
+
+Load_Action :: enum u8 {
+    Dont_Care,
+    Clear,
+    Load,
+}
+
+Store_Action :: enum u8 {
+    Dont_Care,
+    Store,
+}
+
+Pipeline :: struct {
+    using native: _Pipeline,
+}
+
+Compute_Pipeline :: struct {
+    using native: _Compute_Pipeline,
+}
+
+Pipeline_Descriptor :: struct {
+    color_format: Pixel_Format,
+    depth_format: Pixel_Format,
+}
+
+Front_Face :: enum i32 {
+    CCW = 0x00000001,
+    CW = 0x00000002,
+}
+
+Cull_Mode :: enum i32 {
+    None = 0x00000001,
+	Front = 0x00000002,
+	Back = 0x00000003,
+}
+
+Multisample_State :: struct {
+    count: u32,
+    mask: u32,
+}
+
+Primitive_Type :: enum u8 {
+    Triangle      = 3,
+}
+
+Blend_State :: struct {
+    color: Blend_Component,
+	alpha: Blend_Component,
+}
+
+Blend_Component :: struct {
+	operation: Blend_Operation,
+	srcFactor: Blend_Factor,
+	dstFactor: Blend_Factor,
+}
+
+Blend_Operation :: enum i32 {
+	Add = 0x00000000,
+	Subtract = 0x00000001,
+	ReverseSubtract = 0x00000002,
+	Min = 0x00000003,
+	Max = 0x00000004,
+}
+
+Blend_Factor :: enum i32 {
+	Undefined = 0x00000000,
+	Zero = 0x00000001,
+	One = 0x00000002,
+	Src = 0x00000003,
+	OneMinusSrc = 0x00000004,
+	SrcAlpha = 0x00000005,
+	OneMinusSrcAlpha = 0x00000006,
+	Dst = 0x00000007,
+	OneMinusDst = 0x00000008,
+	DstAlpha = 0x00000009,
+	OneMinusDstAlpha = 0x0000000A,
+	SrcAlphaSaturated = 0x0000000B,
+	Constant = 0x0000000C,
+	OneMinusConstant = 0x0000000D,
+	Src1 = 0x0000000E,
+	OneMinusSrc1 = 0x0000000F,
+	Src1Alpha = 0x00000010,
+	OneMinusSrc1Alpha = 0x00000011,
 }
 
 init :: proc(state: ^State, native_window: rawptr) -> bool {
@@ -133,163 +380,17 @@ resize_swapchain :: proc(width, height: u32) {
     _resize_swapchain(width, height)
 }
 
+depth :: proc() -> Texture {
+    return _state.depth_texture
+}
+
 resize_depth :: proc(width, height: u32) {
     _resize_depth_texture(width, height)
-}
-
-
-Pixel_Format :: enum u8 {
-    None,
-    BGRA8Unorm,
-    RGBA8Unorm,
-    RGBA32Float,
-    Depth32Float,
-}
-
-
-
-MAX_TEXTURE_SIZE :: 4096
-
-
-
-Color :: [4]u8
-
-Load_Action :: enum u8 {
-    Dont_Care,
-    Clear,
-    Load,
-}
-
-Store_Action :: enum u8 {
-    Dont_Care,
-    Store,
-}
-
-
-
-
-
-Shader_Stage :: enum u8 {
-    Vertex,
-    Fragment,
-    Compute,
 }
 
 // CPU side copy
 copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
     _copy_to_texture(texture, origin, size, level, data, bytes_per_row)
-}
-
-Color_Attachment :: struct {
-    clear_color: Color,
-    load_action: Load_Action,
-    store_action: Store_Action,
-    texture: Texture,
-    resolve_texture: Texture,
-}
-
-Shader_IR :: struct {
-    shader: Shader,
-    entry_point: string,
-}
-
-Pipeline_Descriptor :: struct {
-    color_format: Pixel_Format,
-    depth_format: Pixel_Format,
-}
-
-    // multisample: Multisample_State,
-    // blend: Blend_State,
-    // primitive: Primitive_State,
-    // buffers: [8]ptr,
-    // textures: [8]Texture,
-    // samplers: [8]Sampler,
-    // index_buffer: ptr,
-
-Depth_Stencil_State :: struct {
-    using native: _Depth_Stencil_State,
-}   
-
-Depth_Stencil_State_Descriptor :: struct {
-	write_enabled: bool,
-	compare: Compare_Function,
-	// stencilFront: StencilFaceState,
-	// stencilBack: StencilFaceState,
-	// stencilReadMask: u32,
-	// stencilWriteMask: u32,
-	// depthBias: i32,
-	// depthBiasSlopeScale: f32,
-	// depthBiasClamp: f32,
-}
-
-Compare_Function :: enum u8 {
-    Never = 0x00000001,
-    Less = 0x00000002,
-    Equal = 0x00000003,
-    LessEqual = 0x00000004,
-    Greater = 0x00000005,
-    NotEqual = 0x00000006,
-    GreaterEqual = 0x00000007,
-    Always = 0x00000008,
-}
-
-Primitive_State :: struct {
-    topology: Primitive_Type,
-}
-
-Front_Face :: enum i32 {
-    CCW = 0x00000001,
-    CW = 0x00000002,
-}
-
-Cull_Mode :: enum i32 {
-    None = 0x00000001,
-	Front = 0x00000002,
-	Back = 0x00000003,
-}
-
-Multisample_State :: struct {
-    count: u32,
-    mask: u32,
-}
-
-Blend_State :: struct {
-    color: Blend_Component,
-	alpha: Blend_Component,
-}
-
-Blend_Component :: struct {
-	operation: Blend_Operation,
-	srcFactor: Blend_Factor,
-	dstFactor: Blend_Factor,
-}
-Blend_Operation :: enum i32 {
-	Add = 0x00000000,
-	Subtract = 0x00000001,
-	ReverseSubtract = 0x00000002,
-	Min = 0x00000003,
-	Max = 0x00000004,
-}
-
-Blend_Factor :: enum i32 {
-	Undefined = 0x00000000,
-	Zero = 0x00000001,
-	One = 0x00000002,
-	Src = 0x00000003,
-	OneMinusSrc = 0x00000004,
-	SrcAlpha = 0x00000005,
-	OneMinusSrcAlpha = 0x00000006,
-	Dst = 0x00000007,
-	OneMinusDst = 0x00000008,
-	DstAlpha = 0x00000009,
-	OneMinusDstAlpha = 0x0000000A,
-	SrcAlphaSaturated = 0x0000000B,
-	Constant = 0x0000000C,
-	OneMinusConstant = 0x0000000D,
-	Src1 = 0x0000000E,
-	OneMinusSrc1 = 0x0000000F,
-	Src1Alpha = 0x00000010,
-	OneMinusSrc1Alpha = 0x00000011,
 }
 
 depth_stencil_state_init :: proc(desc: Depth_Stencil_State_Descriptor) -> Depth_Stencil_State {
@@ -300,62 +401,12 @@ depth_stencil_state_init :: proc(desc: Depth_Stencil_State_Descriptor) -> Depth_
     }
 }
 
-Stage :: enum u8 {
-    Transfer         = 0,
-    Compute          = 1,
-    All              = 6,
-}
-
-Range :: struct {
-    location: u32,
-    length:  u32,
-}
-
-Primitive_Type :: enum u8 {
-    Triangle      = 3,
-}
-
-Buffer_Type :: enum u8 {
-    Staging,       // CPU visible, mapped at creation; GPU reads as copy source
-    GPU_Storage,   // Device-local; bindable as storage buffer
-    GPU_Constant,  // Device-local; bindable as uniform buffer
-    GPU_Index,     // Device-local; bindable as index buffer
-    Readback,      // CPU visible; GPU writes via copy; CPU reads after fence
-}
-
-Index_Type :: enum u8 {
-    Uint16,
-    Uint32,
-}
-
-Arena :: struct {
-    ptr: ptr,
-    offset: uint,
-    capacity: uint,
-}
-
-ptr :: struct #all_or_none {
-    cpu: rawptr,
-    gpu: rawptr,
-
-    meta: Metadata,
-
-    using native: _ptr,
-}
-
-//////////////////////////////////////////////////////////////
-// Render primitive initialization
-
 shader_init :: proc(name: string, code: []u8) -> Shader {
     native := _shader_init(name, code)
 
     return Shader {
         native = native,
     }
-}
-
-compute_shader_init :: proc(name: string, code: []u8) -> Shader {
-    return shader_init(name, code)
 }
 
 pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> Pipeline {
@@ -370,15 +421,6 @@ pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline
     }
 }
 
-Pipeline :: struct {
-    using native: _Pipeline,
-}
-
-
-Compute_Pipeline :: struct {
-    using native: _Compute_Pipeline,
-}
-
 compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> Compute_Pipeline {
     native := _compute_pipeline_init(shader, entry_point)
 
@@ -389,9 +431,6 @@ compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> Compute_Pi
     return result
 }
 
-//////////////////////////////////////////////////////////////
-// Command flow (init, runtime uploads): no swapchain interaction
-
 begin_commands :: proc() {
     _begin_commands()
 }
@@ -399,9 +438,6 @@ begin_commands :: proc() {
 commit_commands :: proc() {
     _commit_commands()
 }
-
-//////////////////////////////////////////////////////////////
-// Frame flow (render loop): owns the swapchain present
 
 begin_frame :: proc() {
     _begin_frame()
@@ -432,36 +468,6 @@ set_pipeline :: proc(pipeline: Pipeline) {
     _set_pipeline(pipeline)
 }
 
-Sampler :: struct {
-    using native: _Sampler,
-}
-
-Sampler_Min_Mag_Filter :: enum u8 {
-	Nearest = 0,
-	Linear  = 1,
-}
-
-Sampler_Mip_Filter :: enum u8 {
-	NotMipmapped = 0,
-	Nearest      = 1,
-	Linear       = 2,
-}
-
-Sampler_Address_Mode :: enum u8 {
-	ClampToEdge  = 0,
-	MirrorRepeat = 1,
-	Repeat       = 2,
-}
-
-Sampler_Descriptor :: struct {
-    min_filter: Sampler_Min_Mag_Filter,
-    mag_filter: Sampler_Min_Mag_Filter,
-    mip_filter: Sampler_Mip_Filter,
-    wrap_s: Sampler_Address_Mode,
-    wrap_t: Sampler_Address_Mode,
-    wrap_r: Sampler_Address_Mode,
-}
-
 sampler_init :: proc(desc: Sampler_Descriptor) -> Sampler {
     native := _sampler_init(desc)
     
@@ -470,41 +476,14 @@ sampler_init :: proc(desc: Sampler_Descriptor) -> Sampler {
     }
 }
 
-Depth_Attachment :: struct {
-    load_action: Load_Action,
-    store_action: Store_Action,
-    texture: Texture,
-}
+texture_init :: proc(desc: Texture_Descriptor) -> Texture {
+    assert(desc.dimensions.x <= MAX_TEXTURE_SIZE)
+    assert(desc.dimensions.y <= MAX_TEXTURE_SIZE)
+    native := _texture_init(desc)
 
-Texture_Descriptor :: struct #all_or_none {
-    dimensions: [2]u32,
-    format: Pixel_Format,
-    storage: StorageMode,
-    usage: Texture_Usage,
-    type: Texture_Type,
-}
+    tex := Texture { native = native }
 
-StorageMode :: enum u8 {
-	Shared     = 0,
-	Private    = 2,
-}
-
-Texture_Usage :: bit_set[Texture_Usage_Flag; u8]
-
-Texture_Usage_Flag :: enum {
-    Sampled,
-    Read,
-    Write,
-    Color_Attachment,
-    Depth_Attachment,
-}
-
-Texture :: struct {
-    using native: _Texture,
-}
-
-Texture_Type :: enum u8 {
-    _2D,
+    return tex
 }
 
 texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture {
@@ -516,14 +495,6 @@ texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture 
         type = ._2D,
     }
     return texture_init(desc)
-}
-
-texture_init :: proc(desc: Texture_Descriptor) -> Texture {
-    native := _texture_init(desc)
-
-    tex := Texture { native = native }
-
-    return tex
 }
 
 set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
@@ -557,20 +528,10 @@ draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, in
     _draw_indiced_primitives(primitive, index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance)
 }
 
-//////////////////////////////////////////////////////////////
-// Memory
-
 // Allocate a buffer of the given type.
 //   - .Staging     returns ptr with valid .cpu; caller fills data then calls copy() + unmap()
 //   - .GPU_*       returns ptr with .cpu=nil; receive data via copy() from a Staging buffer
 //   - .Readback    returns ptr with .cpu=nil; receive data via copy()
-
-when ODIN_OS == .Darwin {
-    BUFFER_PTR :: true
-} else {
-    BUFFER_PTR :: false
-}
-
 malloc :: proc(
     type:        Buffer_Type,
     el_count:    int,
@@ -582,11 +543,10 @@ malloc :: proc(
     _ptr := _malloc(type, el_count, el_size, alignment, name)
 
     if type == .Staging {
-        cpu_ptr, gpu_ptr := _map(&_ptr)
         return ptr {
             native = _ptr,
-            cpu    = cpu_ptr,
-            gpu    = gpu_ptr,
+            cpu    = _cpu_address(_ptr),
+            gpu    = _gpu_address(_ptr),
             meta   = Metadata {
                 name = strings.clone(name, context.allocator),
                 created_at = loc,
@@ -608,7 +568,7 @@ malloc :: proc(
 }
 
 // Helper for creating index buffer
-malloc_index :: proc(el_count: int, type: Index_Type, name: string = {}, loc := #caller_location) -> ptr {
+malloc_index :: proc(el_count: int, type: Index__Buffer_Type, name: string = {}, loc := #caller_location) -> ptr {
     el_size: int
     switch type {
     case .Uint16:
@@ -633,13 +593,7 @@ copy :: proc(dst, src: ptr) {
     )
 }
 
-//////////////////////////////////////////////////////////////
-// Arena
-
-/*
-Linear bump arena that allocates staging buffer. Helps if multiple types of staging data is needed to be copied simultaneously.
-*/
-
+// Linear bump arena that allocates staging buffer. Helps if multiple types of staging data is needed to be copied simultaneously.
 arena :: proc(
     #any_int size: uint      = 4 * 1024 * 1024,
     #any_int alignment: uint = 16,
@@ -649,7 +603,6 @@ arena :: proc(
 
     bytes := runtime.align_forward_uint(size, alignment)
     _ptr := _malloc(.Staging, 1, bytes, alignment, "ARENA")
-    cpu_ptr, gpu_ptr := _map(&_ptr)
 
     arena.ptr = {
         meta = Metadata {
@@ -657,8 +610,8 @@ arena :: proc(
             created_at = loc,
         },
         native = _ptr,
-        cpu = cpu_ptr,
-        gpu = gpu_ptr,
+        cpu = _cpu_address(_ptr),
+        gpu = _gpu_address(_ptr),
     }
     arena.offset = 0
     arena.capacity = bytes
@@ -685,9 +638,19 @@ arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, alignment: uint) -> pt
     }
     arena.offset += bytes_aligned
 
-    ptr := _sub_alloc(arena.ptr, temp, bytes_aligned)
+    ptr := sub_alloc(arena.ptr, temp, bytes_aligned)
 
     return ptr
+}
+
+sub_alloc :: proc(parent: ptr, offset, length: uint) -> ptr {
+    result := parent
+    result.cpu      = rawptr(uintptr(parent.cpu) + uintptr(offset))
+    result.gpu      = rawptr(uintptr(parent.gpu) + uintptr(offset))
+    result.offset   = offset
+    result.capacity = length
+
+    return result
 }
 
 // Helper for arena alloc
@@ -695,6 +658,7 @@ arena_alloc :: proc(arena: ^Arena, $T: typeid, el_count: uint = 1) -> ptr {
     assert(_mapped(arena.ptr))
     temp := arena_alloc_raw(arena, size_of(T), el_count, align_of(T))
 
+    // NOTE add typed return?
     // []T from aligned offset before bytes are added in
     // s := slice.from_ptr((^T)(temp.cpu), int(el_count))
     
@@ -712,15 +676,15 @@ recycle_frame_arena :: proc(arena: ^Arena) {
     _recycle_frame_arena(arena)
 }
 
-//////////////////////////////////////////////////////////////
-// Synchronization
+// Sets shader's parameter block to be used for the next draw call.
+use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination = .Graphics) {
+    _use_parameter_block(block, destination)
+}
 
 // Ends before stage
 barrier :: proc(before: Stage, after: Stage) {
     _barrier(before, after)
 }
-
-Semaphore :: distinct rawptr
 
 semaphore :: proc(value: u64) -> Semaphore {
     return _semaphore(value)
@@ -730,8 +694,6 @@ semaphore_wait :: proc(semaphore: Semaphore, value: u64) -> bool {
     return _semaphore_wait(semaphore, value)
 }
 
-//////////////////////////////////////////////////////////////
-// Misc
 
 bit_set_to_another :: proc(input: $T/bit_set[$TT; $TI], $Out: typeid, interop: proc(TT) -> $O) -> (result: Out) {
     for f in input { result |= {interop(f)} }

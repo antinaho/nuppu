@@ -6,9 +6,57 @@ import "core:fmt"
 import "core:log"
 import "core:strings"
 import "base:runtime"
-import hm "core:container/handle_map"
 
 when GPU_BACKEND == GPU_BACKEND_WGPU {
+
+    _ptr :: struct {
+        buffer: wgpu.Buffer,
+        offset: uint, // Byte offset of this view into `buffer` (0 for top-level allocations)
+        capacity: uint, // Capacity of the ptr, NOT the buffer
+        index_bytes: u8,
+        is_mapped: bool,
+        binding_type: wgpu.BufferBindingType,
+    }
+
+    _Shader :: struct {
+        module: wgpu.ShaderModule,
+    }
+
+    _Sampler :: struct {
+        s: wgpu.Sampler,
+    }
+
+    _Texture :: struct {
+        using _ : struct #raw_union {
+            surface_texture: wgpu.SurfaceTexture,
+            texture: wgpu.Texture,
+        },
+        view:   wgpu.TextureView,
+        access: wgpu.StorageTextureAccess,
+    }
+
+    _Depth_Stencil_State :: wgpu.DepthStencilState
+
+    _Compute_Pipeline :: struct {
+        shader: Shader,
+        entry: string,
+    }
+
+    _Pipeline :: struct {
+        vertex_shader: Shader,
+        vertex_function: string,
+        fragment_shader: Shader,
+        fragment_function: string,
+        
+        color_format: Pixel_Format,
+        depth_format: Pixel_Format,
+    }
+
+    _Pipeline_Settings :: struct {
+        multisample: wgpu.MultisampleState,
+        blend: wgpu.BlendState,
+        primitive: wgpu.PrimitiveState,
+    }
 
     _State :: struct {
         instance: wgpu.Instance,
@@ -33,10 +81,10 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         curr_depth_stencil_state: Depth_Stencil_State,
         uniform_offset_align: u32,
 
-        settings: Pipeline_Settings, 
+        settings: _Pipeline_Settings, 
     }
 
-    DEFAULT_PIPELINE_SETTINGS :: Pipeline_Settings {
+    DEFAULT_PIPELINE_SETTINGS :: _Pipeline_Settings {
         multisample = {
             count = 1,
             mask = 0xFFFFFFFF,
@@ -57,61 +105,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             topology = .TriangleList,
             cullMode = .None,
             frontFace = .CCW,
-        }
-    }
-
-    _Shader :: struct {
-        module: wgpu.ShaderModule,
-    }
-
-    _ptr :: struct {
-        buffer: wgpu.Buffer,
-        offset: uint, // Byte offset of this view into `buffer` (0 for top-level allocations)
-        capacity: uint, // Capacity of the ptr, NOT the buffer
-        index_bytes: u8,
-        is_mapped: bool,
-        binding_type: wgpu.BufferBindingType, // .Uniform for .GPU_Constant, .ReadOnlyStorage otherwise
-    }
-
-    _Texture :: struct {
-        using _ : struct #raw_union {
-            surface_texture: wgpu.SurfaceTexture,
-            texture: wgpu.Texture,
-        },
-        view:   wgpu.TextureView,
-        access: wgpu.StorageTextureAccess,
-    }
-
-    _copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
-        destination := wgpu.TexelCopyTextureInfo {
-            texture  = texture.native.texture,
-            mipLevel = level,
-            origin   = wgpu.Origin3D { u32(origin.x), u32(origin.y), u32(origin.z) },
-            aspect   = .All,
-        }
-        layout := wgpu.TexelCopyBufferLayout {
-            offset       = 0,
-            bytesPerRow  = bytes_per_row,
-            rowsPerImage = u32(size.y),
-        }
-        write_size := wgpu.Extent3D {
-            width              = u32(size.x),
-            height             = u32(size.y),
-            depthOrArrayLayers = u32(size.z),
-        }
-        data_size := uint(bytes_per_row) * uint(size.y) * uint(max(size.z, 1))
-
-        wgpu.QueueWriteTexture(_state.queue, &destination, data, data_size, &layout, &write_size)
-    }
-
-
-    _resize_depth_texture :: proc(width, height: u32) {
-        if _state.depth_texture.native.view == nil {
-            _state.depth_texture = texture_depth_init({width, height}, .Depth32Float)    
-        } else {
-            wgpu.TextureViewRelease(_state.depth_texture.native.view)
-            wgpu.TextureRelease(_state.depth_texture.native.texture)
-            _state.depth_texture = texture_depth_init({width, height}, .Depth32Float)    
         }
     }
 
@@ -158,13 +151,15 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
                 panic("Failed to get limits")
             }
 
-
-
             _state.uniform_offset_align = limits.minUniformBufferOffsetAlignment
             _state.settings = DEFAULT_PIPELINE_SETTINGS
 
             _state.is_init = true
         }
+    }
+
+    _deinit :: proc() {
+
     }
 
     _resize_swapchain :: proc(width, height: u32) -> bool {
@@ -186,8 +181,116 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         return true
     }
 
-    _deinit :: proc() {
+    _resize_depth_texture :: proc(width, height: u32) {
+        if _state.depth_texture.native.view == nil {
+            _state.depth_texture = texture_depth_init({width, height}, .Depth32Float)    
+        } else {
+            wgpu.TextureViewRelease(_state.depth_texture.native.view)
+            wgpu.TextureRelease(_state.depth_texture.native.texture)
+            _state.depth_texture = texture_depth_init({width, height}, .Depth32Float)    
+        }
+    }
 
+    _copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
+        destination := wgpu.TexelCopyTextureInfo {
+            texture  = texture.native.texture,
+            mipLevel = level,
+            origin   = wgpu.Origin3D { u32(origin.x), u32(origin.y), u32(origin.z) },
+            aspect   = .All,
+        }
+        layout := wgpu.TexelCopyBufferLayout {
+            offset       = 0,
+            bytesPerRow  = bytes_per_row,
+            rowsPerImage = u32(size.y),
+        }
+        write_size := wgpu.Extent3D {
+            width              = u32(size.x),
+            height             = u32(size.y),
+            depthOrArrayLayers = u32(size.z),
+        }
+        data_size := uint(bytes_per_row) * uint(size.y) * uint(max(size.z, 1))
+
+        wgpu.QueueWriteTexture(_state.queue, &destination, data, data_size, &layout, &write_size)
+    }
+
+    _depth_stencil_state_init :: proc(depth_descriptor: Depth_Stencil_State_Descriptor) -> _Depth_Stencil_State {
+        optional_bool: wgpu.OptionalBool
+        switch depth_descriptor.write_enabled {
+        case true:
+            optional_bool = .True
+        case false:
+            optional_bool = .False
+        }
+
+        dpso: wgpu.DepthStencilState
+        dpso.depthWriteEnabled = optional_bool
+        dpso.depthCompare = _compare_function_interop(depth_descriptor.compare)
+
+        return dpso
+    }
+
+    _shader_init :: proc(name: string, code: []u8) -> _Shader {
+        module := wgpu.DeviceCreateShaderModule(_state.device, &{
+            nextInChain = &wgpu.ShaderSourceWGSL {
+                sType = .ShaderSourceWGSL,
+                code = string(code),
+            }
+        })
+
+        result := _Shader {
+            module = module,
+        }
+
+        return result
+    }
+
+    _pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> _Pipeline {
+        result := _Pipeline {
+            vertex_shader = vertex.shader,
+            vertex_function = strings.clone(vertex.entry_point),
+            fragment_shader = fragment.shader,
+            fragment_function = strings.clone(fragment.entry_point),
+            color_format = pipeline_descriptor.color_format,
+            depth_format = pipeline_descriptor.depth_format,
+        }
+
+        return result
+    }
+
+    _compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> _Compute_Pipeline {
+        return _Compute_Pipeline {
+            shader = shader,
+            entry  = strings.clone(entry_point),
+        }
+    }
+
+    _begin_commands :: proc() {
+        _state.command_encoder = wgpu.DeviceCreateCommandEncoder(_state.device, nil)
+    }
+
+    _commit_commands :: proc() {
+        finished := wgpu.CommandEncoderFinish(_state.command_encoder, nil)
+        defer {
+            wgpu.CommandBufferRelease(finished)
+            wgpu.CommandEncoderRelease(_state.command_encoder)
+        }
+        wgpu.QueueSubmit(_state.queue, []wgpu.CommandBuffer{finished})
+    }
+
+    _begin_frame :: proc() {
+        _begin_commands()
+    }
+
+    _end_frame :: proc() {
+        finished := wgpu.CommandEncoderFinish(_state.command_encoder, nil)
+        defer {
+            wgpu.CommandBufferRelease(finished)
+            wgpu.CommandEncoderRelease(_state.command_encoder)
+        }
+        wgpu.QueueSubmit(_state.queue, []wgpu.CommandBuffer{finished})
+        _state.command_encoder = nil
+    
+        wgpu.SurfacePresent(_state.surface)
     }
 
     _acquire_next_swapchain :: proc() -> _Texture {
@@ -216,26 +319,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
 
         return result
-    }
-
-    //////////////////////////////////////////////////////////////
-    // Render primitive initialization
-    _Compute_Pipeline :: struct {
-        shader: Shader,
-        entry: string,
-    }
-
-    _compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> _Compute_Pipeline {
-        return _Compute_Pipeline {
-            shader = shader,
-            entry  = strings.clone(entry_point),
-        }
-    }
-    _compute_pass_encoder :: proc() -> wgpu.ComputePassEncoder {
-        if _state.compute_pass_encoder == nil {
-            _state.compute_pass_encoder = wgpu.CommandEncoderBeginComputePass(_state.command_encoder, nil)
-        }
-        return _state.compute_pass_encoder
     }
 
     _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
@@ -283,246 +366,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         _state.curr_compute_pipeline = pipeline
     }
 
-    _shader_init :: proc(name: string, code: []u8) -> _Shader {
-        module := wgpu.DeviceCreateShaderModule(_state.device, &{
-            nextInChain = &wgpu.ShaderSourceWGSL {
-                sType = .ShaderSourceWGSL,
-                code = string(code),
-            }
-        })
-
-        result := _Shader {
-            module = module,
-        }
-
-        return result
-    }
-
-    _Pipeline :: struct {
-        vertex_shader: Shader,
-        vertex_function: string,
-        fragment_shader: Shader,
-        fragment_function: string,
-        
-        color_format: Pixel_Format,
-        depth_format: Pixel_Format,
-    }
-
-    Pipeline_Settings :: struct {
-        multisample: wgpu.MultisampleState,
-        blend: wgpu.BlendState,
-        primitive: wgpu.PrimitiveState,
-    }
-
-    _pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> _Pipeline {
-
-        result := _Pipeline {
-            vertex_shader = vertex.shader,
-            vertex_function = strings.clone(vertex.entry_point),
-            fragment_shader = fragment.shader,
-            fragment_function = strings.clone(fragment.entry_point),
-            color_format = pipeline_descriptor.color_format,
-            depth_format = pipeline_descriptor.depth_format,
-        }
-
-        return result
-    }
-
-    //////////////////////////////////////////////////////////////
-    // Render loop commands
-
-    _begin_commands :: proc() {
-        _state.command_encoder = wgpu.DeviceCreateCommandEncoder(_state.device, nil)
-    }
-
-    _begin_frame :: proc() {
-        _begin_commands()
-    }
-
-    _semaphore :: proc(value: u64) -> Semaphore {
-        /* no op */
-        return {}
-    }
-
-    _semaphore_wait :: proc(semaphore: Semaphore, value: u64) -> bool {
-        /* no op */
-        return true
-    }
-
-    _end_frame :: proc() {
-        finished := wgpu.CommandEncoderFinish(_state.command_encoder, nil)
-        defer {
-            wgpu.CommandBufferRelease(finished)
-            wgpu.CommandEncoderRelease(_state.command_encoder)
-        }
-        wgpu.QueueSubmit(_state.queue, []wgpu.CommandBuffer{finished})
-        _state.command_encoder = nil
-    
-        wgpu.SurfacePresent(_state.surface)
-    }
-
-    _set_front_face_winding :: proc(winding: Front_Face) {
-        
-    }
-
-    _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_Attachment) {
-
-        res: wgpu.RenderPassColorAttachment
-        res.view = c_attachment.texture.view
-        res.storeOp = _store_action_interop(c_attachment.store_action)
-        res.loadOp = _load_action_interop(c_attachment.load_action)
-        res.clearValue = from_4xu8_to_4xf64_color(c_attachment.clear_color)
-        res.depthSlice = wgpu.DEPTH_SLICE_UNDEFINED
-
-        depth: wgpu.RenderPassDepthStencilAttachment
-        if d_attachment.texture.native.view != nil {
-            depth.view = d_attachment.texture.native.view
-            depth.depthClearValue = 1
-            depth.depthLoadOp = _load_action_interop(d_attachment.load_action)
-            depth.depthStoreOp = _store_action_interop(d_attachment.store_action)
-        }
-        
-	// depthClearValue: f32,
-	// depthReadOnly: b32,
-	// stencilLoadOp: LoadOp,
-	// stencilStoreOp: StoreOp,
-	// stencilClearValue: u32,
-	// stencilReadOnly: b32,
-
-        desc := wgpu.RenderPassDescriptor {
-            colorAttachmentCount = 1,
-            colorAttachments = &res,
-            depthStencilAttachment = nil if d_attachment.texture.native.view == nil else &depth,
-        }
-
-        _state.render_pass_encoder = wgpu.CommandEncoderBeginRenderPass(_state.command_encoder, &desc)
-    }
-
-    _end_render_pass :: proc() {
-        wgpu.RenderPassEncoderEnd(_state.render_pass_encoder)
-        wgpu.RenderPassEncoderRelease(_state.render_pass_encoder)
-    }
-
     _set_pipeline :: proc(pipeline: Pipeline) {
         _state.curr_pipeline = pipeline
-    }
-
-    _set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
-        _state.curr_depth_stencil_state = depth_stencil_state
-    }
-
-    _set_cull_mode :: proc(cull_mode: Cull_Mode) {
-    }
-
-
-    _Depth_Stencil_State :: wgpu.DepthStencilState
-
-    _compare_function_interop :: proc(compare: Compare_Function) -> wgpu.CompareFunction {
-        switch compare {
-        case .Never:
-            return .Never
-        case .Less:
-            return .Less
-        case .Equal:
-            return .Equal
-        case .LessEqual:
-            return .LessEqual
-        case .Greater:
-            return .Greater
-        case .NotEqual:
-            return .NotEqual
-        case .GreaterEqual:
-            return .GreaterEqual
-        case .Always:
-            return .Always
-        }
-        unreachable()
-    }
-
-    _texture_type_interop :: proc(texture_type: Texture_Type) -> wgpu.TextureDimension {
-        switch texture_type {
-        case ._2D:
-            return ._2D
-        }
-        unreachable()
-    }
-
-    _texture_usage_interop :: proc(usage: Texture_Usage, storage: StorageMode) -> wgpu.TextureUsageFlags {
-        flags: wgpu.TextureUsageFlags
-        if .Sampled          in usage { flags += {.TextureBinding} }
-        if .Read             in usage { flags += {.StorageBinding} }
-        if .Write            in usage { flags += {.StorageBinding} }
-        if .Color_Attachment in usage { flags += {.RenderAttachment, .TextureBinding} }
-        if .Depth_Attachment in usage { flags += {.RenderAttachment} }
-        if storage == .Shared && (.Sampled in usage || .Read in usage || .Write in usage) {
-            flags += {.CopyDst}
-        }
-        return flags
-    }
-
-    _texture_access_interop :: proc(usage: Texture_Usage) -> wgpu.StorageTextureAccess {
-        read  := .Read in usage
-        write := .Write in usage
-        switch {
-        case read && write:  return .ReadWrite
-        case write:          return .WriteOnly
-        case read:           return .ReadOnly
-        }
-        return .WriteOnly
-    }
-    
-    _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
-        desc: wgpu.TextureDescriptor
-        desc.size = {texture_descriptor.dimensions.x, texture_descriptor.dimensions.y, 1}
-        desc.mipLevelCount = 1
-        desc.sampleCount = 1
-        desc.dimension = _texture_type_interop(texture_descriptor.type)
-        desc.format = _pixel_format_interop(texture_descriptor.format)
-        desc.usage = _texture_usage_interop(texture_descriptor.usage, texture_descriptor.storage)
-
-        texture := wgpu.DeviceCreateTexture(_state.device, &desc)
-        if texture == nil {
-            log.panic("gpu_wgpu.odin: MTL_texture_init: failed to create texture")
-        }
-
-        view := wgpu.TextureCreateView(texture, nil)
-
-        return _Texture {
-            texture = texture,
-            view = view,
-            access = _texture_access_interop(texture_descriptor.usage),
-        }
-    }
-
-    _depth_stencil_state_init :: proc(depth_descriptor: Depth_Stencil_State_Descriptor) -> _Depth_Stencil_State {
-//         DepthStencilState :: struct {
-// 	nextInChain: ^ChainedStruct,
-// 	format: TextureFormat,
-// 	stencilFront: StencilFaceState,
-// 	stencilBack: StencilFaceState,
-// 	stencilReadMask: u32,
-// 	stencilWriteMask: u32,
-// 	depthBias: i32,
-// 	depthBiasSlopeScale: f32,
-// 	depthBiasClamp: f32,
-// }
-        optional_bool: wgpu.OptionalBool
-        switch depth_descriptor.write_enabled {
-        case true:
-            optional_bool = .True
-        case false:
-            optional_bool = .False
-        }
-
-        dpso: wgpu.DepthStencilState
-        dpso.depthWriteEnabled = optional_bool
-        dpso.depthCompare = _compare_function_interop(depth_descriptor.compare)
-
-        return dpso
-    }
-
-    _Sampler :: struct {
-        s: wgpu.Sampler,
     }
 
     _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
@@ -569,6 +414,70 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         return _Sampler {
             s = sampler,
         }
+    }
+
+    _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
+        desc: wgpu.TextureDescriptor
+        desc.size = {texture_descriptor.dimensions.x, texture_descriptor.dimensions.y, 1}
+        desc.mipLevelCount = 1
+        desc.sampleCount = 1
+        desc.dimension = _texture_type_interop(texture_descriptor.type)
+        desc.format = _pixel_format_interop(texture_descriptor.format)
+        desc.usage = _texture_usage_interop(texture_descriptor.usage, texture_descriptor.storage)
+
+        texture := wgpu.DeviceCreateTexture(_state.device, &desc)
+        if texture == nil {
+            log.panic("gpu_wgpu.odin: MTL_texture_init: failed to create texture")
+        }
+
+        view := wgpu.TextureCreateView(texture, nil)
+
+        return _Texture {
+            texture = texture,
+            view = view,
+            access = _texture_access_interop(texture_descriptor.usage),
+        }
+    }
+
+    _set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
+        _state.curr_depth_stencil_state = depth_stencil_state
+    }
+
+    _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_Attachment) {
+
+        res: wgpu.RenderPassColorAttachment
+        res.view = c_attachment.texture.view
+        res.storeOp = _store_action_interop(c_attachment.store_action)
+        res.loadOp = _load_action_interop(c_attachment.load_action)
+        res.clearValue = from_4xu8_to_4xf64_color(c_attachment.clear_color)
+        res.depthSlice = wgpu.DEPTH_SLICE_UNDEFINED
+
+        depth: wgpu.RenderPassDepthStencilAttachment
+        if d_attachment.texture.native.view != nil {
+            depth.view = d_attachment.texture.native.view
+            depth.depthClearValue = 1
+            depth.depthLoadOp = _load_action_interop(d_attachment.load_action)
+            depth.depthStoreOp = _store_action_interop(d_attachment.store_action)
+        }
+
+        desc := wgpu.RenderPassDescriptor {
+            colorAttachmentCount = 1,
+            colorAttachments = &res,
+            depthStencilAttachment = nil if d_attachment.texture.native.view == nil else &depth,
+        }
+
+        _state.render_pass_encoder = wgpu.CommandEncoderBeginRenderPass(_state.command_encoder, &desc)
+    }
+
+    _end_render_pass :: proc() {
+        wgpu.RenderPassEncoderEnd(_state.render_pass_encoder)
+        wgpu.RenderPassEncoderRelease(_state.render_pass_encoder)
+    }
+
+    _set_cull_mode :: proc(cull_mode: Cull_Mode) {
+    }
+
+    _set_front_face_winding :: proc(winding: Front_Face) {   
     }
 
     _draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {    
@@ -657,9 +566,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         )
     }
 
-    //////////////////////////////////////////////////////////////
-    // Memory
-
     _malloc :: proc(
         type: Buffer_Type,
         #any_int el_count: uint,
@@ -670,30 +576,24 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         bytes := runtime.align_forward_uint(el_count * el_size, alignment)
 
         usage: wgpu.BufferUsageFlags
-        mapped: b32
         binding_type: wgpu.BufferBindingType
 
         switch type {
         case .Staging:
             usage  = {.CopySrc, .MapWrite}
-            mapped = true
             binding_type = .ReadOnlyStorage
         case .GPU_Storage:
             usage  = {.CopyDst, .Storage}
-            mapped = false
             binding_type = .ReadOnlyStorage
         case .GPU_Constant:
             usage  = {.CopyDst, .Uniform}
-            mapped = false
             binding_type = .Uniform
             bytes = max(bytes, uint(_state.uniform_offset_align))
         case .GPU_Index:
             usage  = {.CopyDst, .Index}
-            mapped = false
             binding_type = .ReadOnlyStorage
         case .Readback:
             usage  = {.CopyDst, .MapRead}
-            mapped = false
             binding_type = .ReadOnlyStorage
         }
 
@@ -701,13 +601,13 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             label = name,
             usage = usage,
             size = u64(bytes),
-            mappedAtCreation = mapped,
+            mappedAtCreation = type == .Staging,
         })
 
         return _ptr {
             buffer = buffer,
             offset = 0,
-            is_mapped = bool(mapped),
+            is_mapped = bool(type == .Staging),
             capacity = uint(bytes),
             binding_type = binding_type,
             index_bytes = u8(el_size) if type == .GPU_Index else 0,
@@ -723,31 +623,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         ptr.is_mapped = false
     }
 
-    _sub_alloc :: proc(parent: ptr, offset, length: uint) -> ptr {
-        result := parent
-        result.cpu      = rawptr(uintptr(parent.cpu) + uintptr(offset))
-        result.gpu      = rawptr(uintptr(parent.gpu) + uintptr(offset))
-        result.offset   = offset
-        result.capacity = length
-
-        return result
-    }
-
-    _map :: proc(ptr: ^_ptr) -> (cpu: rawptr, gpu: rawptr) {
-        cpu = wgpu.RawBufferGetMappedRange(ptr.buffer, 0, ptr.capacity)
-        gpu = nil
-        ptr.is_mapped = true
-        return
-    }
-
-    _mapped :: proc(ptr: ptr) -> bool {
-        return ptr.is_mapped
-    }
-
-    _gpu_address :: proc(p: _ptr) -> rawptr {
-        return nil
-    }
-
     _copy :: proc(dst, src: ptr) {
         wgpu.CommandEncoderCopyBufferToBuffer(
             _state.command_encoder,
@@ -759,8 +634,18 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         )
     }
 
-    //////////////////////////////////////////////////////////////
-    // Arena
+    _cpu_address :: proc(p: _ptr) -> rawptr {
+        assert(p.is_mapped)
+        return wgpu.RawBufferGetMappedRange(p.buffer, 0, p.capacity)
+    }
+
+    _gpu_address :: proc(p: _ptr) -> rawptr {
+        return nil
+    }
+
+    _mapped :: proc(ptr: ptr) -> bool {
+        return ptr.is_mapped
+    }
 
     _frame_arena :: proc() -> ^Arena {
         if len(_state.frame_arenas) == 0 {
@@ -769,7 +654,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             return new_arena
         } else {
             arena := pop(&_state.frame_arenas)
-            arena.ptr.cpu, arena.ptr.gpu = _map(&arena.ptr.native)
+            arena.ptr.is_mapped = true
+            arena.ptr.cpu = _cpu_address(arena.ptr.native)
             arena.offset = 0
             return arena
         }
@@ -797,62 +683,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         })
     }
 
-    //////////////////////////////////////////////////////////////
-    // Synchronization
-
-    _commit_commands :: proc() {
-        finished := wgpu.CommandEncoderFinish(_state.command_encoder, nil)
-        defer {
-            wgpu.CommandBufferRelease(finished)
-            wgpu.CommandEncoderRelease(_state.command_encoder)
-        }
-        wgpu.QueueSubmit(_state.queue, []wgpu.CommandBuffer{finished})
-    }
-
-    _barrier :: proc(before: Stage, after: Stage) { /* no op */ }
-
-    //////////////////////////////////////////////////////////////
-    // Type interop
-
-    _pixel_format_interop :: proc(format: Pixel_Format) -> wgpu.TextureFormat {
-        switch format {
-        case .None:
-            return .Undefined
-        case .BGRA8Unorm:
-            return .BGRA8Unorm
-        case .RGBA8Unorm:
-            return .RGBA8Unorm
-        case .RGBA32Float:
-            return .RGBA32Float
-        case .Depth32Float:
-            return .Depth32Float
-        }
-        unreachable()
-    }
-
-    _store_action_interop :: proc(action: Store_Action) -> wgpu.StoreOp {
-        switch action {
-        case .Dont_Care:
-            return .Undefined
-        case .Store:
-            return .Store
-        }
-        unreachable()
-    }
-
-    _load_action_interop :: proc(action: Load_Action) -> wgpu.LoadOp {
-        switch action {
-        case .Dont_Care:
-            return .Undefined
-        case .Clear:
-            return .Clear
-        case .Load:
-            return .Load
-        }
-        unreachable()
-    }
-
-    _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Destination) {
+    _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {
         bg_layout_entries := &_state.bg_layout_entries
         bg_entries := &_state.bg_entries
         count: u32
@@ -990,6 +821,122 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
 
         _state.parameter_count = count
+    }
+
+    _barrier :: proc(before: Stage, after: Stage) { /* no op */ }
+
+    _semaphore :: proc(value: u64) -> Semaphore {
+        /* no op */
+        return {}
+    }
+
+    _semaphore_wait :: proc(semaphore: Semaphore, value: u64) -> bool {
+        /* no op */
+        return true
+    }
+
+    //////////////////////////////////////////////////////////////
+
+    _compute_pass_encoder :: proc() -> wgpu.ComputePassEncoder {
+        if _state.compute_pass_encoder == nil {
+            _state.compute_pass_encoder = wgpu.CommandEncoderBeginComputePass(_state.command_encoder, nil)
+        }
+        return _state.compute_pass_encoder
+    }
+
+    //////////////////////////////////////////////////////////////
+    // Interop
+
+    _compare_function_interop :: proc(compare: Compare_Function) -> wgpu.CompareFunction {
+        switch compare {
+        case .Never:
+            return .Never
+        case .Less:
+            return .Less
+        case .Equal:
+            return .Equal
+        case .LessEqual:
+            return .LessEqual
+        case .Greater:
+            return .Greater
+        case .NotEqual:
+            return .NotEqual
+        case .GreaterEqual:
+            return .GreaterEqual
+        case .Always:
+            return .Always
+        }
+        unreachable()
+    }
+
+    _texture_type_interop :: proc(texture_type: Texture_Type) -> wgpu.TextureDimension {
+        switch texture_type {
+        case ._2D:
+            return ._2D
+        }
+        unreachable()
+    }
+
+    _texture_usage_interop :: proc(usage: Texture_Usage, storage: StorageMode) -> wgpu.TextureUsageFlags {
+        flags: wgpu.TextureUsageFlags
+        if .Sampled          in usage { flags += {.TextureBinding} }
+        if .Read             in usage { flags += {.StorageBinding} }
+        if .Write            in usage { flags += {.StorageBinding} }
+        if .Color_Attachment in usage { flags += {.RenderAttachment, .TextureBinding} }
+        if .Depth_Attachment in usage { flags += {.RenderAttachment} }
+        if storage == .Shared && (.Sampled in usage || .Read in usage || .Write in usage) {
+            flags += {.CopyDst}
+        }
+        return flags
+    }
+
+    _texture_access_interop :: proc(usage: Texture_Usage) -> wgpu.StorageTextureAccess {
+        read  := .Read in usage
+        write := .Write in usage
+        switch {
+        case read && write:  return .ReadWrite
+        case write:          return .WriteOnly
+        case read:           return .ReadOnly
+        }
+        return .WriteOnly
+    }
+    
+    _pixel_format_interop :: proc(format: Pixel_Format) -> wgpu.TextureFormat {
+        switch format {
+        case .None:
+            return .Undefined
+        case .BGRA8Unorm:
+            return .BGRA8Unorm
+        case .RGBA8Unorm:
+            return .RGBA8Unorm
+        case .RGBA32Float:
+            return .RGBA32Float
+        case .Depth32Float:
+            return .Depth32Float
+        }
+        unreachable()
+    }
+
+    _store_action_interop :: proc(action: Store_Action) -> wgpu.StoreOp {
+        switch action {
+        case .Dont_Care:
+            return .Undefined
+        case .Store:
+            return .Store
+        }
+        unreachable()
+    }
+
+    _load_action_interop :: proc(action: Load_Action) -> wgpu.LoadOp {
+        switch action {
+        case .Dont_Care:
+            return .Undefined
+        case .Clear:
+            return .Clear
+        case .Load:
+            return .Load
+        }
+        unreachable()
     }
 
 }
