@@ -28,6 +28,8 @@ else {
 FRAMES_IN_FLIGHT :: 3
 FRAME_ARENA_SIZE :: 4 * 1024 * 1024
 
+MIN_ALIGNMENT :: 4 // To respect wgpu
+
 // Limits based of WGSL https://www.w3.org/TR/WGSL/#limits
 __MAX_CONSTANT_BUFFERS     :: 12 // Seperate limit from MAX_BUFFERS
 __MAX_BUFFERS              :: 8  // 8 in total between read + read_write
@@ -536,10 +538,11 @@ malloc :: proc(
     type:        Buffer_Type,
     el_count:    int,
     el_size:     int        = 1,
-    alignment:   int        = 1,
+    alignment:   int        = 16,
     name:        string     = "",
     loc:                    = #caller_location,
 ) -> ptr {
+    assert(alignment >= MIN_ALIGNMENT, fmt.tprintf("GPU arena_alloc_raw: alignment too small: %v, extend to %v", alignment, MIN_ALIGNMENT))
     _ptr := _malloc(type, el_count, el_size, alignment, name)
 
     if type == .Staging {
@@ -594,15 +597,18 @@ copy :: proc(dst, src: ptr) {
 }
 
 // Linear bump arena that allocates staging buffer. Helps if multiple types of staging data is needed to be copied simultaneously.
-arena :: proc(
-    #any_int size: uint      = 4 * 1024 * 1024,
+arena_init :: proc(
+    #any_int el_size: uint   = 4 * 1024 * 1024,
+    #any_int el_count: uint  = 1,
     #any_int alignment: uint = 16,
-    loc:                     = #caller_location
+    loc:                     = #caller_location,
+    usage: Buffer_Type       = .Staging,
 ) -> Arena {
     arena: Arena
 
-    bytes := runtime.align_forward_uint(size, alignment)
-    _ptr := _malloc(.Staging, 1, bytes, alignment, "ARENA")
+    assert(alignment >= MIN_ALIGNMENT, fmt.tprintf("GPU arena_alloc_raw: alignment too small: %v, extend to %v", alignment, MIN_ALIGNMENT))
+    bytes := runtime.align_forward_uint(el_size * el_count, alignment)
+    _ptr := _malloc(usage, el_count, el_size, alignment, "ARENA")
 
     arena.ptr = {
         meta = Metadata {
@@ -610,7 +616,7 @@ arena :: proc(
             created_at = loc,
         },
         native = _ptr,
-        cpu = _cpu_address(_ptr),
+        cpu = _cpu_address(_ptr) if usage == .Staging else nil,
         gpu = _gpu_address(_ptr),
     }
     arena.offset = 0
@@ -620,14 +626,14 @@ arena :: proc(
 }
 
 // Returns ptr with correct field values.
-arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, alignment: uint) -> ptr {
-    assert(_mapped(arena.ptr))
-    assert(arena.ptr.cpu != nil)
+arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, alignment: uint, loc := #caller_location) -> ptr {
+    // assert(_mapped(arena.ptr)) IF staging buffer
+    assert(alignment >= MIN_ALIGNMENT, fmt.tprintf("GPU arena_alloc_raw: alignment too small: %v, extend to %v", alignment, MIN_ALIGNMENT), loc)
     bytes := el_size * el_count
     assert(bytes >= 0 && alignment > 0)
     bytes_aligned := runtime.align_forward_uint(uint(bytes), uint(alignment))
 
-    if uintptr(arena.ptr.cpu) % uintptr(alignment) != uintptr(arena.ptr.gpu) % uintptr(alignment) {
+    if arena.ptr.cpu != nil && uintptr(arena.ptr.cpu) % uintptr(alignment) != uintptr(arena.ptr.gpu) % uintptr(alignment) {
         panic("Could not satisfy alignment requirements in GPU arena allocation.")
     }
 
@@ -643,6 +649,18 @@ arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, alignment: uint) -> pt
     return ptr
 }
 
+// Helper for arena alloc
+arena_alloc :: proc(arena: ^Arena, $T: typeid, el_count: uint = 1, loc := #caller_location) -> ptr {
+    // assert(_mapped(arena.ptr)) IF staging buffer
+    temp := arena_alloc_raw(arena, size_of(T), el_count, align_of(T), loc)
+
+    // NOTE add typed return?
+    // []T from aligned offset before bytes are added in
+    // s := slice.from_ptr((^T)(temp.cpu), int(el_count))
+    
+    return temp
+}
+
 sub_alloc :: proc(parent: ptr, offset, length: uint) -> ptr {
     result := parent
     result.cpu      = rawptr(uintptr(parent.cpu) + uintptr(offset))
@@ -651,18 +669,6 @@ sub_alloc :: proc(parent: ptr, offset, length: uint) -> ptr {
     result.capacity = length
 
     return result
-}
-
-// Helper for arena alloc
-arena_alloc :: proc(arena: ^Arena, $T: typeid, el_count: uint = 1) -> ptr {
-    assert(_mapped(arena.ptr))
-    temp := arena_alloc_raw(arena, size_of(T), el_count, align_of(T))
-
-    // NOTE add typed return?
-    // []T from aligned offset before bytes are added in
-    // s := slice.from_ptr((^T)(temp.cpu), int(el_count))
-    
-    return temp
 }
 
 // Same as arena() with automatic recycling after use. Always get mapped buffer for render frame.
