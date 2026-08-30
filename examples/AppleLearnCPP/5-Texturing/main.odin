@@ -102,7 +102,7 @@ when ODIN_OS == .JS {
 
     gpu.copy_to_texture(state.texture, {}, {TW, TH, 1}, 0, raw_data(pixels), TW * 4)
 
-    upload := gpu.arena()
+    upload := gpu.arena_init()
     //defer nuppu.gpu_arena_deinit(&upload_arena)
 
     s :: f32(0.5)

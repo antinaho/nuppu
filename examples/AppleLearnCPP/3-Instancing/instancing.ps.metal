@@ -17,11 +17,11 @@ struct pixelInput_0
 };
 
 
-#line 42
+#line 69
 [[fragment]] pixelOutput_0 fragmentMain(pixelInput_0 _S1 [[stage_in]], float4 position_0 [[position]])
 {
 
-#line 42
+#line 69
     pixelOutput_0 _S2 = { float4(_S1.color_0, 1.0f) };
     return _S2;
 }

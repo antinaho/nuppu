@@ -9,13 +9,7 @@ import "core:slice"
 State :: struct {
     pso: gpu.Pipeline,
 
-    index_gpu: gpu.ptr,
-    vertices: gpu.ptr,
-}
-
-Vertex :: struct #align(16) {
-    pos: [4]f32,
-    color: [4]f32,
+    mesh: nuppu.Mesh,
 }
 
 state: ^State
@@ -51,28 +45,30 @@ when ODIN_OS == .JS {
     NUM_VERTICES :: 3
 
     // Allocates single CPU writable buffer for staging
-    upload := gpu.arena()
+    upload := gpu.arena_init()
     //defer gpu.destroy_arena(&upload)
 
     // Moves upload scope's offset and returns CPU modifiable slice to put data into
-    vertices := gpu.arena_alloc(&upload, Vertex, NUM_VERTICES)
-    mem.copy_non_overlapping(vertices.cpu, &[NUM_VERTICES]Vertex{
-        { pos = { -0.8,  0.8, 0.0, 1.0 }, color = { 1, 0, 0, 1 } },
-        { pos = {  0.0, -0.8, 0.0, 1.0 }, color = { 0, 1, 0, 1 } },
-        { pos = { +0.8,  0.8, 0.0, 1.0 }, color = { 0, 0, 1, 1 } },
-    }, NUM_VERTICES * size_of(Vertex))
+    vertices := gpu.arena_alloc(&upload, nuppu.Vertex, NUM_VERTICES)
+    mem.copy_non_overlapping(vertices.cpu, &[NUM_VERTICES]nuppu.Vertex{
+        nuppu.pack_vertex( position = { -0.8, +0.8, 0.0 }, color = { 255, 0, 0, 255 }),
+        nuppu.pack_vertex( position = {  0.0, -0.8, 0.0 }, color = { 0, 255, 0, 255 }),
+        nuppu.pack_vertex( position = { +0.8, +0.8, 0.0 }, color = { 0, 0, 255, 255 }),
+    }, NUM_VERTICES * size_of(nuppu.Vertex))
 
-    indices := gpu.arena_alloc(&upload, u32, NUM_VERTICES)
-    mem.copy_non_overlapping(indices.cpu, &[NUM_VERTICES]u32{ 0, 1, 2 }, NUM_VERTICES * size_of(u32))
+    indices := gpu.arena_alloc_raw(&upload, size_of(nuppu.Vertex_Index), NUM_VERTICES, 4)
+    mem.copy_non_overlapping(indices.cpu, &[NUM_VERTICES]nuppu.Vertex_Index{ 0, 1, 2 }, NUM_VERTICES * size_of(nuppu.Vertex_Index))
 
     gpu.unmap(&upload.ptr)
 
-    state.vertices = gpu.malloc(.GPU_Storage, NUM_VERTICES, size_of(Vertex), align_of(Vertex), "Vertices buffer")
-    state.index_gpu = gpu.malloc_index(NUM_VERTICES, .Uint32, "Indices buffer")
+    state.mesh = nuppu.push_mesh_zeroed(
+        vertex_count = NUM_VERTICES,
+        index_count = NUM_VERTICES,
+    )
 
     gpu.begin_commands()
-    gpu.copy(state.vertices, vertices)
-    gpu.copy(state.index_gpu, indices)
+    gpu.copy(state.mesh.verts, vertices)
+    gpu.copy(state.mesh.indices, indices)
     gpu.barrier(.Transfer, .All)
     gpu.commit_commands()
     //
@@ -97,13 +93,14 @@ _render :: proc(previous, current: ^State, alpha: f32) {
 
     block := gpu.Parameter_Block {
         constants = {},
-        read_resources = {0 = current.vertices},
+        read_resources = {0 = current.mesh.verts},
         read_write_resources = {},
         samplers = {},
     }
+
     gpu.use_parameter_block(&block)
 
-    gpu.draw_indiced_primitives(.Triangle, current.index_gpu, 3, 0, 1, 0, 0)
+    gpu.draw_indiced_primitives(.Triangle, current.mesh.indices, current.mesh.index_count, 0, 1, 0, 0)
 
     gpu.end_render_pass()
 

@@ -4,8 +4,8 @@ struct v2f {
 };
 
 struct Vertex {
-    float4 position;
-    float4 color;
+    float4 position_uv;
+    uint4 color_normal;
 };
 
 struct VertexData {
@@ -14,13 +14,38 @@ struct VertexData {
 
 ParameterBlock<VertexData> data;
 
+float4 unpack_uint_to_float4_01(uint value)
+{
+    return float4(
+        float((value >> 0)  & 0xFF),
+        float((value >> 8)  & 0xFF),
+        float((value >> 16) & 0xFF),
+        float((value >> 24) & 0xFF)
+    ) * (1.0 / 255.0);
+}
+
+float unpack_u16(uint16_t value)
+{
+    return float(value) * (1.0 / 65535.0);
+}
+
 [shader("vertex")]
 v2f vertexMain(uint vertexID : SV_VertexID) {
     v2f o;
     Vertex v = data.verts[vertexID];
 
-    o.position = float4(v.position.xyz, 1.0);
-    o.color = v.color.xyz;
+    float3 position = v.position_uv.xyz;
+
+    float2 uv = float2(
+        unpack_u16( uint16_t( ( uint(v.position_uv.w) >> 0 ) & 0xFFFF ) ), 
+        unpack_u16( uint16_t( ( uint(v.position_uv.w) >> 16) & 0xFFFF ) )
+    );
+
+    float4 color = unpack_uint_to_float4_01(v.color_normal.x);
+    float3 normal = v.color_normal.yzw;
+
+    o.position = float4(v.position_uv.xyz, 1.0);
+    o.color = color.xyz;
     return o;
 }
 

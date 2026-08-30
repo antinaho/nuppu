@@ -100,7 +100,7 @@ when ODIN_OS == .JS {
     state.kernel = gpu.shader_init("my_compute_shader", compute_code)
     state.compute_pso = gpu.compute_pipeline_init(state.kernel, "mandelbrot_set")
 
-    upload := gpu.arena()
+    upload := gpu.arena_init()
     // defer nuppu.gpu_arena_deinit(&upload_arena)
 
     VERT_COUNT :: nuppu.UNIT_CUBE_VERTEX_COUNT

@@ -58,7 +58,7 @@ when ODIN_OS == .JS {
     NUM_VERTICES :: 3
 
     // Staging arena for one-time vertex upload + initial angle.
-    upload := gpu.arena()
+    upload := gpu.arena_init()
 
     vertices := gpu.arena_alloc(&upload, Vertex, NUM_VERTICES)
     mem.copy_non_overlapping(vertices.cpu, &[NUM_VERTICES]Vertex{

@@ -8,17 +8,11 @@ import "core:math"
 import "core:math/linalg"
 
 State :: struct {
-    vertex_gpu: gpu.ptr,
-    index_gpu: gpu.ptr,
     instance_gpu: gpu.ptr,
 
     angle: f32,
 
     pso: gpu.Pipeline,
-}
-
-Vertex :: struct #align(16) {
-    pos: [4]f32,
 }
 
 INSTANCE_COUNT :: 32
@@ -60,33 +54,8 @@ when ODIN_OS == .JS {
     NUM_VERTICES :: 4
     NUM_INDICES :: 6
     s :: 0.5
-//
-    upload := gpu.arena()
 
-    vertices := gpu.arena_alloc(&upload, Vertex, NUM_VERTICES)
-    mem.copy_non_overlapping(vertices.cpu, &[NUM_VERTICES]Vertex{
-        {{ -s, -s, +s, 1.0 }},
-        {{ +s, -s, +s, 1.0 }},
-        {{ +s, +s, +s, 1.0 }},
-        {{ -s, +s, +s, 1.0 }},    
-    }, NUM_VERTICES * size_of(Vertex))
-    
-    indices := gpu.arena_alloc(&upload, u32, NUM_INDICES)
-    mem.copy_non_overlapping(indices.cpu, &[NUM_INDICES]u32{
-        0, 1, 2, 2, 3, 0    
-    }, NUM_INDICES * size_of(u32))
-    
-    gpu.unmap(&upload.ptr)    
-//
-    state.vertex_gpu = gpu.malloc(.GPU_Storage, NUM_VERTICES, size_of(Vertex), align_of(Vertex), "Positions")
-    state.index_gpu = gpu.malloc_index(NUM_INDICES, .Uint32, "Indices")    
     state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance_Data), align_of(Instance_Data), "Instances")
-
-    gpu.begin_commands()
-    gpu.copy(state.vertex_gpu, vertices)
-    gpu.copy(state.index_gpu, indices)
-    gpu.barrier(.Transfer, .All)
-    gpu.commit_commands()
 }
 
 _update :: proc() {
@@ -131,7 +100,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     block := gpu.Parameter_Block {
         constants = {},
         read_resources = {
-            0 = current.vertex_gpu,
+            0 = nuppu.mesh.verts,
             1 = current.instance_gpu,
         },
         read_write_resources = {},
@@ -143,8 +112,8 @@ _render :: proc(previous, current: ^State, alpha: f32) {
 
     gpu.draw_indiced_primitives(
     .Triangle,
-    current.index_gpu,
-    6, 0,
+    nuppu.mesh.indices,
+    nuppu.mesh.index_count, 0,
     INSTANCE_COUNT,
     0, 0)
 

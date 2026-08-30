@@ -66,7 +66,7 @@ when ODIN_OS == .JS {
     
     state.depth_pso = gpu.depth_stencil_state_init({compare = .Less, write_enabled = true})
 
-    upload := gpu.arena()
+    upload := gpu.arena_init()
 
     s :: f32(0.5)
     VERT_COUNT :: 8
