@@ -1,14 +1,19 @@
 #+build darwin
+#+vet explicit-allocators shadowing unused
+
 package nuppu_gpu
 
 import MTL "vendor:darwin/Metal"
 import CA "vendor:darwin/QuartzCore"
 import NS "core:sys/darwin/Foundation"
-import "core:log"
 import "base:runtime"
 import "core:time"
 import "core:slice"
+import "core:log"
 import "core:fmt"
+
+_ :: log
+_ :: fmt
 
 when GPU_BACKEND == GPU_BACKEND_METAL {
 
@@ -74,9 +79,9 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         
         _state.queue = _state.device->newCommandQueue()
 
-        for i in 0 ..< FRAMES_IN_FLIGHT {
+        for _ in 0 ..< FRAMES_IN_FLIGHT {
             frame_arena := new(Arena, context.allocator)
-            frame_arena^ = arena()
+            frame_arena^ = arena_init()
             append(&_state.frame_arenas, frame_arena)
         }
 
@@ -466,16 +471,15 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {
         data := make([dynamic]uintptr, context.temp_allocator)
-        offset := 0
 
         if destination == .Graphics {
-            for C, idx in block.constants {
+            for C in block.constants {
                 if C.native.buffer == nil { continue }
                 _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex, .Fragment})
                 append(&data, uintptr(C.gpu))
             }
     
-            for R, idx in block.read_resources {
+            for R in block.read_resources {
                 switch res in R {
                 case ptr:
                     if res.native.buffer == nil { continue }
@@ -501,7 +505,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
                 }
             }
     
-            for S, idx in block.samplers {
+            for S in block.samplers {
                 if S.native == nil { continue }
                 append(&data, uintptr(S.native->gpuResourceID()))
             }
@@ -514,13 +518,13 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
             _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Fragment)
         } else {
             
-            for C, idx in block.constants {
+            for C in block.constants {
                 if C.native.buffer == nil { continue }
                 _compute_command_encoder()->useResource(C.native.buffer, {.Read})
                 append(&data, uintptr(C.gpu))
             }
     
-            for R, idx in block.read_resources {
+            for R in block.read_resources {
                 switch res in R {
                 case ptr:
                     if res.native.buffer == nil { continue }
@@ -546,7 +550,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
                 }
             }
     
-            for S, idx in block.samplers {
+            for S in block.samplers {
                 if S.native == nil { continue }
                 append(&data, uintptr(S.native->gpuResourceID()))
             }

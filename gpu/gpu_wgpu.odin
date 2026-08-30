@@ -1,4 +1,6 @@
 #+build js
+#+vet explicit-allocators shadowing unused
+
 package nuppu_gpu
 
 import "vendor:wgpu"
@@ -8,6 +10,30 @@ import "core:strings"
 import "base:runtime"
 
 when GPU_BACKEND == GPU_BACKEND_WGPU {
+
+    DEFAULT_PIPELINE_SETTINGS :: _Pipeline_Settings {
+        multisample = {
+            count = 1,
+            mask = 0xFFFFFFFF,
+        },
+        blend = {
+            alpha = {
+                srcFactor = .SrcAlpha,
+                dstFactor = .OneMinusSrcAlpha,
+                operation = .Add,
+            },
+            color = {
+                srcFactor = .SrcAlpha,
+                dstFactor = .OneMinusSrcAlpha,
+                operation = .Add,
+            },
+        },
+        primitive = {
+            topology = .TriangleList,
+            cullMode = .None,
+            frontFace = .CCW,
+        }
+    }
 
     _ptr :: struct {
         buffer: wgpu.Buffer,
@@ -58,6 +84,42 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         primitive: wgpu.PrimitiveState,
     }
 
+    MAX_BG_LAYOUT_CACHE_ENTRIES :: 32
+    MAX_PIPELINE_CACHE_ENTRIES  :: 32
+
+    // Captures the full description of a bind group layout: the entry count
+    // plus the entries themselves. Two signatures compare equal iff they
+    // describe identical layouts.
+    _BG_Layout_Signature :: struct {
+        count:   u32,
+        entries: [MAX_LAYOUT_BINDINGS]wgpu.BindGroupLayoutEntry,
+    }
+
+    _BG_Layout_Cache_Entry :: struct {
+        sig:             _BG_Layout_Signature,
+        layout:          wgpu.BindGroupLayout,
+        pipeline_layout: wgpu.PipelineLayout,
+    }
+
+    // Render pipeline cache key includes everything that affects the
+    // generated wgpu.RenderPipeline: the bind group layout, the pipeline
+    // descriptor (shaders, entry points, target formats), the depth stencil
+    // state, the pipeline settings, and the color write mask.
+    _Render_Pipeline_Cache_Entry :: struct {
+        bg_layout:     wgpu.BindGroupLayout,
+        meta:          Pipeline,
+        depth_stencil: wgpu.DepthStencilState,
+        settings:      _Pipeline_Settings,
+        write_mask:    wgpu.ColorWriteMaskFlags,
+        pipeline:      wgpu.RenderPipeline,
+    }
+
+    _Compute_Pipeline_Cache_Entry :: struct {
+        bg_layout: wgpu.BindGroupLayout,
+        meta:      Compute_Pipeline,
+        pipeline:  wgpu.ComputePipeline,
+    }
+
     _State :: struct {
         instance: wgpu.Instance,
         surface: wgpu.Surface,
@@ -66,6 +128,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         config: wgpu.SurfaceConfiguration,
         queue: wgpu.Queue,
 
+        uniform_offset_align: u32,
         //
 
         bg_layout_entries: [MAX_LAYOUT_BINDINGS]wgpu.BindGroupLayoutEntry,
@@ -79,33 +142,21 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         curr_pipeline: Pipeline,
         curr_compute_pipeline: Compute_Pipeline,
         curr_depth_stencil_state: Depth_Stencil_State,
-        uniform_offset_align: u32,
 
-        settings: _Pipeline_Settings, 
-    }
 
-    DEFAULT_PIPELINE_SETTINGS :: _Pipeline_Settings {
-        multisample = {
-            count = 1,
-            mask = 0xFFFFFFFF,
-        },
-        blend = {
-            alpha = {
-                srcFactor = .SrcAlpha,
-                dstFactor = .OneMinusSrcAlpha,
-                operation = .Add,
-            },
-            color = {
-                srcFactor = .SrcAlpha,
-                dstFactor = .OneMinusSrcAlpha,
-                operation = .Add,
-            },
-        },
-        primitive = {
-            topology = .TriangleList,
-            cullMode = .None,
-            frontFace = .CCW,
-        }
+        settings: _Pipeline_Settings,
+
+        // Fixed-capacity caches with circular overwrite on full. Empty
+        // slots are detected by nil resource handles, so we don't need a
+        // count field.
+        bg_layout_cache:        [MAX_BG_LAYOUT_CACHE_ENTRIES]_BG_Layout_Cache_Entry,
+        bg_layout_cache_next:   u32,
+
+        render_pipeline_cache:      [MAX_PIPELINE_CACHE_ENTRIES]_Render_Pipeline_Cache_Entry,
+        render_pipeline_cache_next: u32,
+
+        compute_pipeline_cache:      [MAX_PIPELINE_CACHE_ENTRIES]_Compute_Pipeline_Cache_Entry,
+        compute_pipeline_cache_next: u32,
     }
 
     _init :: proc(native_window: rawptr) -> bool {
@@ -158,8 +209,44 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
     }
 
-    _deinit :: proc() {
+    _release_bg_layout :: proc(e: ^_BG_Layout_Cache_Entry) {
+        if e.layout != nil {
+            wgpu.BindGroupLayoutRelease(e.layout)
+            e.layout = nil
+        }
+        if e.pipeline_layout != nil {
+            wgpu.PipelineLayoutRelease(e.pipeline_layout)
+            e.pipeline_layout = nil
+        }
+    }
 
+    _release_render_pipeline :: proc(e: ^_Render_Pipeline_Cache_Entry) {
+        if e.pipeline != nil {
+            wgpu.RenderPipelineRelease(e.pipeline)
+            e.pipeline = nil
+        }
+    }
+
+    _release_compute_pipeline :: proc(e: ^_Compute_Pipeline_Cache_Entry) {
+        if e.pipeline != nil {
+            wgpu.ComputePipelineRelease(e.pipeline)
+            e.pipeline = nil
+        }
+    }
+
+    _deinit :: proc() {
+        for i in 0..<MAX_BG_LAYOUT_CACHE_ENTRIES  do _release_bg_layout(&_state.bg_layout_cache[i])
+        for i in 0..<MAX_PIPELINE_CACHE_ENTRIES   do _release_render_pipeline(&_state.render_pipeline_cache[i])
+        for i in 0..<MAX_PIPELINE_CACHE_ENTRIES   do _release_compute_pipeline(&_state.compute_pipeline_cache[i])
+        _state.bg_layout_cache_next      = 0
+        _state.render_pipeline_cache_next = 0
+        _state.compute_pipeline_cache_next = 0
+
+        wgpu.QueueRelease(_state.queue)
+        wgpu.DeviceRelease(_state.device)
+        wgpu.AdapterRelease(_state.adapter)
+        wgpu.SurfaceRelease(_state.surface)
+        wgpu.InstanceRelease(_state.instance)
     }
 
     _resize_swapchain :: proc(width, height: u32) -> bool {
@@ -247,9 +334,9 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     _pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> _Pipeline {
         result := _Pipeline {
             vertex_shader = vertex.shader,
-            vertex_function = strings.clone(vertex.entry_point),
+            vertex_function = strings.clone(vertex.entry_point, context.allocator),
             fragment_shader = fragment.shader,
-            fragment_function = strings.clone(fragment.entry_point),
+            fragment_function = strings.clone(fragment.entry_point, context.allocator),
             color_format = pipeline_descriptor.color_format,
             depth_format = pipeline_descriptor.depth_format,
         }
@@ -260,7 +347,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     _compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> _Compute_Pipeline {
         return _Compute_Pipeline {
             shader = shader,
-            entry  = strings.clone(entry_point),
+            entry  = strings.clone(entry_point, context.allocator),
         }
     }
 
@@ -324,23 +411,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
         pipeline := _state.curr_compute_pipeline
 
-        bg_layout := wgpu.DeviceCreateBindGroupLayout(_state.device, &wgpu.BindGroupLayoutDescriptor{
-            entryCount = uint(_state.parameter_count),
-            entries    = raw_data(_state.bg_layout_entries[:_state.parameter_count]),
-        })
-
-        pso_layout := wgpu.DeviceCreatePipelineLayout(_state.device, &wgpu.PipelineLayoutDescriptor{
-            bindGroupLayoutCount = 1,
-            bindGroupLayouts    = &bg_layout,
-        })
-
-        pso := wgpu.DeviceCreateComputePipeline(_state.device, &wgpu.ComputePipelineDescriptor{
-            layout  = pso_layout,
-            compute = wgpu.ComputeState {
-                module     = pipeline.shader.module,
-                entryPoint = pipeline.entry,
-            },
-        })
+        bg_layout, pso_layout := _get_or_create_bg_layout()
+        pso := _get_or_create_compute_pipeline(bg_layout, pso_layout, pipeline)
 
         bg := wgpu.DeviceCreateBindGroup(_state.device, &wgpu.BindGroupDescriptor{
             layout     = bg_layout,
@@ -355,10 +427,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
         wgpu.ComputePassEncoderEnd(pass)
         wgpu.ComputePassEncoderRelease(pass)
-        wgpu.ComputePipelineRelease(pso)
         wgpu.BindGroupRelease(bg)
-        wgpu.BindGroupLayoutRelease(bg_layout)
-        wgpu.PipelineLayoutRelease(pso_layout)
         _state.compute_pass_encoder = nil
     }
     
@@ -480,57 +549,14 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     _set_front_face_winding :: proc(winding: Front_Face) {   
     }
 
-    _draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {    
+    _draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
         pipeline := _state.curr_pipeline
-        
-        bg_layout := wgpu.DeviceCreateBindGroupLayout(_state.device, &wgpu.BindGroupLayoutDescriptor{
-            entryCount = uint(_state.parameter_count),
-            entries    = raw_data(_state.bg_layout_entries[:_state.parameter_count]),
-        })
 
-        pso_layout := wgpu.DeviceCreatePipelineLayout(_state.device, &wgpu.PipelineLayoutDescriptor{
-            bindGroupLayoutCount = 1,
-            bindGroupLayouts    = &bg_layout,
-        })
-
-        target := wgpu.ColorTargetState{
-            format    = _pixel_format_interop(pipeline.color_format),
-            blend     = &_state.settings.blend,
-            writeMask = wgpu.ColorWriteMaskFlags_All,
-        }
-
-        v_shader := pipeline.vertex_shader
-        f_shader := pipeline.fragment_shader
-
-        v_state := wgpu.VertexState{
-            module      = v_shader.module,
-            entryPoint  = pipeline.vertex_function,
-            bufferCount = 0,
-            buffers     = nil,
-        }
-        f_state := wgpu.FragmentState{
-            module      = f_shader.module,
-            entryPoint  = pipeline.fragment_function,
-            targetCount = 1,
-            targets     = &target,
-        }
-
-        
-        depth_format := _pixel_format_interop(pipeline.depth_format)
-        dpso: wgpu.DepthStencilState
-        if depth_format != .Undefined {
-            dpso = _state.curr_depth_stencil_state.native
-            dpso.format = depth_format
-        } 
-
-        pso := wgpu.DeviceCreateRenderPipeline(_state.device, &wgpu.RenderPipelineDescriptor{
-            layout       = pso_layout,
-            vertex       = v_state,
-            primitive    = _state.settings.primitive,
-            multisample  = _state.settings.multisample,
-            fragment     = &f_state,
-            depthStencil = nil if depth_format == .Undefined else &dpso,
-        })
+        bg_layout, pso_layout := _get_or_create_bg_layout()
+        pso := _get_or_create_render_pipeline(
+            bg_layout, pso_layout, pipeline,
+            _state.curr_depth_stencil_state.native, _state.settings,
+        )
 
         frame_bg := wgpu.DeviceCreateBindGroup(_state.device, &wgpu.BindGroupDescriptor{
             layout     = bg_layout,
@@ -555,7 +581,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             index_buffer.native.buffer, index_format,
             u64(index_buffer.native.offset), u64(index_buffer.native.capacity),
         )
-        
+
         wgpu.RenderPassEncoderDrawIndexed(
             _state.render_pass_encoder,
             indexCount    = index_count,
@@ -564,6 +590,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             baseVertex    = i32(base_vertex),
             firstInstance = base_instance,
         )
+
+        wgpu.BindGroupRelease(frame_bg)
     }
 
     _malloc :: proc(
@@ -650,7 +678,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     _frame_arena :: proc() -> ^Arena {
         if len(_state.frame_arenas) == 0 {
             new_arena := new(Arena, context.allocator)
-            new_arena^ = arena()
+            new_arena^ = arena_init()
             return new_arena
         } else {
             arena := pop(&_state.frame_arenas)
@@ -753,7 +781,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
                 }
 
                 count += 1
-            }            
+            }
         }
 
         for RW in block.read_write_resources {
@@ -798,7 +826,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
                 }
 
                 count += 1
-            }   
+            }
         }
         
         for S in block.samplers {
@@ -837,11 +865,194 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     //////////////////////////////////////////////////////////////
 
-    _compute_pass_encoder :: proc() -> wgpu.ComputePassEncoder {
+    _compute_pass_encoder :: #force_inline proc "contextless" () -> wgpu.ComputePassEncoder {
         if _state.compute_pass_encoder == nil {
             _state.compute_pass_encoder = wgpu.CommandEncoderBeginComputePass(_state.command_encoder, nil)
         }
         return _state.compute_pass_encoder
+    }
+
+    //////////////////////////////////////////////////////////////
+    // Pipeline caches
+
+    _bg_layout_sig_equal :: proc(a, b: ^_BG_Layout_Signature) -> bool {
+        if a.count != b.count do return false
+        for i in 0..<int(a.count) {
+            if a.entries[i] != b.entries[i] do return false
+        }
+        return true
+    }
+
+    // Returns (bind_group_layout, pipeline_layout) — both are cached. The
+    // pipeline layout has exactly one bind group layout in this design, so
+    // the two are stored together.
+    _get_or_create_bg_layout :: proc() -> (wgpu.BindGroupLayout, wgpu.PipelineLayout) {
+        sig: _BG_Layout_Signature
+        sig.count = _state.parameter_count
+        for i in 0..<int(_state.parameter_count) {
+            sig.entries[i] = _state.bg_layout_entries[i]
+        }
+
+        for i in 0..<MAX_BG_LAYOUT_CACHE_ENTRIES {
+            e := &_state.bg_layout_cache[i]
+            if e.layout == nil { continue }
+            if _bg_layout_sig_equal(&e.sig, &sig) {
+
+                return e.layout, e.pipeline_layout
+            }
+        }
+
+        new_layout := wgpu.DeviceCreateBindGroupLayout(_state.device, &wgpu.BindGroupLayoutDescriptor{
+            entryCount = uint(sig.count),
+            entries    = raw_data(sig.entries[:sig.count]),
+        })
+        if new_layout == nil {
+            return nil, nil
+        }
+        new_pso_layout := wgpu.DeviceCreatePipelineLayout(_state.device, &wgpu.PipelineLayoutDescriptor{
+            bindGroupLayoutCount = 1,
+            bindGroupLayouts    = &new_layout,
+        })
+        if new_pso_layout == nil {
+            wgpu.BindGroupLayoutRelease(new_layout)
+            return nil, nil
+        }
+
+        slot := int(_state.bg_layout_cache_next)
+        old := &_state.bg_layout_cache[slot]
+        _release_bg_layout(old)
+        old^ = _BG_Layout_Cache_Entry {
+            sig             = sig,
+            layout          = new_layout,
+            pipeline_layout = new_pso_layout,
+        }
+        _state.bg_layout_cache_next = u32((slot + 1) % MAX_BG_LAYOUT_CACHE_ENTRIES)
+
+        return new_layout, new_pso_layout
+    }
+
+    _render_pipeline_entry_equal :: proc(a, b: ^_Render_Pipeline_Cache_Entry) -> bool {
+        return a.bg_layout     == b.bg_layout     &&
+               a.meta          == b.meta          &&
+               a.depth_stencil == b.depth_stencil &&
+               a.settings      == b.settings      &&
+               a.write_mask    == b.write_mask
+    }
+
+    _get_or_create_render_pipeline :: proc(
+        bg_layout:     wgpu.BindGroupLayout,
+        pso_layout:    wgpu.PipelineLayout,
+        meta:          Pipeline,
+        depth_stencil: wgpu.DepthStencilState,
+        settings:      _Pipeline_Settings,
+    ) -> wgpu.RenderPipeline {
+        write_mask := wgpu.ColorWriteMaskFlags_All
+        key := _Render_Pipeline_Cache_Entry {
+            bg_layout     = bg_layout,
+            meta          = meta,
+            depth_stencil = depth_stencil,
+            settings      = settings,
+            write_mask    = write_mask,
+        }
+
+        for i in 0..<MAX_PIPELINE_CACHE_ENTRIES {
+            e := &_state.render_pipeline_cache[i]
+            if e.pipeline == nil { continue }
+            if _render_pipeline_entry_equal(e, &key) {
+                return e.pipeline
+            }
+        }
+
+        // Local copy of settings so we can take the address of fields for
+        // descriptor pointers; Odin does not let you take the address of a
+        // parameter's field directly.
+        settings_local := settings
+        target := wgpu.ColorTargetState{
+            format    = _pixel_format_interop(meta.color_format),
+            blend     = &settings_local.blend,
+            writeMask = write_mask,
+        }
+
+        v_state := wgpu.VertexState{
+            module      = meta.vertex_shader.module,
+            entryPoint  = meta.vertex_function,
+            bufferCount = 0,
+            buffers     = nil,
+        }
+        f_state := wgpu.FragmentState{
+            module      = meta.fragment_shader.module,
+            entryPoint  = meta.fragment_function,
+            targetCount = 1,
+            targets     = &target,
+        }
+
+        depth_format_wgpu := _pixel_format_interop(meta.depth_format)
+        dpso: wgpu.DepthStencilState
+        if depth_format_wgpu != .Undefined {
+            dpso = depth_stencil
+            dpso.format = depth_format_wgpu
+        }
+
+        pso := wgpu.DeviceCreateRenderPipeline(_state.device, &wgpu.RenderPipelineDescriptor{
+            layout       = pso_layout,
+            vertex       = v_state,
+            primitive    = settings_local.primitive,
+            multisample  = settings_local.multisample,
+            fragment     = &f_state,
+            depthStencil = nil if depth_format_wgpu == .Undefined else &dpso,
+        })
+        if pso == nil {
+            return nil
+        }
+        key.pipeline = pso
+
+        slot := int(_state.render_pipeline_cache_next)
+        old := &_state.render_pipeline_cache[slot]
+        _release_render_pipeline(old)
+        old^ = key
+        _state.render_pipeline_cache_next = u32((slot + 1) % MAX_PIPELINE_CACHE_ENTRIES)
+
+        return pso
+    }
+
+    _compute_pipeline_entry_equal :: proc(a, b: ^_Compute_Pipeline_Cache_Entry) -> bool {
+        return a.bg_layout == b.bg_layout &&
+               a.meta      == b.meta
+    }
+
+    _get_or_create_compute_pipeline :: proc(bg_layout: wgpu.BindGroupLayout, pso_layout: wgpu.PipelineLayout, meta: Compute_Pipeline) -> wgpu.ComputePipeline {
+        key := _Compute_Pipeline_Cache_Entry {
+            bg_layout = bg_layout,
+            meta      = meta,
+        }
+
+        for i in 0..<MAX_PIPELINE_CACHE_ENTRIES {
+            e := &_state.compute_pipeline_cache[i]
+            if e.pipeline == nil { continue }
+            if _compute_pipeline_entry_equal(e, &key) {
+                return e.pipeline
+            }
+        }
+
+        pso := wgpu.DeviceCreateComputePipeline(_state.device, &wgpu.ComputePipelineDescriptor{
+            layout  = pso_layout,
+            compute = wgpu.ComputeState {
+                module     = meta.shader.module,
+                entryPoint = meta.entry,
+            },
+        })
+        if pso == nil {
+            return nil
+        }
+        key.pipeline = pso
+
+        slot := int(_state.compute_pipeline_cache_next)
+        old := &_state.compute_pipeline_cache[slot]
+        _release_compute_pipeline(old)
+        old^ = key
+        _state.compute_pipeline_cache_next = u32((slot + 1) % MAX_PIPELINE_CACHE_ENTRIES)
+
+        return key.pipeline
     }
 
     //////////////////////////////////////////////////////////////
