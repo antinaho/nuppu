@@ -1,15 +1,20 @@
 package nuppu
 
+import "base:intrinsics"
 import "base:runtime"
 import "core:mem"
 import "core:time"
 import "core:fmt"
+import "core:log"
 
 import "./platform"
 import "./gpu"
 
-IS_RELEASE :: #config(RELEASE, false)
-IS_DEBUG :: !IS_RELEASE
+_ :: fmt
+_ :: log
+
+SIM_TICKS_PER_SECOND :: 180
+SIM_NS_PER_TICK     :: time.Second / SIM_TICKS_PER_SECOND
 
 State :: struct #align(64) {
     ctx: runtime.Context,
@@ -21,26 +26,28 @@ State :: struct #align(64) {
     accumulator: u64,
     num_sim_ticks: u64,
 
-    update_state_size: int,
-
-    current_state: rawptr,
-    previous_state: rawptr,
-
     window_size: [2]i32,
 
     application_state: platform.State,
     gpu_state: gpu.State,
 
-    s: typeid,
+    update_state_size: int,
+    current_state: rawptr,
+    previous_state: rawptr,
     desc: struct {
         init: proc(),
         update: proc(),
         deinit: proc(),
-        render: rawptr,
+        render: proc(prev, curr: rawptr, alpha: f32),
     },
+
+    vertex: gpu.Arena,
+    index: gpu.Arena,
 }
 
 _state: ^State
+
+Frame_Result :: enum { Continue, Skip_Render, Exit }
 
 App_Desc :: struct($T: typeid) #all_or_none {
     state: ^^T,
@@ -56,59 +63,10 @@ App_Optional :: struct {
     deinit: proc(),
 }
 
-@(private="file", export)
-step :: proc(dt: f32) -> bool {
-    assert(_state != nil)
-    context = _state.ctx
-    
-    if !_state.initialized {
-        if gpu.is_init() {
-            _ready_up()       
-            if _state.desc.init != nil {
-                _state.desc.init()
-            }
-        }
-        else {
-            return true
-        }
-    }
-    
-    if !pre_update() {
-        if _state.desc.deinit != nil {
-            _state.desc.deinit()
-        }
-        return false
-    }
-
-    if _state.num_sim_ticks > 0 {
-        platform.normalize_ticks(_state.num_sim_ticks)
-        for _ in 0 ..< _state.num_sim_ticks {
-            runtime.mem_copy_non_overlapping(_state.previous_state, _state.current_state, _state.update_state_size)
-            _state.desc.update()
-            platform.release_input()
-        }
-    }
-
-    // Skip render?
-    if !_window_visible() {
-        return true
-    }
-    
-    // Resize swapchain + depth?
-    current_window_size := platform.window_size_pixel()
-    if _state.window_size.x != current_window_size.x || _state.window_size.y != current_window_size.y {
-        gpu.resize_swapchain(u32(current_window_size.x), u32(current_window_size.y))
-        gpu.resize_depth(u32(current_window_size.x), u32(current_window_size.y))
-        _state.window_size = current_window_size
-    }
-
-    render_fn := (proc(prev, curr: rawptr, alpha: f32))(_state.desc.render)
-
-    render_fn(_state.previous_state, _state.current_state, _render_alpha())
-    return true
-}
-
 run :: proc(desc: App_Desc($T)) {
+
+    logger := log.create_console_logger()
+    
     assert(_state == nil)
 
     alloc_err: runtime.Allocator_Error
@@ -116,17 +74,15 @@ run :: proc(desc: App_Desc($T)) {
     if alloc_err != nil {
         panic("Failed to allocate state")
     }
-    _state.ctx = context
 
-    state_size := size_of(T)
-    state_size = mem.align_forward_int(state_size, 64)
+    context.logger = logger
+    _state.ctx = context
 
     states, states_err := mem.alloc(size_of(T) * 2, alignment = 64)
     if states_err != nil {
         panic("Failed to allocate states")
     }
 
-    _state.s = T
     current_state := &([^]T)(states)[0]
     previous_state := &([^]T)(states)[1]
     desc.state^ = current_state
@@ -135,115 +91,83 @@ run :: proc(desc: App_Desc($T)) {
     _state.previous_state = previous_state
     _state.update_state_size = mem.align_forward_int(size_of(T), 64)
 
-    platform.init(&_state.application_state, desc.window_size, desc.window_title)
-    _state.prev_time = platform.get_time_ns()
-    gpu.init(&_state.gpu_state, platform.native_window())
-
-when ODIN_OS == .JS { // WEB
     _state.desc = {
         init = desc.init,
         update = desc.update,
         deinit = desc.deinit,
-        render = rawptr(desc.render),
+        render = auto_cast desc.render,
     }
-}
-else { // NATIVE
-    
+
+    platform.init(&_state.application_state, desc.window_size, desc.window_title)
+    _state.prev_time = platform.get_time_ns()
+    gpu.init(&_state.gpu_state, platform.native_window())
+
+when ODIN_OS != .JS { // JS runtime drives the loop via the exported step() on each tick.
+
     _ready_up()
     if desc.init != nil {
         desc.init()
     }
-    
+
     for {
-        if !pre_update() {
-            break
-        }
-        
-        if _state.num_sim_ticks > 0 {
-            platform.normalize_ticks(_state.num_sim_ticks)
-            for _ in 0 ..< _state.num_sim_ticks {
-                runtime.mem_copy_non_overlapping(_state.previous_state, _state.current_state, _state.update_state_size)
-                desc.update()
-                platform.release_input()
+        switch _frame() {
+        case .Exit:
+            if desc.deinit != nil {
+                desc.deinit()
             }
-        }
-
-        // Skip render?
-        if !_window_visible() {
+            return
+        case .Skip_Render:
             continue
+        case .Continue:
+            if _state.gpu_state.frame_n > gpu.FRAMES_IN_FLIGHT {
+                gpu.semaphore_wait(_state.gpu_state.frame_semaphore, _state.gpu_state.frame_n - gpu.FRAMES_IN_FLIGHT)
+            }
+            desc.render((^T)(_state.previous_state), (^T)(_state.current_state), _render_alpha())
         }
-        
-        // Resize swapchain + depth?
-        current_window_size := platform.window_size_pixel()
-        if _state.window_size.x != current_window_size.x || _state.window_size.y != current_window_size.y {
-            gpu.resize_swapchain(u32(current_window_size.x), u32(current_window_size.y))
-            gpu.resize_depth(u32(current_window_size.x), u32(current_window_size.y))
-            _state.window_size = current_window_size
-        }
-
-        if _state.gpu_state.frame_n > gpu.FRAMES_IN_FLIGHT {
-            gpu.semaphore_wait(_state.gpu_state.frame_semaphore, _state.gpu_state.frame_n - gpu.FRAMES_IN_FLIGHT)
-        }
-        
-        desc.render((^T)(_state.previous_state), (^T)(_state.current_state), _render_alpha())
-    }
-    
-    if desc.deinit != nil {
-        desc.deinit()
     }
 }
 }
 
-RENDER_TARGET_X :: 1280
-RENDER_TARGET_Y :: 720
-USE_RENDER_TARGET :: #config(USE_RENDER_TARGET, true)
+@(private="file", export)
+step :: proc(dt: f32) -> bool {
+    assert(_state != nil)
+    context = _state.ctx
 
-_ready_up :: proc() {
-    _state.gpu_state.frame_semaphore = gpu.semaphore(0)
-    
-    _state.window_size = platform.window_size_pixel()
-    gpu.resize_swapchain(u32(_state.window_size.x), u32(_state.window_size.y))
-    gpu.resize_depth(u32(_state.window_size.x), u32(_state.window_size.y))
-    // if USE_RENDER_TARGET {
-    //     gpu.resize_render_target(RENDER_TARGET_X, RENDER_TARGET_Y)
-    //     gpu.resize_render_target_depth(RENDER_TARGET_X, RENDER_TARGET_Y)
-    // }
+    if !_state.initialized {
+        if gpu.is_init() {
+            _ready_up()
+            if _state.desc.init != nil {
+                _state.desc.init()
+            }
+        } else {
+            return true
+        }
+    }
 
-    _state.initialized = true
-}
-
-_render_alpha :: proc() -> f32 {
-    return f32(_state.accumulator) / f32(SIM_NS_PER_TICK)
-}
-
-_window_visible :: proc() -> bool {
-    current_window_size := platform.window_size_pixel()
-
-    if current_window_size.x <= 0 || current_window_size.y <= 0 || .Iconified in platform.window_flags() || .Visible not_in platform.window_flags() {
+    switch _frame() {
+    case .Exit:
+        if _state.desc.deinit != nil {
+            _state.desc.deinit()
+        }
         return false
+    case .Skip_Render:
+        return true
+    case .Continue:
+        _state.desc.render(_state.previous_state, _state.current_state, _render_alpha())
+        return true
     }
     return true
 }
 
-SIM_TICKS_PER_SECOND :: 180
-SIM_NS_PER_TICK     :: time.Second / SIM_TICKS_PER_SECOND
+_frame :: proc() -> Frame_Result {
 
-aspect_ratio :: proc() -> f32 {
-    return platform.window_aspect_ratio()
-}
-
-sim_delta_time :: proc() -> f32 {
-    return 1.0 / f32(SIM_TICKS_PER_SECOND)
-}
-
-pre_update :: proc() -> bool {
     free_all(context.temp_allocator)
 
     platform.platform_reset_frame_input()
     platform.poll_events()
 
     if platform.input_key_pressed(.KEY_ESCAPE) {
-        return false
+        return .Exit
     }
     
     time_ns := platform.get_time_ns()
@@ -255,7 +179,103 @@ pre_update :: proc() -> bool {
     _state.num_sim_ticks = _state.accumulator / u64(SIM_NS_PER_TICK)
     _state.accumulator -= _state.num_sim_ticks * u64(SIM_NS_PER_TICK)
 
-    return true
+    if _state.num_sim_ticks > 0 {
+        platform.normalize_ticks(_state.num_sim_ticks)
+        for _ in 0 ..< _state.num_sim_ticks {
+            runtime.mem_copy_non_overlapping(_state.previous_state, _state.current_state, _state.update_state_size)
+            _state.desc.update()
+            platform.release_input()
+        }
+    }
+
+    current_window_size := platform.window_size_pixel()
+    if current_window_size.x <= 0 || current_window_size.y <= 0 || .Iconified in platform.window_flags() || .Visible not_in platform.window_flags() {
+        return .Skip_Render
+    }
+    
+    // Resize swapchain + depth?
+    current := platform.window_size_pixel()
+    if _state.window_size.x != current.x || _state.window_size.y != current.y {
+        gpu.resize_swapchain(u32(current.x), u32(current.y))
+        gpu.resize_depth(u32(current.x), u32(current.y))
+        _state.window_size = current
+    }
+
+    return .Continue
+}
+
+_ready_up :: proc() {
+    _state.gpu_state.frame_semaphore = gpu.semaphore(0)
+
+    _state.window_size = platform.window_size_pixel()
+    gpu.resize_swapchain(u32(_state.window_size.x), u32(_state.window_size.y))
+    gpu.resize_depth(u32(_state.window_size.x), u32(_state.window_size.y))
+
+    // Currently forcing vertex to by Vertex type and index to Vertex_Index
+    _state.vertex = gpu.arena_init(usage = .GPU_Storage)
+    _state.index = gpu.arena_init(el_size = size_of(Vertex_Index), el_count = 1024, alignment = 4, usage = .GPU_Index)
+
+
+    // Quad
+    s :: 0.5
+    v := [4]Vertex {
+        pack_vertex( position = { -s, -s, +s }),
+        pack_vertex( position = { +s, -s, +s }),
+        pack_vertex( position = { +s, +s, +s }),
+        pack_vertex( position = { -s, +s, +s }),    
+    }
+
+    i := [6]Vertex_Index {
+        0, 1, 2, 2, 3, 0
+    }
+
+    upload := gpu.arena_init()
+    verts := gpu.arena_alloc(&upload, Vertex, uint(4))
+    intrinsics.mem_copy_non_overlapping(verts.cpu, &v, size_of(v))
+    indices := gpu.arena_alloc_raw(&upload, size_of(Vertex_Index), 6, 4)
+    intrinsics.mem_copy_non_overlapping(indices.cpu, &i, size_of(i))
+
+    mesh = push_mesh_zeroed(4, 6)
+
+    gpu.unmap(&upload.ptr)
+    gpu.begin_commands()
+    gpu.copy(mesh.verts, verts)
+    gpu.copy(mesh.indices, indices)
+    gpu.barrier(.Transfer, .All)
+    gpu.commit_commands()
+
+    _state.initialized = true
+}
+
+mesh: Mesh
+
+///////////////////////////////////////////////////////////////
+
+@(require_results)
+push_mesh_zeroed :: proc(
+    vertex_count: u32,
+    index_count: u32,
+) -> Mesh {
+
+    return Mesh {
+        vertex_count = vertex_count,
+        index_count = index_count,
+        verts = gpu.arena_alloc(&_state.vertex, Vertex, uint(vertex_count)),
+        indices = gpu.arena_alloc_raw(&_state.index, size_of(Vertex_Index), uint(index_count), 4)
+    }
+
+}
+
+_render_alpha :: proc() -> f32 {
+    return f32(_state.accumulator) / f32(SIM_NS_PER_TICK)
+}
+
+aspect_ratio :: proc() -> f32 {
+    return platform.window_aspect_ratio()
+}
+
+sim_delta_time :: proc() -> f32 {
+    return 1.0 / f32(SIM_TICKS_PER_SECOND)
 }
 
 Screen_Bounds :: struct #align(16) {
@@ -263,7 +283,6 @@ Screen_Bounds :: struct #align(16) {
     // (max_x, max_y) = top-right of letterboxed region in NDC
     min_x, min_y, max_x, max_y: f32,
 }
-
 
 Screen_Layout :: struct {
     ndc_bounds: Screen_Bounds,
@@ -308,9 +327,4 @@ compute_screen_layout :: proc(window_w, window_h: i32, internal_w, internal_h: i
         scissor_w = scissor_w,
         scissor_h = scissor_h,
     }
-}
-
-Vertex :: struct #align(16) {
-    position: [3]f32,
-    uv: [2]u16,
 }
