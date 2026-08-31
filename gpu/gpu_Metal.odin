@@ -432,6 +432,14 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         }
     }
 
+    _capacity :: proc(ptr: _ptr) -> uint {
+        return ptr.capacity
+    }
+
+    _min_alignment :: proc(ptr: _ptr) -> u32 {
+        return MIN_ALIGNMENT
+    }
+
     _cpu_address :: proc(p: _ptr) -> rawptr {
         return rawptr(uintptr(p.buffer->contentsPointer()))
     }

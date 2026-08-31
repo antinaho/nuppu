@@ -41,6 +41,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         capacity: uint, // Capacity of the ptr, NOT the buffer
         index_bytes: u8,
         is_mapped: bool,
+        min_alignment: u32,
         binding_type: wgpu.BufferBindingType,
     }
 
@@ -129,6 +130,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         queue: wgpu.Queue,
 
         uniform_offset_align: u32,
+        storage_offset_align: u32,
+        index_offset_align: u32,
         //
 
         bg_layout_entries: [MAX_LAYOUT_BINDINGS]wgpu.BindGroupLayoutEntry,
@@ -203,6 +206,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             }
 
             _state.uniform_offset_align = limits.minUniformBufferOffsetAlignment
+            _state.storage_offset_align = limits.minStorageBufferOffsetAlignment
+            _state.index_offset_align = 4
             _state.settings = DEFAULT_PIPELINE_SETTINGS
 
             _state.is_init = true
@@ -605,24 +610,32 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
         usage: wgpu.BufferUsageFlags
         binding_type: wgpu.BufferBindingType
+        min_alignment: u32
 
         switch type {
         case .Staging:
             usage  = {.CopySrc, .MapWrite}
             binding_type = .ReadOnlyStorage
+            min_alignment = 4
         case .GPU_Storage:
             usage  = {.CopyDst, .Storage}
             binding_type = .ReadOnlyStorage
+            bytes = runtime.align_forward_uint(bytes, uint(_state.storage_offset_align))
+            min_alignment = _state.storage_offset_align
         case .GPU_Constant:
             usage  = {.CopyDst, .Uniform}
             binding_type = .Uniform
-            bytes = max(bytes, uint(_state.uniform_offset_align))
+            bytes = runtime.align_forward_uint(bytes, uint(_state.uniform_offset_align))
+            min_alignment = _state.uniform_offset_align
         case .GPU_Index:
             usage  = {.CopyDst, .Index}
             binding_type = .ReadOnlyStorage
+            bytes = runtime.align_forward_uint(bytes, uint(_state.index_offset_align))
+            min_alignment = _state.index_offset_align
         case .Readback:
             usage  = {.CopyDst, .MapRead}
             binding_type = .ReadOnlyStorage
+            panic("not implemented")
         }
 
         buffer := wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor {
@@ -639,7 +652,16 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             capacity = uint(bytes),
             binding_type = binding_type,
             index_bytes = u8(el_size) if type == .GPU_Index else 0,
+            min_alignment = min_alignment,
         }
+    }
+
+    _capacity :: proc(ptr: _ptr) -> uint {
+        return ptr.capacity
+    }
+
+    _min_alignment :: proc(ptr: _ptr) -> u32 {
+        return ptr.min_alignment
     }
 
     _unmap :: proc(ptr: ^_ptr) {

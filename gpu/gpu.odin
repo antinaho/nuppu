@@ -606,8 +606,6 @@ arena_init :: proc(
 ) -> Arena {
     arena: Arena
 
-    assert(alignment >= MIN_ALIGNMENT, fmt.tprintf("GPU arena_alloc_raw: alignment too small: %v, extend to %v", alignment, MIN_ALIGNMENT))
-    bytes := runtime.align_forward_uint(el_size * el_count, alignment)
     _ptr := _malloc(usage, el_count, el_size, alignment, "ARENA")
 
     arena.ptr = {
@@ -620,22 +618,22 @@ arena_init :: proc(
         gpu = _gpu_address(_ptr),
     }
     arena.offset = 0
-    arena.capacity = bytes
+    arena.capacity = _capacity(_ptr)
 
     return arena
 }
 
 // Returns ptr with correct field values.
-arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, alignment: uint, loc := #caller_location) -> ptr {
+arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, align: uint, loc := #caller_location) -> ptr {
     // assert(_mapped(arena.ptr)) IF staging buffer
-    assert(alignment >= MIN_ALIGNMENT, fmt.tprintf("GPU arena_alloc_raw: alignment too small: %v, extend to %v", alignment, MIN_ALIGNMENT), loc)
-    bytes := el_size * el_count
-    assert(bytes >= 0 && alignment > 0)
-    bytes_aligned := runtime.align_forward_uint(uint(bytes), uint(alignment))
-
+    alignment := max(u32(align), _min_alignment(arena.ptr))
     if arena.ptr.cpu != nil && uintptr(arena.ptr.cpu) % uintptr(alignment) != uintptr(arena.ptr.gpu) % uintptr(alignment) {
         panic("Could not satisfy alignment requirements in GPU arena allocation.")
     }
+    
+    bytes := el_size * el_count
+    assert(bytes >= 0 && alignment > 0)
+    bytes_aligned := runtime.align_forward_uint(uint(bytes), uint(alignment))
 
     arena.offset = mem.align_forward_uint(arena.offset, uint(alignment))
     temp := arena.offset
