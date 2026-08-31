@@ -97,10 +97,13 @@ _render :: proc(previous, current: ^State, alpha: f32) {
 
     gpu.set_pipeline(current.pso)
 
+
+    quad_mesh := nuppu.get_built_in_mesh(.Quad)
+
     block := gpu.Parameter_Block {
         constants = {},
         read_resources = {
-            0 = nuppu.mesh.verts,
+            0 = quad_mesh.verts,
             1 = current.instance_gpu,
         },
         read_write_resources = {},
@@ -112,8 +115,8 @@ _render :: proc(previous, current: ^State, alpha: f32) {
 
     gpu.draw_indiced_primitives(
     .Triangle,
-    nuppu.mesh.indices,
-    nuppu.mesh.index_count, 0,
+    quad_mesh.indices,
+    quad_mesh.index_count, 0,
     INSTANCE_COUNT,
     0, 0)
 

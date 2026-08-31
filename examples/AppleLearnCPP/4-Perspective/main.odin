@@ -12,27 +12,15 @@ state: ^Window
 Window :: struct {
     angle: f32,
 
-    vertex_gpu: gpu.ptr,
-    index_gpu: gpu.ptr,
     instance_gpu: gpu.ptr,
-    camera_uniform: gpu.ptr,
     
     pso: gpu.Pipeline,
     depth_pso: gpu.Depth_Stencil_State,
 }
 
-Vertex :: struct #align(16) {
-    position: [4]f32,
-}
-
 Instance :: struct #align(16) {
     transform: matrix[4, 4]f32,
     color: [4]f32
-}
-
-Camera :: struct #align(16) {
-    world_transform: matrix[4, 4]f32,
-    perspective_transform: matrix[4, 4]f32,
 }
 
 init :: proc() {
@@ -66,58 +54,7 @@ when ODIN_OS == .JS {
     
     state.depth_pso = gpu.depth_stencil_state_init({compare = .Less, write_enabled = true})
 
-    upload := gpu.arena_init()
-
-    s :: f32(0.5)
-    VERT_COUNT :: 8
-    INDEX_COUNT :: 6 * 6
-
-    verts := gpu.arena_alloc(&upload, Vertex, VERT_COUNT)
-    mem.copy_non_overlapping(
-        verts.cpu, &[VERT_COUNT]Vertex {
-            {{ -s, -s, +s, 1.0 }},
-            {{ +s, -s, +s, 1.0 }},
-            {{ +s, +s, +s, 1.0 }},
-            {{ -s, +s, +s, 1.0 }},
-            {{ -s, -s, -s, 1.0 }},
-            {{ -s, +s, -s, 1.0 }},
-            {{ +s, +s, -s, 1.0 }},
-            {{ +s, -s, -s, 1.0 }},
-        }, VERT_COUNT * size_of(Vertex)
-    )
-
-    indices := gpu.arena_alloc(&upload, u32, INDEX_COUNT)
-    mem.copy_non_overlapping(indices.cpu, &[INDEX_COUNT]u32{
-        0, 1, 2, /* front */
-        2, 3, 0,
-
-        1, 7, 6, /* right */
-        6, 2, 1,
-
-        7, 4, 5, /* back */
-        5, 6, 7,
-
-        4, 0, 3, /* left */
-        3, 5, 4,
-
-        3, 2, 6, /* top */
-        6, 5, 3,
-
-        4, 7, 1, /* bottom */
-        1, 0, 4  
-    }, INDEX_COUNT * size_of(u32))
-    gpu.unmap(&upload.ptr)
-    
-    state.vertex_gpu = gpu.malloc(.GPU_Storage, VERT_COUNT, size_of(Vertex), align_of(Vertex), "Vertices")
-    state.index_gpu = gpu.malloc_index(INDEX_COUNT, .Uint32, "Indices")
     state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance), align_of(Instance), "Instances")
-    state.camera_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Camera), align_of(Camera), "Camera")
-    
-    gpu.begin_commands()
-    gpu.copy(state.vertex_gpu, verts)
-    gpu.copy(state.index_gpu, indices)
-    gpu.barrier(.Transfer, .All)
-    gpu.commit_commands()
 }
 
 INSTANCE_COUNT :: 18
@@ -168,18 +105,20 @@ render :: proc(prev, curr: ^Window, alpha: f32) {
         instance.color = {i, 1-i, math.sin(math.TAU * i), 1}
     }
 
-    cam_ptr := gpu.arena_alloc(frame_arena, Camera, 1)
+    cam_ptr := gpu.arena_alloc(frame_arena, nuppu.Engine_Uniform, 1)
     
-    cam := Camera {
+    cam := nuppu.Engine_Uniform {
         perspective_transform = glm.mat4Perspective(glm.radians_f32(45), nuppu.aspect_ratio(), 0.03, 500),
-		world_transform = 1
+		world_transform = 1,
+        camera_position = {},
+        _pad = {},
     }
 
-    (^Camera)(cam_ptr.cpu)^ = cam
+    (^nuppu.Engine_Uniform )(cam_ptr.cpu)^ = cam
 
     gpu.unmap(&frame_arena.ptr)
     gpu.copy(curr.instance_gpu, instances)
-    gpu.copy(curr.camera_uniform, cam_ptr)
+    gpu.copy(nuppu.global_frame_uniform(), cam_ptr)
     gpu.barrier(.Transfer, .All)
 
     swapchain := gpu.acquire_next_swapchain()
@@ -201,12 +140,13 @@ render :: proc(prev, curr: ^Window, alpha: f32) {
     gpu.set_pipeline(state.pso)
     gpu.set_depth_stencil_state(state.depth_pso)
 
+    cube_mesh := nuppu.get_built_in_mesh(.Cube)
     block := gpu.Parameter_Block {
         constants = { 
-            0 = curr.camera_uniform 
+            0 = nuppu.global_frame_uniform()
         },
         read_resources = {
-            0 = curr.vertex_gpu,
+            0 = nuppu.global_vertex_buffer(),
             1 = curr.instance_gpu,
         },
         read_write_resources = {},
@@ -221,12 +161,7 @@ render :: proc(prev, curr: ^Window, alpha: f32) {
     // gpu.set_front_face_winding(.CCW)
     // gpu.set_buffers({state.vertex_gpu, curr.instance_gpu, curr.camera_uniform}, {0, 3}, .Vertex)
     
-    gpu.draw_indiced_primitives(
-    .Triangle,
-    curr.index_gpu,
-    6 * 6, 0,
-    INSTANCE_COUNT,
-    0, 0)
+    nuppu.draw_mesh(cube_mesh, INSTANCE_COUNT)
 
     gpu.end_render_pass()
 

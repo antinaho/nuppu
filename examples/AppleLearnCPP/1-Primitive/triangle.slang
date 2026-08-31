@@ -75,3 +75,25 @@ float4 fragmentMain(v2f in) : SV_Target
 //     -entry fragmentMain \
 //     -stage fragment \
 //     -o examples/AppleLearnCPP/1-Primitive/triangle.wgsl
+
+
+// slangc examples/AppleLearnCPP/4-Perspective/perspective.slang \
+//     -target metal \
+//     -entry vertexMain \
+//     -stage vertex \
+//     -o examples/AppleLearnCPP/4-Perspective/perspective.vs.metal \
+
+
+// slangc examples/AppleLearnCPP/4-Perspective/perspective.slang \
+//     -target metal \
+//     -entry fragmentMain \
+//     -stage fragment \
+//     -o examples/AppleLearnCPP/4-Perspective/perspective.ps.metal \
+
+// slangc examples/AppleLearnCPP/4-Perspective/perspective.slang \
+//     -target wgsl \
+//     -entry vertexMain \
+//     -stage vertex \
+//     -entry fragmentMain \
+//     -stage fragment \
+//     -o examples/AppleLearnCPP/4-Perspective/perspective.wgsl

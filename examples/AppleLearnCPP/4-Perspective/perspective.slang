@@ -5,27 +5,46 @@ struct v2f {
 
 
 struct Vertex {
-    float4 position;
+    float4 position_uv;
+    uint4 color_normal;
 };
+
 
 struct Instance {
     float4x4 transform;
     float4 color;
 };
 
-struct CameraData {
-    float4x4 perspectiveTransform;
-    float4x4 worldTransform;
+struct Engine_Uniform {
+    float4x4 perspective_transform;
+    float4x4 world_transform;
+    float4 camera_position;
 }
 
+
 struct FrameData {
-    ConstantBuffer<CameraData> camera;
+    ConstantBuffer<Engine_Uniform> camera;
     
     StructuredBuffer<Vertex> verts;
     StructuredBuffer<Instance> instances;
 };
 
 ParameterBlock<FrameData> data;
+
+float4 unpack_uint_to_float4_01(uint value)
+{
+    return float4(
+        float((value >> 0)  & 0xFF),
+        float((value >> 8)  & 0xFF),
+        float((value >> 16) & 0xFF),
+        float((value >> 24) & 0xFF)
+    ) * (1.0 / 255.0);
+}
+
+float unpack_u16(uint16_t value)
+{
+    return float(value) * (1.0 / 65535.0);
+}
 
 [shader("vertex")]
 v2f vertexMain(
@@ -35,10 +54,20 @@ v2f vertexMain(
     Vertex v = data.verts[vertexID];
     Instance i = data.instances[instanceID];
 
-    float4 pos = float4(v.position.xyz, 1.0);
+    float3 position = v.position_uv.xyz;
+
+    float2 uv = float2(
+        unpack_u16( uint16_t( ( uint(v.position_uv.w) >> 0 ) & 0xFFFF ) ), 
+        unpack_u16( uint16_t( ( uint(v.position_uv.w) >> 16) & 0xFFFF ) )
+    );
+
+    float4 color = unpack_uint_to_float4_01(v.color_normal.x);
+    float3 normal = v.color_normal.yzw;
+
+    float4 pos = float4(position.xyz, 1.0);
     pos = mul(i.transform, pos);
-    pos = mul(data.camera.worldTransform, pos);
-    pos = mul(data.camera.perspectiveTransform, pos);
+    pos = mul(data.camera.world_transform, pos);
+    pos = mul(data.camera.perspective_transform, pos);
 
     v2f o;
 
