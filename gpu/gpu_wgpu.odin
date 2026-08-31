@@ -581,10 +581,12 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         case: panic("Index buffer format not supported")
         }
 
+        offset_bytes := u64(index_offset) * u64(index_buffer.native.index_bytes)
+        assert(offset_bytes <= u64(index_buffer.native.capacity), "index_offset past end of index buffer")
         wgpu.RenderPassEncoderSetIndexBuffer(
             _state.render_pass_encoder,
             index_buffer.native.buffer, index_format,
-            u64(index_buffer.native.offset), u64(index_buffer.native.capacity),
+            offset_bytes, u64(index_buffer.native.capacity) - offset_bytes,
         )
 
         wgpu.RenderPassEncoderDrawIndexed(
