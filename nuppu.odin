@@ -9,6 +9,7 @@ import "core:log"
 
 import "./platform"
 import "./gpu"
+import "bit_array"
 
 _ :: fmt
 _ :: log
@@ -43,6 +44,10 @@ State :: struct #align(64) {
 
     vertex: gpu.Arena,
     index: gpu.Arena,
+    frame_uniform: gpu.ptr,
+
+    built_in_meshes: [Built_in_mesh]bit_array.Handle,
+    meshes: bit_array.Bit_Array(Resource(Mesh), 512),
 }
 
 _state: ^State
@@ -61,6 +66,17 @@ App_Optional :: struct {
     window_title: string,
     init: proc(),
     deinit: proc(),
+}
+
+Resource :: struct($T: typeid) {
+    handle: bit_array.Handle,
+    data: T,
+    metadata: Metadata,
+}
+
+Metadata :: struct {
+    name: string,
+    created_at: runtime.Source_Code_Location,
 }
 
 run :: proc(desc: App_Desc($T)) {
@@ -215,56 +231,25 @@ _ready_up :: proc() {
     _state.vertex = gpu.arena_init(usage = .GPU_Storage)
     _state.index = gpu.arena_init(el_size = size_of(Vertex_Index), el_count = 1024, alignment = 4, usage = .GPU_Index)
 
-
-    // Quad
-    s :: 0.5
-    v := [4]Vertex {
-        pack_vertex( position = { -s, -s, +s }),
-        pack_vertex( position = { +s, -s, +s }),
-        pack_vertex( position = { +s, +s, +s }),
-        pack_vertex( position = { -s, +s, +s }),    
-    }
-
-    i := [6]Vertex_Index {
-        0, 1, 2, 2, 3, 0
-    }
-
-    upload := gpu.arena_init()
-    verts := gpu.arena_alloc(&upload, Vertex, uint(4))
-    intrinsics.mem_copy_non_overlapping(verts.cpu, &v, size_of(v))
-    indices := gpu.arena_alloc_raw(&upload, size_of(Vertex_Index), 6, 4)
-    intrinsics.mem_copy_non_overlapping(indices.cpu, &i, size_of(i))
-
-    mesh = push_mesh_zeroed(4, 6)
-
-    gpu.unmap(&upload.ptr)
-    gpu.begin_commands()
-    gpu.copy(mesh.verts, verts)
-    gpu.copy(mesh.indices, indices)
-    gpu.barrier(.Transfer, .All)
-    gpu.commit_commands()
+    _state.frame_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Engine_Uniform), align_of(Engine_Uniform), "Frame Uniform")
+    create_built_in_meshes()
 
     _state.initialized = true
 }
 
-mesh: Mesh
+global_frame_uniform :: proc() -> gpu.ptr {
+    return _state.frame_uniform
+}
+
+global_vertex_buffer :: proc() -> gpu.ptr {
+    return _state.vertex.ptr
+}
+
+global_index_buffer :: proc() -> gpu.ptr {
+    return _state.index.ptr
+}
 
 ///////////////////////////////////////////////////////////////
-
-@(require_results)
-push_mesh_zeroed :: proc(
-    vertex_count: u32,
-    index_count: u32,
-) -> Mesh {
-
-    return Mesh {
-        vertex_count = vertex_count,
-        index_count = index_count,
-        verts = gpu.arena_alloc(&_state.vertex, Vertex, uint(vertex_count)),
-        indices = gpu.arena_alloc_raw(&_state.index, size_of(Vertex_Index), uint(index_count), 4)
-    }
-
-}
 
 _render_alpha :: proc() -> f32 {
     return f32(_state.accumulator) / f32(SIM_NS_PER_TICK)
@@ -327,4 +312,18 @@ compute_screen_layout :: proc(window_w, window_h: i32, internal_w, internal_h: i
         scissor_w = scissor_w,
         scissor_h = scissor_h,
     }
+}
+
+add_resource :: proc(array: ^bit_array.Bit_Array(Resource($T), $N), res: T, meta: Metadata) -> bit_array.Handle {
+    resource_handle := bit_array.add(array, Resource(T) {
+        data = res,
+        metadata = meta,
+    })
+
+    return resource_handle
+}
+
+get_resource :: proc(array: ^bit_array.Bit_Array(Resource($T), $N), handle: bit_array.Handle) -> (^T, bool) {
+    resource_ptr, ok := bit_array.get(array, handle)
+    return &resource_ptr.data, ok
 }
