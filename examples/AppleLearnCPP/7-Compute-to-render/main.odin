@@ -95,6 +95,7 @@ when ODIN_OS == .JS {
         type = ._2D,
         storage = .Shared,
         usage = {.Write, .Sampled},
+        layer_count = 1,
     })
 
     state.kernel = gpu.shader_init("my_compute_shader", compute_code)

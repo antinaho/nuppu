@@ -108,9 +108,9 @@ render :: proc(prev, curr: ^Window, alpha: f32) {
     cam_ptr := gpu.arena_alloc(frame_arena, nuppu.Engine_Uniform, 1)
     
     cam := nuppu.Engine_Uniform {
-        perspective_transform = glm.mat4Perspective(glm.radians_f32(45), nuppu.aspect_ratio(), 0.03, 500),
-		world_transform = 1,
-        camera_position = {},
+        cam_perspective_transform = glm.mat4Perspective(glm.radians_f32(45), nuppu.aspect_ratio(), 0.03, 500),
+		cam_view_transform = 1,
+        cam_position = {},
         _pad = {},
     }
 

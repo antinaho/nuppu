@@ -87,6 +87,7 @@ when ODIN_OS == .JS {
         type = ._2D,
         storage = .Shared,
         usage = {.Sampled},
+        layer_count = 1,
     })
 
     pixels := make([][4]u8, TW * TH, context.temp_allocator)

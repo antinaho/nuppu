@@ -1,6 +1,8 @@
 struct v2f {
     float4 position : SV_Position;
     float3 color    : COLOR0;
+    float2 tex_coord : TEXCOORD0;
+    uint   layer    : LAYER;
 };
 
 struct Vertex {
@@ -14,12 +16,24 @@ struct Vertex {
 struct Sprite_Instance {
     float4 position_color;   // off 0:  xyz = position, w = color RGBA u8 packed
     uint2  uv_min_size;      // off 16: x = uv_min u16-pair, y = uv_size u16-pair
-    uint2  scale_turns;      // off 24: x = scale u16-pair (sx, sy), y = turns[0..2] u8 + pad
+    uint2  scale_turns;      // off 24: x = scale u16-pair (sx, sy), y = turns[0..2] u8 + texture_layer u8
 };
 
+struct Engine_Uniform {
+    float4x4 perspective_transform;
+    float4x4 ortho_transform;
+    float4x4 world_transform;
+    float4 camera_position;
+}
+
 struct FrameData {
+    ConstantBuffer<Engine_Uniform> uniforms;
+
     StructuredBuffer<Vertex>          verts;
     StructuredBuffer<Sprite_Instance> instances;
+    Texture2DArray<float4>            textures;
+
+    SamplerState sampler;
 };
 
 ParameterBlock<FrameData> data;
@@ -57,7 +71,7 @@ v2f vertexMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) {
 
     // Vertex decode
     float3 vpos = v.position_uv.xyz;
-    float2 uv = float2(
+    float2 v_uv = float2(
         float((asuint(v.position_uv.w) >>  0) & 0xFFFFu),
         float((asuint(v.position_uv.w) >> 16) & 0xFFFFu)
     ) * (1.0 / 65535.0);
@@ -75,14 +89,15 @@ v2f vertexMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) {
 
     float sx = unpack_scale(i.scale_turns.x);
     float sy = unpack_scale(i.scale_turns.x >> 16);
-    // turns byte layout in scale_turns.y (little-endian u32 at offset 28):
+    // scale_turns.y (little-endian u32 at offset 28):
     //   byte 0 = turns[0] (pitch / rotation.x)
     //   byte 1 = turns[1] (yaw   / rotation.y)
     //   byte 2 = turns[2] (roll  / rotation.z)
-    //   byte 3 = _pad
+    //   byte 3 = texture_layer
     float pitch = unpack_turn( i.scale_turns.y        & 0xFFu);
     float yaw   = unpack_turn((i.scale_turns.y >>  8) & 0xFFu);
     float roll  = unpack_turn((i.scale_turns.y >> 16) & 0xFFu);
+    uint  layer = (i.scale_turns.y >> 24) & 0xFFu;
 
     // T * R_z * R_y * R_x * S  (ZYX Euler; reduces to 2D Z-rotation when pitch = yaw = 0)
     float cp   = cos(pitch), sp   = sin(pitch);
@@ -97,12 +112,19 @@ v2f vertexMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) {
     );
 
     v2f o;
-    o.position = mul(m, float4(vpos, 1.0));
+
+    float4 world_pos = mul(m, float4(vpos, 1.0));
+    world_pos = mul(data.uniforms.world_transform, world_pos);
+    o.position = mul(data.uniforms.perspective_transform, world_pos);
+
     o.color    = icol.xyz;
+    o.tex_coord = uv_min + v_uv * uv_size;
+    o.layer    = layer;
     return o;
 }
 
 [shader("fragment")]
 float4 fragmentMain(v2f in) : SV_Target {
-    return float4(in.color, 1.0);
+    float3 texel = data.textures.Sample(data.sampler, float3(in.tex_coord, in.layer)).rgb;
+    return float4(in.color * texel, 1.0);
 }

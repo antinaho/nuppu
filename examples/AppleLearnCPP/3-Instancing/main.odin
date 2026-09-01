@@ -71,6 +71,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
             uv_size = {1, 1},
             rotation = {0, 0, angle},
             scale = {scl, scl},
+            texture_layer = 0,
         )
     }
     gpu.unmap(&frame_arena.ptr)

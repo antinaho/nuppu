@@ -83,7 +83,6 @@ float4 fragmentMain(v2f in) : SV_Target
 //     -stage vertex \
 //     -o examples/AppleLearnCPP/4-Perspective/perspective.vs.metal \
 
-
 // slangc examples/AppleLearnCPP/4-Perspective/perspective.slang \
 //     -target metal \
 //     -entry fragmentMain \
@@ -97,3 +96,16 @@ float4 fragmentMain(v2f in) : SV_Target
 //     -entry fragmentMain \
 //     -stage fragment \
 //     -o examples/AppleLearnCPP/4-Perspective/perspective.wgsl
+
+// slangc examples/AppleLearnCPP/3-Instancing_camera/instancing.slang \
+//     -target metal \
+//     -entry vertexMain \
+//     -stage vertex \
+//     -o examples/AppleLearnCPP/3-Instancing_camera/instancing.vs.metal \
+
+
+// slangc examples/AppleLearnCPP/3-Instancing_camera/instancing.slang \
+//     -target metal \
+//     -entry fragmentMain \
+//     -stage fragment \
+//     -o examples/AppleLearnCPP/3-Instancing_camera/instancing.ps.metal
