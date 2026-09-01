@@ -11,9 +11,6 @@ import "core:strconv"
 import "core:strings"
 import glm "core:math/linalg/glsl"
 
-// ---------------------------------------------------------------------------
-// Unit meshes
-// ---------------------------------------------------------------------------
 // Camera
 
 Camera :: struct {
@@ -25,16 +22,16 @@ Camera :: struct {
     aspect_ratio: f32,
 }
 
-Camera_Data :: struct #align(16) {
-    to_clip:  glm.mat4,
-    to_view:  glm.mat4,
-}
-
-camera_data :: proc(camera: Camera, centre: [3]f32, up: [3]f32 = {0, 1, 0}) -> Camera_Data {
-    return Camera_Data {
-		to_clip = glm.mat4Perspective(glm.radians_f32(camera.fovy), camera.aspect_ratio, camera.near, camera.far),
-        to_view = glm.mat4LookAt(camera.position, centre, up),
+frame_uniform :: proc(camera: Camera) -> Engine_Uniform {
+	uniform_data := Engine_Uniform {
+        cam_perspective_transform = glm.mat4Perspective(glm.radians_f32(camera.fovy), camera.aspect_ratio, camera.near, camera.far),
+		cam_ortho_transform = 1,
+        cam_view_transform = glm.mat4Translate(-camera.position),
+        cam_position = camera.position,
+        _pad = {},
     }
+
+	return uniform_data
 }
 
 update_camera :: proc(prev_camera: Camera, curr_camera: Camera, alpha: f32) -> Camera {
@@ -43,7 +40,7 @@ update_camera :: proc(prev_camera: Camera, curr_camera: Camera, alpha: f32) -> C
         near = math.lerp(prev_camera.near, curr_camera.near, alpha),
         far = math.lerp(prev_camera.far, curr_camera.far, alpha),
         fovy = math.lerp(prev_camera.fovy, curr_camera.fovy, alpha),
-        aspect_ratio = math.lerp(prev_camera.aspect_ratio, curr_camera.aspect_ratio, alpha),
+        aspect_ratio = curr_camera.aspect_ratio,
     }
 }
 

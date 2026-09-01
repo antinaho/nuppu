@@ -45,6 +45,7 @@ State :: struct #align(64) {
     vertex: gpu.Arena,
     index: gpu.Arena,
     frame_uniform: gpu.ptr,
+    sprite_instances: gpu.ptr,
 
     built_in_meshes: [Built_in_mesh]bit_array.Handle,
     meshes: bit_array.Bit_Array(Resource(Mesh), 512),
@@ -232,9 +233,14 @@ _ready_up :: proc() {
     _state.index = gpu.arena_init(el_size = size_of(Vertex_Index), el_count = 1024, alignment = 4, usage = .GPU_Index)
 
     _state.frame_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Engine_Uniform), align_of(Engine_Uniform), "Frame Uniform")
+    _state.sprite_instances = gpu.malloc(.GPU_Storage, 1024, size_of(Sprite_Instance), align_of(Sprite_Instance), "Sprite Instances")
     create_built_in_meshes()
 
     _state.initialized = true
+}
+
+global_sprite_instances :: proc() -> gpu.ptr {
+    return _state.sprite_instances
 }
 
 global_frame_uniform :: proc() -> gpu.ptr {
