@@ -8,18 +8,12 @@ import "core:math"
 import "core:math/linalg"
 
 State :: struct {
-    instance_gpu: gpu.ptr,
-
     angle: f32,
 
     pso: gpu.Pipeline,
 }
 
 INSTANCE_COUNT :: 32
-Instance_Data :: struct #align(16) {
-    transform: matrix[4, 4]f32,
-    color: [4]f32
-}
 
 state: ^State
 import "core:mem"
@@ -51,11 +45,6 @@ when ODIN_OS == .JS {
     state.pso = gpu.pipeline_init(vertex_shader, fragment_shader, {
         color_format = .BGRA8Unorm,
     })
-    NUM_VERTICES :: 4
-    NUM_INDICES :: 6
-    s :: 0.5
-
-    state.instance_gpu = gpu.malloc(.GPU_Storage, INSTANCE_COUNT, size_of(Instance_Data), align_of(Instance_Data), "Instances")
 }
 
 _update :: proc() {
@@ -69,22 +58,24 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.begin_frame()
     frame_arena := gpu.frame_arena()
 
-    instances := gpu.arena_alloc(frame_arena, Instance_Data, INSTANCE_COUNT)
-    for &isnt, idx in ([^]Instance_Data)(instances.cpu)[:INSTANCE_COUNT] {
+    instances := gpu.arena_alloc(frame_arena, nuppu.Sprite_Instance, INSTANCE_COUNT)
+    for &isnt, idx in ([^]nuppu.Sprite_Instance)(instances.cpu)[:INSTANCE_COUNT] {
         i := f32(idx) / f32(INSTANCE_COUNT)
         x_off := (i * 2 - 1) + (1.0 / INSTANCE_COUNT)
         y_off := math.sin((i + angle) * 2 * math.PI)
-        isnt.transform = linalg.transpose(matrix[4, 4]f32{
-            scl * math.sin(angle), scl * math.cos(angle), 0, 0,
-            scl * math.cos(angle), -scl * math.sin(angle), 0, 0,
-            0, 0, scl, 0,
-            x_off, y_off, 0, 1
-        })
-        isnt.color = [4]f32{i, 1 - i, math.sin(math.PI * i), 1}
+
+        isnt = nuppu.pack_sprite_instance(
+            position = {x_off, y_off, 0},
+            color = {i, 1 - i, math.sin(math.PI * i), 1},
+            uv_min = {0, 0},
+            uv_size = {1, 1},
+            rotation = {0, 0, angle},
+            scale = {scl, scl},
+        )
     }
     gpu.unmap(&frame_arena.ptr)
 
-    gpu.copy(current.instance_gpu, instances)
+    gpu.copy(nuppu.global_sprite_instances(), instances)
     gpu.barrier(.Transfer, .All)
 
     swapchain := gpu.acquire_next_swapchain()
@@ -104,7 +95,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
         constants = {},
         read_resources = {
             0 = quad_mesh.verts,
-            1 = current.instance_gpu,
+            1 = nuppu.global_sprite_instances(),
         },
         read_write_resources = {},
         samplers = {},
@@ -113,12 +104,14 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.use_parameter_block(&block)
     //gpu.set_buffers({current.pos_gpu, current.instance_gpu}, {0, 2}, .Vertex)
 
-    gpu.draw_indiced_primitives(
-    .Triangle,
-    quad_mesh.indices,
-    quad_mesh.index_count, 0,
-    INSTANCE_COUNT,
-    0, 0)
+    nuppu.draw_mesh(quad_mesh, INSTANCE_COUNT)
+
+    // gpu.draw_indiced_primitives(
+    // .Triangle,
+    // quad_mesh.indices,
+    // quad_mesh.index_count, 0,
+    // INSTANCE_COUNT,
+    // 0, 0)
 
     gpu.end_render_pass()
 
