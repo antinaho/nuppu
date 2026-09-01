@@ -183,11 +183,13 @@ Sampler_Descriptor :: struct {
 }
 
 Texture :: struct {
+
     using native: _Texture,
 }
 
 Texture_Type :: enum u8 {
     _2D,
+    _2D_Array,
 }
 
 Texture_Descriptor :: struct #all_or_none {
@@ -196,6 +198,7 @@ Texture_Descriptor :: struct #all_or_none {
     storage: StorageMode,
     usage: Texture_Usage,
     type: Texture_Type,
+    layer_count: u32, // 0 == 1
 }
 
 StorageMode :: enum u8 {
@@ -495,6 +498,7 @@ texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture 
         usage = {.Depth_Attachment},
         storage = .Private,
         type = ._2D,
+        layer_count = 1,
     }
     return texture_init(desc)
 }
