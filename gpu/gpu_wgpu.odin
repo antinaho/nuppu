@@ -60,6 +60,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         },
         view:   wgpu.TextureView,
         access: wgpu.StorageTextureAccess,
+        type:   Texture_Type,
     }
 
     _Depth_Stencil_State :: wgpu.DepthStencilState
@@ -298,9 +299,9 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         write_size := wgpu.Extent3D {
             width              = u32(size.x),
             height             = u32(size.y),
-            depthOrArrayLayers = u32(size.z),
+            depthOrArrayLayers = 1,
         }
-        data_size := uint(bytes_per_row) * uint(size.y) * uint(max(size.z, 1))
+        data_size := uint(bytes_per_row) * uint(size.y)
 
         wgpu.QueueWriteTexture(_state.queue, &destination, data, data_size, &layout, &write_size)
     }
@@ -408,6 +409,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         result := _Texture {
             surface_texture = surface_texture,
             view = view,
+            type = ._2D,
         }
 
         return result
@@ -491,8 +493,10 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     }
 
     _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
+        layers := max(texture_descriptor.layer_count, 1)
+
         desc: wgpu.TextureDescriptor
-        desc.size = {texture_descriptor.dimensions.x, texture_descriptor.dimensions.y, 1}
+        desc.size = {texture_descriptor.dimensions.x, texture_descriptor.dimensions.y, layers}
         desc.mipLevelCount = 1
         desc.sampleCount = 1
         desc.dimension = _texture_type_interop(texture_descriptor.type)
@@ -504,13 +508,27 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             log.panic("gpu_wgpu.odin: MTL_texture_init: failed to create texture")
         }
 
-        view := wgpu.TextureCreateView(texture, nil)
-
-        return _Texture {
-            texture = texture,
-            view = view,
-            access = _texture_access_interop(texture_descriptor.usage),
+        switch texture_descriptor.type {
+        case ._2D:
+            return _Texture {
+                texture = texture,
+                view = wgpu.TextureCreateView(texture, nil),
+                access = _texture_access_interop(texture_descriptor.usage),
+                type = ._2D,
+            }
+        case ._2D_Array:
+            view_desc := wgpu.TextureViewDescriptor {
+                dimension = ._2DArray,
+                arrayLayerCount = layers,
+            }
+            return _Texture {
+                texture = texture,
+                view = wgpu.TextureCreateView(texture, &view_desc),
+                access = _texture_access_interop(texture_descriptor.usage),
+                type = ._2D_Array,
+            }
         }
+        unreachable()
     }
 
     _set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
@@ -789,14 +807,27 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             case Texture:
                 if res.native.texture == nil { continue }
 
-                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                    binding = u32(count),
-                    visibility = {.Vertex, .Fragment, .Compute},
-                    texture = wgpu.TextureBindingLayout{
-                        sampleType = .Float,
-                        viewDimension = ._2D,
-                        multisampled = false,
-                    },
+                switch res.native.type {
+                case ._2D:
+                    bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                        binding = u32(count),
+                        visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
+                        texture = wgpu.TextureBindingLayout{
+                            sampleType = .Float,
+                            viewDimension = ._2D,
+                            multisampled = false,
+                        },
+                    }
+                case ._2D_Array:
+                    bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                        binding = u32(count),
+                        visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
+                        texture = wgpu.TextureBindingLayout{
+                            sampleType = .Float,
+                            viewDimension = ._2DArray,
+                            multisampled = false,
+                        },
+                    }
                 }
 
                 bg_entries[count] = wgpu.BindGroupEntry{
@@ -834,14 +865,27 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             case Texture:
                 if res.native.texture == nil { continue }
 
-                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                    binding = u32(count),
-                    visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
-                    storageTexture = wgpu.StorageTextureBindingLayout{
-                        access = res.native.access,
-                        format = wgpu.TextureGetFormat(res.native.texture),
-                        viewDimension = ._2D,
-                    },
+                switch res.native.type {
+                case ._2D:
+                    bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                        binding = u32(count),
+                        visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
+                        storageTexture = wgpu.StorageTextureBindingLayout{
+                            access = res.native.access,
+                            format = wgpu.TextureGetFormat(res.native.texture),
+                            viewDimension = ._2D,
+                        },
+                    }
+                case ._2D_Array:
+                    bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                        binding = u32(count),
+                        visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
+                        storageTexture = wgpu.StorageTextureBindingLayout{
+                            access = res.native.access,
+                            format = wgpu.TextureGetFormat(res.native.texture),
+                            viewDimension = ._2DArray,
+                        },
+                    }
                 }
 
                 bg_entries[count] = wgpu.BindGroupEntry{
@@ -1106,7 +1150,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     _texture_type_interop :: proc(texture_type: Texture_Type) -> wgpu.TextureDimension {
         switch texture_type {
-        case ._2D:
+        case ._2D, ._2D_Array:
             return ._2D
         }
         unreachable()

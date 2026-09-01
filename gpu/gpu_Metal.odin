@@ -33,12 +33,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     _Texture :: struct #all_or_none {
         type: Texture_Type,
         usage: Texture_Usage,
-        
-        using _ : struct #raw_union {
-            texture: ^MTL.Texture,
-            texture_array: []^MTL.Texture,
-        }
-
+        texture: ^MTL.Texture,
     }
 
     _Depth_Stencil_State :: ^MTL.DepthStencilState
@@ -125,28 +120,22 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     _copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
         native := texture.native
 
-        switch native.type {
-        case ._2D:
-            region := MTL.Region {
-                origin = MTL.Origin {NS.Integer(origin.x), NS.Integer(origin.y), NS.Integer(origin.z)},
-                size = MTL.Size {
-                    width = NS.Integer(size.x),
-                    height = NS.Integer(size.y),
-                    depth = NS.Integer(size.z),
-                },
-            }
-    
-            native.texture->replaceRegion(region, NS.UInteger(level), data, NS.UInteger(bytes_per_row))
-        case ._2D_Array:
-            assert(origin.z >= 0 && int(origin.z) < len(native.texture_array), "copy_to_texture: array layer out of range")
-            layer := native.texture_array[origin.z]
-            region := MTL.Region {
-                origin = MTL.Origin {NS.Integer(origin.x), NS.Integer(origin.y), 0},
-                size = MTL.Size { NS.Integer(size.x), NS.Integer(size.y), NS.Integer(size.z) },
-            }
-            layer->replaceRegion(region, NS.UInteger(level), data, NS.UInteger(bytes_per_row))
+        region := MTL.Region {
+            origin = MTL.Origin {NS.Integer(origin.x), NS.Integer(origin.y), 0},
+            size = MTL.Size {
+                width  = NS.Integer(size.x),
+                height = NS.Integer(size.y),
+                depth  = 1,
+            },
         }
 
+        switch native.type {
+        case ._2D:
+            native.texture->replaceRegion(region, NS.UInteger(level), data, NS.UInteger(bytes_per_row))
+        case ._2D_Array:
+            bytes_per_image := NS.UInteger(bytes_per_row) * NS.UInteger(size.y)
+            native.texture->replaceRegionWithLevel(region, NS.UInteger(level), NS.UInteger(origin.z), data, NS.UInteger(bytes_per_row), bytes_per_image)
+        }
     }
 
     _depth_stencil_state_init :: proc(depth_descriptor: Depth_Stencil_State_Descriptor) -> _Depth_Stencil_State { 
@@ -326,50 +315,28 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
         desc := MTL.TextureDescriptor.alloc()->init()
         defer desc->release()
-
-        layers := max(texture_descriptor.layer_count, 1)
-
+        
         desc->setWidth(NS.UInteger(texture_descriptor.dimensions.x))
         desc->setHeight(NS.UInteger(texture_descriptor.dimensions.y))
         desc->setPixelFormat(_pixel_format_interop(texture_descriptor.format))
         desc->setUsage(_texture_usage_interop(texture_descriptor.usage))
         desc->setStorageMode(_storage_mode_interop(texture_descriptor.storage))
+        desc->setTextureType(_texture_type_interop(texture_descriptor.type))
         
-        // Only setting type for 2D and 3D textures, array is custom implementation
-        // Custom type is carried over with _Texture
-        actual_type: MTL.TextureType
-        switch texture_descriptor.type {
-        case ._2D, ._2D_Array:
-            actual_type = .Type2D
+        layers := max(texture_descriptor.layer_count, 1)
+        if texture_descriptor.type == ._2D_Array {
+            desc->setArrayLength(NS.UInteger(layers))
         }
-        desc->setTextureType(actual_type)
 
-        switch texture_descriptor.type {
-        case ._2D:
-            texture := _state.device->newTextureWithDescriptor(desc)
-            if texture == nil {
-                log.panic("gpu_MTL.odin: MTL_texture_init: failed to create texture")
-            }
+        texture := _state.device->newTextureWithDescriptor(desc)
+        if texture == nil {
+            log.panic("gpu_MTL.odin: MTL_texture_init: failed to create texture")
+        }
 
-            return _Texture { 
-                type = texture_descriptor.type,
-                texture = texture,
-                usage = texture_descriptor.usage }
-        case ._2D_Array:
-            texture_array := make([]^MTL.Texture, len=layers, allocator=context.allocator)
-            for i in 0 ..< layers {
-                texture := _state.device->newTextureWithDescriptor(desc)
-                if texture == nil {
-                    log.panic("gpu_MTL.odin: MTL_texture_init: failed to create texture")
-                }
-                texture_array[i] = texture
-            }
-            
-            return _Texture { 
-                type = texture_descriptor.type,
-                texture_array = texture_array,
-                usage = texture_descriptor.usage }
-        case: unreachable()
+        return _Texture {
+            type = texture_descriptor.type,
+            texture = texture,
+            usage = texture_descriptor.usage,
         }
     }
 
@@ -555,31 +522,15 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
                 
                 append(&data, uintptr(res.gpu))
             case Texture:
-                switch res.native.type {
-                case ._2D:
-                    if res.native.texture == nil { continue }
+                if res.native.texture == nil { continue }
 
-                    if destination == .Graphics {
-                        _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
-                    } else {
-                        _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
-                    }
-
-
-                    append(&data, uintptr(res.native.texture->gpuResourceID()))
-                case ._2D_Array:
-                    for texture_element in res.native.texture_array {
-                        if texture_element == nil { continue }
-
-                        if destination == .Graphics {
-                            _state.render_command_encoder->useResourceWithStages(texture_element, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
-                        } else {
-                            _compute_command_encoder()->useResource(texture_element, _texture_resource_usage_interop(res.native.usage))
-                        }
-
-                        append(&data, uintptr(texture_element->gpuResourceID()))
-                    } 
+                if destination == .Graphics {
+                    _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
+                } else {
+                    _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
                 }
+
+                append(&data, uintptr(res.native.texture->gpuResourceID()))
             }
         }
 
@@ -596,29 +547,15 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
                 append(&data, uintptr(res.gpu))
             case Texture:
-                switch res.native.type {
-                case ._2D:
-                    if res.native.texture == nil { continue }
+                if res.native.texture == nil { continue }
 
-                    if destination == .Graphics {
-                        _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
-                    } else {
-                        _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
-                    }
-
-                    append(&data, uintptr(res.native.texture->gpuResourceID()))
-                case ._2D_Array:
-                    for texture_element in res.native.texture_array {
-                        if texture_element == nil { continue }
-
-                        if destination == .Graphics {
-                            _state.render_command_encoder->useResourceWithStages(texture_element, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
-                        } else {
-                            _compute_command_encoder()->useResource(texture_element, _texture_resource_usage_interop(res.native.usage))
-                        }
-                        append(&data, uintptr(texture_element->gpuResourceID()))
-                    }
+                if destination == .Graphics {
+                    _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
+                } else {
+                    _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
                 }
+
+                append(&data, uintptr(res.native.texture->gpuResourceID()))
             }
         }
 
