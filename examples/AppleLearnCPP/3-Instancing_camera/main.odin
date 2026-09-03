@@ -9,11 +9,13 @@ import "core:math/linalg"
 import "core:image"
 import "core:image/png"
 import glm "core:math/linalg/glsl"
+import "base:intrinsics"
 
 State :: struct {
     angle: f32,
 
     pso:      gpu.Pipeline,
+    depth_pso: gpu.Depth_Stencil_State,
     textures: gpu.Texture,
     sampler:  gpu.Sampler,
 
@@ -50,9 +52,11 @@ _init :: proc() {
         entry_point = "fragmentMain",
     }
 
+    state.depth_pso = gpu.depth_stencil_state_init({compare = .Less, write_enabled = true})
+
     state.pso = gpu.pipeline_init(vertex_shader, fragment_shader, {
         color_format = .BGRA8Unorm,
-        depth_format = .None,
+        depth_format = .Depth32Float,
     })
 
     state.textures = gpu.texture_init({
@@ -80,30 +84,60 @@ _init :: proc() {
 }
 
 _update :: proc() {
-    state.angle += nuppu.sim_delta_time() * 0.5
+    state.angle += nuppu.sim_delta_time() * 0.09
 }
 
 _render :: proc(previous, current: ^State, alpha: f32) {
     scl :: 0.33
     angle := math.lerp(previous.angle, current.angle, alpha)
 
+    nuppu._batch.len = 0
+    nuppu._batch.cap = 0
+
+    nuppu._batch_2.len = 0
+    nuppu._batch_2.cap = 0
+
     gpu.begin_frame()
     frame_arena := gpu.frame_arena()
 
-    instances := gpu.arena_alloc(frame_arena, nuppu.Sprite_Instance, INSTANCE_COUNT)
-    for &isnt, idx in ([^]nuppu.Sprite_Instance)(instances.cpu)[:INSTANCE_COUNT] {
+    for idx in 0 ..< INSTANCE_COUNT {
         i := f32(idx) / f32(INSTANCE_COUNT)
         x_off := (i * 2 - 1) + (1.0 / INSTANCE_COUNT)
         y_off := math.sin((i + angle) * 2 * math.PI)
 
-        isnt = nuppu.pack_sprite_instance(
+        nuppu.draw_sprite(
             position      = {x_off, y_off, 0},
-            //color = {i, 1 - i, math.sin(math.PI * i), 1},
             rotation      = {0, 0, angle},
             scale         = {scl, scl},
-            texture_layer = u32(idx % 2),
+            material_idx = u32(idx % 2),
         )
     }
+
+    for idx in 0 ..< INSTANCE_COUNT {
+        i := f32(idx) / f32(INSTANCE_COUNT)
+        x_off := (i * 2 - 1) + (1.0 / INSTANCE_COUNT)
+        y_off := math.sin((i + angle) * 2 * math.PI)
+
+        nuppu.draw_cube(
+            position      = {-y_off, -x_off, x_off * 0.5},
+            rotation      = {0, angle, 0},
+            scale         = {scl, scl, scl},
+            material_idx = u32(idx % 2),
+        )
+    }
+
+    nuppu._batch_2.last_len = nuppu._batch_2.len
+    nuppu._batch.last_len = nuppu._batch.len
+    
+    sprite_instances_base := gpu.arena_alloc_raw(frame_arena, size_of(nuppu.Instance), uint(nuppu._batch.len), align_of(nuppu.Instance))    
+    sprite_instances_data := gpu.arena_alloc_raw(frame_arena, size_of(nuppu.Sprite_Instance), uint(nuppu._batch.len), align_of(nuppu.Sprite_Instance))
+    intrinsics.mem_copy_non_overlapping(sprite_instances_base.cpu, nuppu._batch.base_instances, size_of(nuppu.Instance) * nuppu._batch.len)
+    intrinsics.mem_copy_non_overlapping(sprite_instances_data.cpu, nuppu._batch.frame_instances, size_of(nuppu.Sprite_Instance) * nuppu._batch.len)
+
+    cube_instances_base := gpu.arena_alloc_raw(frame_arena, size_of(nuppu.Instance), uint(nuppu._batch_2.len), align_of(nuppu.Instance))
+    cube_instances_data := gpu.arena_alloc_raw(frame_arena, size_of(nuppu.Mesh_Instance), uint(nuppu._batch_2.len), align_of(nuppu.Mesh_Instance))
+    intrinsics.mem_copy_non_overlapping(cube_instances_base.cpu, nuppu._batch_2.base_instances, size_of(nuppu.Instance) * nuppu._batch_2.len)
+    intrinsics.mem_copy_non_overlapping(cube_instances_data.cpu, nuppu._batch_2.frame_instances, size_of(nuppu.Mesh_Instance) * nuppu._batch_2.len)
 
     uniforms := gpu.arena_alloc(frame_arena, nuppu.Engine_Uniform, 1)
 
@@ -119,7 +153,12 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.unmap(&frame_arena.ptr)
 
     gpu.copy(nuppu.global_frame_uniform(), uniforms)
-    gpu.copy(nuppu.global_sprite_instances(), instances)
+
+    gpu.copy(nuppu.instances(), sprite_instances_base) // Sprite instances
+    gpu.copy(nuppu.instances(), cube_instances_base, nuppu._batch.len * size_of(nuppu.Instance)) // Cube instances
+
+    gpu.copy(nuppu.instances_data(), sprite_instances_data) // Sprites
+    gpu.copy(nuppu.instances_data(), cube_instances_data, nuppu._batch.len * size_of(nuppu.Sprite_Instance)) // Cubes
     gpu.barrier(.Transfer, .All)
 
     swapchain := gpu.acquire_next_swapchain()
@@ -128,25 +167,17 @@ _render :: proc(previous, current: ^State, alpha: f32) {
         load_action  = .Clear,
         store_action = .Store,
         texture      = swapchain,
-    }, {})
+    }, {
+        load_action = .Clear,
+        store_action = .Store,
+        texture = gpu.depth(),
+    })
 
     gpu.set_pipeline(current.pso)
+    gpu.set_depth_stencil_state(current.depth_pso)
 
-    quad_mesh := nuppu.get_built_in_mesh(.Quad)
-
-    block := gpu.Parameter_Block {
-        constants = { 0 = nuppu.global_frame_uniform() },
-        read_resources = {
-            0 = quad_mesh.verts,
-            1 = nuppu.global_sprite_instances(),
-            2 = current.textures,
-        },
-        read_write_resources = {},
-        samplers = { 0 = current.sampler },
-    }
-
-    gpu.use_parameter_block(&block)
-    nuppu.draw_mesh(quad_mesh, INSTANCE_COUNT)
+    nuppu.draw_mesh_builtin(.Quad, INSTANCE_COUNT)
+    nuppu.draw_mesh_builtin(.Cube, INSTANCE_COUNT, nuppu._batch.len)
 
     gpu.end_render_pass()
     gpu.end_frame()

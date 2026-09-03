@@ -76,7 +76,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     }
     gpu.unmap(&frame_arena.ptr)
 
-    gpu.copy(nuppu.global_sprite_instances(), instances)
+    gpu.copy(nuppu.global_instance_ptr(), instances)
     gpu.barrier(.Transfer, .All)
 
     swapchain := gpu.acquire_next_swapchain()
@@ -96,7 +96,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
         constants = {},
         read_resources = {
             0 = quad_mesh.verts,
-            1 = nuppu.global_sprite_instances(),
+            1 = nuppu.global_instance_ptr(),
         },
         read_write_resources = {},
         samplers = {},
@@ -105,7 +105,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.use_parameter_block(&block)
     //gpu.set_buffers({current.pos_gpu, current.instance_gpu}, {0, 2}, .Vertex)
 
-    nuppu.draw_mesh(quad_mesh, INSTANCE_COUNT)
+    nuppu.draw_mesh_ex(quad_mesh, INSTANCE_COUNT)
 
     // gpu.draw_indiced_primitives(
     // .Triangle,

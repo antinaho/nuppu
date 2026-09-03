@@ -161,7 +161,7 @@ render :: proc(prev, curr: ^Window, alpha: f32) {
     // gpu.set_front_face_winding(.CCW)
     // gpu.set_buffers({state.vertex_gpu, curr.instance_gpu, curr.camera_uniform}, {0, 3}, .Vertex)
     
-    nuppu.draw_mesh(cube_mesh, INSTANCE_COUNT)
+    nuppu.draw_mesh_ex(cube_mesh, INSTANCE_COUNT)
 
     gpu.end_render_pass()
 

@@ -97,12 +97,14 @@ float4 fragmentMain(v2f in) : SV_Target
 //     -stage fragment \
 //     -o examples/AppleLearnCPP/4-Perspective/perspective.wgsl
 
+
+
+
 // slangc examples/AppleLearnCPP/3-Instancing_camera/instancing.slang \
 //     -target metal \
 //     -entry vertexMain \
 //     -stage vertex \
 //     -o examples/AppleLearnCPP/3-Instancing_camera/instancing.vs.metal \
-
 
 // slangc examples/AppleLearnCPP/3-Instancing_camera/instancing.slang \
 //     -target metal \

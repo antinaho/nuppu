@@ -15,7 +15,7 @@ struct pixelInput_0
 {
     float3 color_0 [[user(COLOR)]];
     float2 tex_coord_0 [[user(TEXCOORD)]];
-    uint layer_0 [[user(LAYER)]];
+    uint material_0 [[user(MATERIAL)]];
 };
 
 
@@ -44,35 +44,34 @@ struct Vertex_natural_0
 };
 
 
-#line 2570
-struct Sprite_Instance_natural_0
+#line 44 "examples/AppleLearnCPP/3-Instancing_camera/instancing.slang"
+struct Instance_0
 {
-    packed_float4 position_color_0;
-    packed_uint2 uv_min_size_0;
-    packed_uint2 scale_turns_0;
+    uint kind_material_0;
+    uint extra_data_0;
 };
 
 
-#line 2570
+#line 49
 struct FrameData_default_0
 {
     Engine_Uniform_natural_0 constant* uniforms_0;
     Vertex_natural_0 device* verts_0;
-    Sprite_Instance_natural_0 device* instances_0;
+    Instance_0 device* instances_0;
+    uint32_t device* instances_data_0;
     texture2d_array<float, access::sample> textures_0;
     sampler sampler_0;
 };
 
 
-#line 127 "examples/AppleLearnCPP/3-Instancing_camera/instancing.slang"
+#line 242
 [[fragment]] pixelOutput_0 fragmentMain(pixelInput_0 _S1 [[stage_in]], float4 position_0 [[position]], FrameData_default_0 constant* data_1 [[buffer(0)]])
 {
 
+#line 243
+    float3 _S2 = float3(_S1.tex_coord_0, 0.0f);
 
-#line 128
-    float3 _S2 = float3(_S1.tex_coord_0, float(_S1.layer_0));
-
-#line 128
+#line 243
     pixelOutput_0 _S3 = { float4(_S1.color_0 * ((data_1->textures_0).sample((data_1->sampler_0), ((_S2)).xy, uint(((_S2)).z))).xyz, 1.0f) };
     return _S3;
 }
