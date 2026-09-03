@@ -6,6 +6,7 @@ import "core:mem"
 import "core:time"
 import "core:fmt"
 import "core:log"
+import "core:image"
 
 import "./platform"
 import "./gpu"
@@ -45,11 +46,27 @@ State :: struct #align(64) {
     vertex: gpu.Arena,
     index: gpu.Arena,
     frame_uniform: gpu.ptr,
-    sprite_instances: gpu.ptr,
 
+    
+    _instances: gpu.Arena,
+    _instances_data: gpu.Arena,
+    
+    
+    sampler: gpu.Sampler,
+
+
+    
+    
+    // Built-in resources, currently representing quad sprite
+    built_in_block: gpu.Parameter_Block,
+    built_in_textures: gpu.Texture,
+
+    //
+    meshes: bit_array.Bit_Array(Resource(Mesh), 128),
     built_in_meshes: [Built_in_mesh]bit_array.Handle,
-    meshes: bit_array.Bit_Array(Resource(Mesh), 512),
 }
+
+
 
 _state: ^State
 
@@ -228,27 +245,86 @@ _ready_up :: proc() {
     gpu.resize_swapchain(u32(_state.window_size.x), u32(_state.window_size.y))
     gpu.resize_depth(u32(_state.window_size.x), u32(_state.window_size.y))
 
-    // Currently forcing vertex to by Vertex type and index to Vertex_Index
-    _state.vertex = gpu.arena_init(usage = .GPU_Storage)
-    _state.index = gpu.arena_init(el_size = size_of(Vertex_Index), el_count = 1024, alignment = 4, usage = .GPU_Index)
-
+    // Global buffers wrapped in arena
+    VERTEX_BLOB_SIZE :: 16 * mem.Megabyte
+    GLOBAL_INDEX_COUNT_MAX :: 1 << 16
+    
+    MAX_INSTANCES :: 10_000
+    INSTANCE_BLOB_SIZE :: 64 * mem.Megabyte
+    
+    // MAX_MATERIAL_COUNT :: 1 << 8 // If this raises need to increase material idx on sprite instance
+    
+    _state.vertex = gpu.arena_init(el_size = VERTEX_BLOB_SIZE, el_count = 1, alignment = 16, usage = .GPU_Storage)
+    _state.index = gpu.arena_init(el_size = size_of(Vertex_Index), el_count = GLOBAL_INDEX_COUNT_MAX, alignment = 4, usage = .GPU_Index)
+    _state._instances = gpu.arena_init(el_size = size_of(Instance), el_count = MAX_INSTANCES, alignment = align_of(Instance), usage = .GPU_Storage)
+    _state._instances_data = gpu.arena_init(el_size = INSTANCE_BLOB_SIZE, el_count = 1, alignment = 16, usage = .GPU_Storage)
+    //_state.materials = gpu.arena_init(el_size = size_of(Material), el_count = MAX_MATERIAL_COUNT, alignment = 16, usage = .GPU_Storage)
+    
+    // Global frame uniform
+    // Updated and binded once per frame
     _state.frame_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Engine_Uniform), align_of(Engine_Uniform), "Frame Uniform")
-    _state.sprite_instances = gpu.malloc(.GPU_Storage, 1024, size_of(Sprite_Instance), align_of(Sprite_Instance), "Sprite Instances")
+
+    // 
+    _state.built_in_textures = gpu.texture_init({
+        dimensions  = {63, 63},
+        format      = .RGBA8Unorm,
+        type        = ._2D_Array,
+        storage     = .Shared,
+        usage       = {.Sampled},
+        layer_count = 16,
+    })
+
+    _state.sampler = gpu.sampler_init({
+        mag_filter = .Nearest,
+        min_filter = .Nearest,
+        mip_filter = .Nearest,
+        wrap_r = .ClampToEdge,
+        wrap_s = .ClampToEdge,
+        wrap_t = .ClampToEdge,
+    })
+
+
+
+    _upload_png_to_array_layer :: proc(texture: gpu.Texture, layer: int, data: []u8, label: string) {
+        img, img_err := image.load_from_bytes(data, {.alpha_add_if_missing}, context.temp_allocator)
+        if img_err != nil {
+            panic(fmt.tprintf("3-Instancing_camera: failed to decode %s: %v", label, img_err))
+        }
+        defer image.destroy(img, context.temp_allocator)
+
+        gpu.copy_to_texture(texture, {0, 0, layer}, {img.width, img.height, 1}, 0, raw_data(img.pixels.buf[:]), u32(img.width * 4))
+    }
+
+    _upload_png_to_array_layer(_state.built_in_textures, 0, #load("./examples/AppleLearnCPP/3-Instancing_camera/bowser.png", []u8), "bowser.png")
+    _upload_png_to_array_layer(_state.built_in_textures, 1, #load("./examples/AppleLearnCPP/3-Instancing_camera/peach.png", []u8), "peach.png")
+
     create_built_in_meshes()
+
+    _state.built_in_block = gpu.Parameter_Block {
+        constants = { 0 = _state.frame_uniform },
+        read_resources = {
+            0 = {},
+            1 = _state._instances.ptr,
+            2 = _state._instances_data.ptr,
+            3 = _state.built_in_textures,
+        },
+        read_write_resources = {},
+        samplers = { 0 = _state.sampler },
+    }
 
     _state.initialized = true
 }
 
-global_sprite_instances :: proc() -> gpu.ptr {
-    return _state.sprite_instances
+instances :: proc() -> gpu.ptr {
+    return _state._instances.ptr
+}
+
+instances_data :: proc() -> gpu.ptr {
+    return _state._instances_data.ptr
 }
 
 global_frame_uniform :: proc() -> gpu.ptr {
     return _state.frame_uniform
-}
-
-global_vertex_buffer :: proc() -> gpu.ptr {
-    return _state.vertex.ptr
 }
 
 global_index_buffer :: proc() -> gpu.ptr {

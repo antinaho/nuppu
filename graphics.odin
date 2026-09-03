@@ -17,6 +17,7 @@ Vertex :: struct #align(16) {
 
 Vertex_Index :: u16
 
+
 Mesh :: struct #all_or_none {
     vertex_count:   u32,
     index_count:    u32,
@@ -24,11 +25,10 @@ Mesh :: struct #all_or_none {
     indices:        gpu.ptr,
 }
 
-Built_in_mesh :: enum {
+Built_in_mesh :: enum u32 {
     Quad,
     Cube,
 }
-
 
 @(require_results)
 push_mesh_zeroed :: proc(
@@ -56,16 +56,139 @@ get_built_in_mesh :: proc(built_in_mesh: Built_in_mesh) -> (^Mesh, bool) #option
 
 get_mesh :: proc(handle: bit_array.Handle) -> (^Mesh, bool) { return get_resource(&_state.meshes, handle) }
 
-draw_mesh :: proc(mesh: ^Mesh, instance_count: u32) {
+draw_sprite :: proc(
+    position:     [3]f32,
+    color:        [4]f32 = {1, 1, 1, 1},
+    uv_min:       [2]f32 = {0, 0},
+    uv_size:      [2]f32 = {1, 1},
+    rotation:     [3]f32 = {0, 0, 0},
+    scale:        [2]f32 = {1, 1},
+    material_idx: u32    = 0,
+) {
+
+    base_instance := Instance {
+        kind = .Sprite,
+        material_idx = .Default,
+        extra_data = _batch.len,
+    }
+    sprite_instance := pack_sprite_instance(position, color, uv_min, uv_size, rotation, scale, material_idx)
+
+    push_instance(&_batch, base_instance, sprite_instance)   
+}
+
+draw_cube :: proc(
+    position:     [3]f32,
+    color:        [4]f32 = {1, 1, 1, 1},
+    rotation:     [3]f32 = {0, 0, 0},
+    scale:        [3]f32 = {1, 1, 1},
+    material_idx: u32    = 0,
+) {
+
+    base_instance := Instance {
+        kind = .Mesh,
+        material_idx = .Default,
+        extra_data = _batch.len,
+    }
+
+    instance := pack_mesh_instance(position, color, rotation, scale, material_idx)
+
+    push_instance(&_batch_2, base_instance, instance)
+}
+
+Instance_Kind :: enum u16 {
+    Sprite = 0,
+    Mesh,
+}
+
+Material_Kind :: enum u16 {
+    Default = 0,
+}
+
+#assert(size_of(Instance) == 8)
+Instance :: struct #align(8) {
+    kind: Instance_Kind,
+    material_idx: Material_Kind,
+
+    extra_data: u32,
+}
+
+
+#assert(size_of(Mesh_Instance) == 32)
+Mesh_Instance :: struct #all_or_none #align(16) {
+    position: [3]f32,
+    color:    [4]u8,
+
+    scale: [3]u16,
+    turns: [3]u8,
+    material_index: u8,
+    _pad: [3]u8,
+}
+
+_batch_2: Instance_Batch(Mesh_Instance)
+_batch: Instance_Batch(Sprite_Instance)
+
+push_instance :: proc(batch :^Instance_Batch($T), base_instance: Instance, instance: T) {
+
+    if batch.len >= batch.cap {
+        batch.cap = math.max(batch.last_len + 64, batch.cap * 2)
+        frame_instances := make([^]T, len = batch.cap, allocator = context.temp_allocator)
+        base_instances := make([^]Instance, len = batch.cap, allocator = context.temp_allocator)
+        if batch.len > 0 {
+            intrinsics.mem_copy_non_overlapping(rawptr(frame_instances), batch.frame_instances, size_of(Sprite_Instance) * batch.len)
+            intrinsics.mem_copy_non_overlapping(rawptr(base_instances), batch.base_instances, size_of(Instance) * batch.len)
+        }
+        batch.base_instances = base_instances
+        batch.frame_instances = frame_instances
+    }
+
+    batch.base_instances[batch.len] = base_instance
+    batch.frame_instances[batch.len] = instance
+    batch.len += 1
+}
+
+Instance_Batch :: struct($T: typeid) {
+    len: u32,
+    last_len: u32,
+    cap: u32,
+    base_instances: [^]Instance,
+    frame_instances: [^]T,
+}
+
+
+draw_mesh_builtin :: proc(mesh_type: Built_in_mesh, instance_count: u32 = 1, base_instance: u32 = 0) {
+
+    mesh := get_built_in_mesh(mesh_type)
+
     base_vertex := u32(mesh.verts.offset / size_of(Vertex))
     first_index := u32(mesh.indices.offset / size_of(Vertex_Index))
 
+    _state.built_in_block.read_resources[0] = _state.vertex.ptr //mesh.verts
+
     gpu.draw_indiced_primitives(
-    .Triangle,
-    _state.index.ptr,
-    mesh.index_count, first_index,
-    instance_count,
-    base_vertex, 0)
+        &_state.built_in_block,
+        _state.index.ptr,
+        mesh.index_count,
+        first_index,
+        instance_count,
+        base_vertex,
+        base_instance
+    )
+}
+
+draw_mesh_ex :: proc(mesh: ^Mesh, parameter_block: ^gpu.Parameter_Block, instance_count: u32) {
+    base_vertex := u32(mesh.verts.offset / size_of(Vertex))
+    first_index := u32(mesh.indices.offset / size_of(Vertex_Index))
+    base_instance :u32= 0
+
+    gpu.draw_indiced_primitives(
+        parameter_block,
+        _state.index.ptr,
+        mesh.index_count,
+        first_index,
+        instance_count,
+        base_vertex,
+        base_instance
+    )
 }
 
 create_built_in_meshes :: proc() {
@@ -76,10 +199,10 @@ create_built_in_meshes :: proc() {
         VERTEX_COUNT :: 4
         INDEX_COUNT :: 6
         v := [VERTEX_COUNT]Vertex {
-            pack_vertex( position = { -s, -s, 0 }),
-            pack_vertex( position = { +s, -s, 0 }),
-            pack_vertex( position = { +s, +s, 0 }),
-            pack_vertex( position = { -s, +s, 0 }),    
+            pack_vertex( position = { -s, -s, 0 }, uv = { 0.0, 0.0 } ),
+            pack_vertex( position = { +s, -s, 0 }, uv = { 1.0, 0.0 } ),
+            pack_vertex( position = { +s, +s, 0 }, uv = { 1.0, 1.0 } ),
+            pack_vertex( position = { -s, +s, 0 }, uv = { 0.0, 1.0 } ),
         }
     
         i := [INDEX_COUNT]Vertex_Index {
@@ -109,38 +232,53 @@ create_built_in_meshes :: proc() {
     {
         // Cube
         s :: 0.5
-        VERTEX_COUNT :: 8
+        VERTEX_COUNT :: 24
         INDEX_COUNT :: 36
         v := [VERTEX_COUNT]Vertex {
-            pack_vertex( position = { -s, -s, +s }),
-            pack_vertex( position = { +s, -s, +s }),
-            pack_vertex( position = { +s, +s, +s }),
-            pack_vertex( position = { -s, +s, +s }),
-            pack_vertex( position = { -s, -s, -s }),
-            pack_vertex( position = { -s, +s, -s }),
-            pack_vertex( position = { +s, +s, -s }),
-            pack_vertex( position = { +s, -s, -s }),    
+            // Front (+Z)
+            pack_vertex( position = { -s, -s, +s }, uv = { 0, 0 } ),
+            pack_vertex( position = { +s, -s, +s }, uv = { 1, 0 } ),
+            pack_vertex( position = { +s, +s, +s }, uv = { 1, 1 } ),
+            pack_vertex( position = { -s, +s, +s }, uv = { 0, 1 } ),
+
+            // Right (+X)
+            pack_vertex( position = { +s, -s, +s }, uv = { 0, 0 } ),
+            pack_vertex( position = { +s, -s, -s }, uv = { 1, 0 } ),
+            pack_vertex( position = { +s, +s, -s }, uv = { 1, 1 } ),
+            pack_vertex( position = { +s, +s, +s }, uv = { 0, 1 } ),
+
+            // Back (-Z)
+            pack_vertex( position = { +s, -s, -s }, uv = { 0, 0 } ),
+            pack_vertex( position = { -s, -s, -s }, uv = { 1, 0 } ),
+            pack_vertex( position = { -s, +s, -s }, uv = { 1, 1 } ),
+            pack_vertex( position = { +s, +s, -s }, uv = { 0, 1 } ),
+
+            // Left (-X)
+            pack_vertex( position = { -s, -s, -s }, uv = { 0, 0 } ),
+            pack_vertex( position = { -s, -s, +s }, uv = { 1, 0 } ),
+            pack_vertex( position = { -s, +s, +s }, uv = { 1, 1 } ),
+            pack_vertex( position = { -s, +s, -s }, uv = { 0, 1 } ),
+
+            // Top (+Y)
+            pack_vertex( position = { -s, +s, +s }, uv = { 0, 0 } ),
+            pack_vertex( position = { +s, +s, +s }, uv = { 1, 0 } ),
+            pack_vertex( position = { +s, +s, -s }, uv = { 1, 1 } ),
+            pack_vertex( position = { -s, +s, -s }, uv = { 0, 1 } ),
+
+            // Bottom (-Y)
+            pack_vertex( position = { -s, -s, -s }, uv = { 0, 0 } ),
+            pack_vertex( position = { +s, -s, -s }, uv = { 1, 0 } ),
+            pack_vertex( position = { +s, -s, +s }, uv = { 1, 1 } ),
+            pack_vertex( position = { -s, -s, +s }, uv = { 0, 1 } ),
         }
 
         i := [INDEX_COUNT]Vertex_Index {
-            0, 1, 2, /* front */
-            2, 3, 0,
-
-            1, 7, 6, /* right */
-            6, 2, 1,
-
-
-            7, 4, 5, /* back */
-            5, 6, 7,
-
-            4, 0, 3, /* left */
-            3, 5, 4,
-
-            3, 2, 6, /* top */
-            6, 5, 3,
-
-            4, 7, 1, /* bottom */
-            1, 0, 4  
+            0,  1,  2,  2,  3,  0,    /* front  */
+            4,  5,  6,  6,  7,  4,    /* right  */
+            8,  9, 10, 10, 11,  8,    /* back   */
+            12, 13, 14, 14, 15, 12,   /* left   */
+            16, 17, 18, 18, 19, 16,   /* top    */
+            20, 21, 22, 22, 23, 20,   /* bottom */
         }
 
         upload := gpu.arena_init()
@@ -161,14 +299,7 @@ create_built_in_meshes :: proc() {
         gpu.copy(cube_mesh.indices, indices)
         gpu.barrier(.Transfer, .All)
         gpu.commit_commands()
-
     }
-    
-    
-    
-    
-
-    
 }
 
 /////////////////////////////////////////////////////
@@ -196,29 +327,62 @@ Sprite_Instance :: struct #all_or_none #align(16) {
 
     scale: [2]u16,
     turns: [3]u8,
-    _pad: u8,
+    material_index: u8,
 }
 
-pack_sprite_instance :: proc(
-    position: [3]f32,
-    color:    [4]f32,
-    uv_min:   [2]f32,
-    uv_size:  [2]f32,
-    rotation: [3]f32,
-    scale:    [2]f32,
-) -> Sprite_Instance {
-    return Sprite_Instance {
+#assert(size_of(Material) == 8)
+Material :: struct {
+    id: u16,
+    user_data_1: u16,
+    user_data_2: u32,
+}
+
+pack_mesh_instance :: proc(
+    position:     [3]f32,
+    color:        [4]f32 = {1, 1, 1, 1},
+    rotation:     [3]f32 = {0, 0, 0},
+    scale:        [3]f32 = {1, 1, 1},
+    material_idx: u32    = 0,
+) -> Mesh_Instance {
+    assert(material_idx < u32(max(u8) - 1))
+
+    return Mesh_Instance {
         position = position,
         color    = pack_color(color),
-        uv_min   = {pack_float01(uv_min.x), pack_float01(uv_min.y)},
-        uv_size  = {pack_float01(uv_size.x), pack_float01(uv_size.y)},
-        scale    = {pack_scale_f32(scale.x), pack_scale_f32(scale.y)},
+        scale    = { pack_scale_f32(scale.x), pack_scale_f32(scale.y), pack_scale_f32(scale.z) },
         turns    = {
             pack_radians_turn(rotation.x),
             pack_radians_turn(rotation.y),
             pack_radians_turn(rotation.z),
         },
-        _pad     = 0,
+        material_index = u8(material_idx),
+        _pad = {},
+    }
+} 
+
+pack_sprite_instance :: proc(
+    position:     [3]f32,
+    color:        [4]f32 = {1, 1, 1, 1},
+    uv_min:       [2]f32 = {0, 0},
+    uv_size:      [2]f32 = {1, 1},
+    rotation:     [3]f32 = {0, 0, 0},
+    scale:        [2]f32 = {1, 1},
+    material_idx: u32    = 0,
+) -> Sprite_Instance {
+    assert(material_idx < u32(max(u8) - 1))
+    
+    return Sprite_Instance {
+        position = position,
+        color    = pack_color(color),
+        uv_min   = { pack_float01(uv_min.x), pack_float01(uv_min.y) },
+        uv_size  = { pack_float01(uv_size.x), pack_float01(uv_size.y) },
+        scale    = { pack_scale_f32(scale.x), pack_scale_f32(scale.y) },
+        turns    = {
+            pack_radians_turn(rotation.x),
+            pack_radians_turn(rotation.y),
+            pack_radians_turn(rotation.z),
+        },
+        material_index = u8(material_idx),
     }
 }
 
