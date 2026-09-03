@@ -380,8 +380,10 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         _state.render_command_encoder->setFrontFacingWinding(_front_face_winding_interop(winding))
     }
 
-    _draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
+    _draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
         _state.render_command_encoder->setRenderPipelineState(_state.curr_pipeline)
+
+        _use_parameter_block(parameter_block, .Graphics)
 
         if instance_count == 0 {
             return
@@ -467,14 +469,14 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _unmap :: proc(ptr: ^_ptr) { /* no op in Metal */ }
 
-    _copy :: proc(dst, src: ptr) {
+    _copy :: proc(dst, src: ptr, dst_offset, src_offset: u32) {
         if _state.blit_command_encoder == nil {
             _state.blit_command_encoder = _state.command_buffer->blitCommandEncoder()
         }
 
         _state.blit_command_encoder->copyFromBuffer(
-            src.native.buffer, NS.UInteger(src.offset),
-            dst.native.buffer, NS.UInteger(dst.offset),
+            src.native.buffer, NS.UInteger(src.offset + uint(src_offset)),
+            dst.native.buffer, NS.UInteger(dst.offset + uint(dst_offset)),
             NS.UInteger(src.capacity),
         )
     }

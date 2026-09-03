@@ -86,8 +86,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         primitive: wgpu.PrimitiveState,
     }
 
-    MAX_BG_LAYOUT_CACHE_ENTRIES :: 32
-    MAX_PIPELINE_CACHE_ENTRIES  :: 32
+    MAX_BG_LAYOUT_CACHE_ENTRIES :: 64
+    MAX_PIPELINE_CACHE_ENTRIES  :: 64
 
     // Captures the full description of a bind group layout: the entry count
     // plus the entries themselves. Two signatures compare equal iff they
@@ -572,8 +572,10 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
     _set_front_face_winding :: proc(winding: Front_Face) {   
     }
 
-    _draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
+    _draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
         pipeline := _state.curr_pipeline
+
+        _use_parameter_block(parameter_block, .Graphics)
 
         bg_layout, pso_layout := _get_or_create_bg_layout()
         pso := _get_or_create_render_pipeline(
@@ -693,13 +695,13 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         ptr.is_mapped = false
     }
 
-    _copy :: proc(dst, src: ptr) {
+    _copy :: proc(dst, src: ptr, dst_offset, src_offset: u32) {
         wgpu.CommandEncoderCopyBufferToBuffer(
             _state.command_encoder,
             src.native.buffer,
-            u64(src.native.offset),
+            u64(src.native.offset + uint(src_offset)),
             dst.native.buffer,
-            u64(dst.native.offset),
+            u64(dst.native.offset + uint(dst_offset)),
             u64(src.capacity),
         )
     }

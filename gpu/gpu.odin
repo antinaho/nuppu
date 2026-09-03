@@ -530,8 +530,8 @@ temp_malloc :: proc(bytes: []u8, buffer_index: u32, shader_stage: Shader_Stage) 
 }
 }
 
-draw_indiced_primitives :: proc(primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
-    _draw_indiced_primitives(primitive, index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance)
+draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
+    _draw_indiced_primitives(parameter_block, .Triangle, index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance)
 }
 
 // Allocate a buffer of the given type.
@@ -593,10 +593,12 @@ unmap :: proc(ptr: ^ptr) {
 }
 
 // Copies src data into dst
-copy :: proc(dst, src: ptr) {
+copy :: proc(dst, src: ptr, dst_offset: u32 = 0, src_offset: u32 = 0) {
     _copy(
         dst,
         src,
+        dst_offset,
+        src_offset,
     )
 }
 
