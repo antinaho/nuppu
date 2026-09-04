@@ -733,6 +733,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
     }
 
+
+
     _recycle_frame_arena :: proc(arena: ^Arena) {
 
         //BufferMapCallback :: #type proc "c" (status: MapAsyncStatus, message: StringView, userdata1: rawptr, userdata2: rawptr)
@@ -753,6 +755,39 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             callback = callback_,
             userdata1 = arena,
         })
+    }
+
+    _bucket_arena_kick_remap :: proc(bucket_arena: ^Bucket_Arena($N)) {
+
+        for &bucket in bucket_arena.buckets {
+            if bucket.state != .Locked { continue }
+            if !bucket.buffer.native.is_mapped {
+                wgpu.BufferMapAsync(
+                    bucket.buffer.native.buffer,
+                    {.Write},
+                    0,
+                    bucket.buffer.native.capacity,
+                    wgpu.BufferMapCallbackInfo{
+                        mode = .AllowProcessEvents,
+                        callback = bucket_remap_callback,
+                        userdata1 = bucket,
+                    },
+                )
+            }
+        }
+    }
+
+    bucket_remap_callback :: proc "c" (status: wgpu.MapAsyncStatus, message: wgpu.StringView, userdata1: rawptr, userdata2: rawptr) {
+        context = _state.ctx
+        if status != .Success {
+            log.errorf("bucket_arena: failed to remap chunk: %v", message)
+            return
+        }
+        chunk := (^Bucket)(userdata1)
+        chunk.buffer.native.is_mapped = true
+        chunk.buffer.cpu             = wgpu.RawBufferGetMappedRange(chunk.buffer.native.buffer, 0, chunk.buffer.native.capacity)
+        chunk.cursor                  = 0
+        chunk.state = .Mapped
     }
 
     _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {

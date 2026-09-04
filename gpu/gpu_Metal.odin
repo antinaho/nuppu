@@ -496,6 +496,15 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         // end frame signals the semaphore
     }
 
+    _bucket_arena_kick_remap :: proc(arena: ^Bucket_Arena($T)) {
+        for &bucket in arena.buckets {
+            if bucket.state != .Locked { continue }
+            bucket.cursor = 0
+            bucket.state = .Mapped
+        }
+        /* no op in Metal; staging buffers stay mapped for life */
+    }
+
     _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {
         data := make([dynamic]uintptr, context.temp_allocator)
         

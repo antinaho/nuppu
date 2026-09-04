@@ -137,6 +137,106 @@ Arena :: struct {
     capacity: uint,
 }
 
+// Three stages per chunk:
+//
+//   mapped   - CPU-writable; allocations land here. The chunk's `buffer.is_mapped`
+//              is true.
+//   dirty    - this frame's allocations, written but not yet GPU-copied,
+//              unmapped. `batches_finish` iterates this and gpu.copies each
+//              chunk's region before moving it to `locked`.
+//   locked   - prior frames' chunks whose GPU copies were recorded. They
+//              are unmapped on WGPU until `recall`'s async BufferMapAsync
+//              completes; the semaphore wait in `_frame` keeps us from
+//              writing a chunk the GPU is still reading.
+
+Bucket_State :: enum {
+    Mapped,
+    Unmapped,
+    Locked,
+}
+Bucket :: struct {
+    state: Bucket_State,
+    buffer: ptr,
+    cursor: uint,
+}
+
+Bucket_Arena :: struct($N: int) {
+    buckets: [N]Bucket,
+    bucket_capacity: uint,
+}
+
+bucket_arena_init :: proc($N: int, capacity: uint, alignment: uint = 16, loc := #caller_location) -> Bucket_Arena(N) {
+    bucket_arena: Bucket_Arena(N)
+
+    for I in 0 ..< N {
+        _ptr   := _malloc(.Staging, 1, int(capacity), int(alignment), "BUCKET")
+        bucket_arena.buckets[I] = Bucket {
+            state = .Mapped,
+            cursor = 0,
+            buffer = ptr {
+                native = _ptr,
+                cpu    = _cpu_address(_ptr),
+                gpu    = _gpu_address(_ptr),
+                meta = Metadata {
+                    name = "BUCKET",
+                    created_at = loc,
+                },
+            }
+        }
+    }
+
+    bucket_arena.bucket_capacity = capacity
+    return bucket_arena
+}
+
+// Sub-allocates within the first chunk in `mapped` that has space.
+// Returns the view (cpu/gpu pointers set) and the byte length of the
+// allocation. Chunks that don't yet satisfy alignment, are full, or
+// haven't finished remapping on WGPU (the BufferMapAsync callback has
+// not yet fired) are skipped.
+@(require_results)
+bucket_arena_alloc :: proc(arena: ^Bucket_Arena($N), el_size, el_count, align: uint) -> ptr {
+    bytes := el_size * el_count
+
+    for &bucket in arena.buckets {
+        if bucket.state != .Mapped { continue }
+        if uintptr(bucket.buffer.cpu) % uintptr(align) != uintptr(bucket.buffer.gpu) % uintptr(align) {
+            continue
+        }
+
+        alignment := max(uint(align), uint(_min_alignment(bucket.buffer)))
+        bytes_aligned := runtime.align_forward_uint(uint(bytes), alignment)
+
+        temp := mem.align_forward_uint(bucket.cursor, alignment)
+        if temp + bytes_aligned > arena.bucket_capacity {
+            continue
+        }
+
+        bucket.cursor = temp + bytes_aligned
+        return sub_alloc(bucket.buffer, temp, bytes_aligned)
+    }
+
+    panic("Bucket_Arena: out of space (all chunks full or remap pending)")
+}
+
+// Unmap any chunk that had `cursor > 0` (i.e. CPU wrote to it this frame)
+// and move it from `mapped` to `dirty`. Chunks with `cursor == 0` stay in
+// `mapped` untouched. Removal is done after a pre-pass to avoid
+// mutating-while-iterating.
+bucket_arena_finish :: proc(arena: ^Bucket_Arena($N)) {
+    for &chunk in arena.buckets {
+        if chunk.cursor > 0 && chunk.state == .Mapped {
+            _unmap(&chunk.buffer.native)
+            chunk.state = .Unmapped
+        }
+    }
+}
+
+// Move every `locked` chunk back into `mapped`, reset its cursor, and
+bucket_arena_recall :: proc(arena: ^Bucket_Arena($N)) {
+    _bucket_arena_kick_remap(arena)
+}
+
 Shader :: struct {
     using native: _Shader,
 }

@@ -54,9 +54,9 @@ State :: struct #align(64) {
     
     sampler: gpu.Sampler,
 
+    batcher: Batcher,
 
-    
-    
+
     // Built-in resources, currently representing quad sprite
     built_in_block: gpu.Parameter_Block,
     built_in_textures: gpu.Texture,
@@ -196,6 +196,7 @@ step :: proc(dt: f32) -> bool {
 _frame :: proc() -> Frame_Result {
 
     free_all(context.temp_allocator)
+    batcher_free_all(&_state.batcher)
 
     platform.platform_reset_frame_input()
     platform.poll_events()
@@ -263,6 +264,12 @@ _ready_up :: proc() {
     // Global frame uniform
     // Updated and binded once per frame
     _state.frame_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Engine_Uniform), align_of(Engine_Uniform), "Frame Uniform")
+
+    append(&_state.batcher.batches, batch_init("Sprite", size_of(Sprite_Instance)))
+    append(&_state.batcher.batches, batch_init("Mesh",   size_of(Mesh_Instance)))
+
+    _state.batcher.instance_bucket = gpu.bucket_arena_init(BATCH_STAGING_BUCKETS, BATCH_STAGING_BUCKET_BYTES)
+    _state.batcher.data_bucket     = gpu.bucket_arena_init(BATCH_STAGING_BUCKETS, BATCH_STAGING_BUCKET_BYTES)
 
     // 
     _state.built_in_textures = gpu.texture_init({

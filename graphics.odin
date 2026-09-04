@@ -1,10 +1,12 @@
 package nuppu
 
 import "core:math"
+import "core:mem"
 import "gpu"
 import "bit_array"
 import "base:intrinsics"
 import "base:runtime"
+import "core:slice"
 
 #assert(size_of(Vertex) == 32)
 Vertex :: struct #align(16) {
@@ -69,11 +71,11 @@ draw_sprite :: proc(
     base_instance := Instance {
         kind = .Sprite,
         material_idx = .Default,
-        extra_data = _batch.len,
+        extra_data = {},
     }
     sprite_instance := pack_sprite_instance(position, color, uv_min, uv_size, rotation, scale, material_idx)
 
-    push_instance(&_batch, base_instance, sprite_instance)   
+    push_to_batch(sprite_batch(), base_instance, slice.bytes_from_ptr(&sprite_instance, size_of(Sprite_Instance)))
 }
 
 draw_cube :: proc(
@@ -87,12 +89,12 @@ draw_cube :: proc(
     base_instance := Instance {
         kind = .Mesh,
         material_idx = .Default,
-        extra_data = _batch.len,
+        extra_data = {},
     }
 
-    instance := pack_mesh_instance(position, color, rotation, scale, material_idx)
+    mesh_instance := pack_mesh_instance(position, color, rotation, scale, material_idx)
 
-    push_instance(&_batch_2, base_instance, instance)
+    push_to_batch(mesh_batch(), base_instance, slice.bytes_from_ptr(&mesh_instance, size_of(Mesh_Instance)))
 }
 
 Instance_Kind :: enum u16 {
@@ -124,36 +126,175 @@ Mesh_Instance :: struct #all_or_none #align(16) {
     _pad: [3]u8,
 }
 
-_batch_2: Instance_Batch(Mesh_Instance)
-_batch: Instance_Batch(Sprite_Instance)
+Batcher :: struct {
+    batches:              [dynamic; 32]Batch,
 
-push_instance :: proc(batch :^Instance_Batch($T), base_instance: Instance, instance: T) {
+    instance_offset:      u32,
+    instance_data_offset: u32,
 
-    if batch.len >= batch.cap {
-        batch.cap = math.max(batch.last_len + 64, batch.cap * 2)
-        frame_instances := make([^]T, len = batch.cap, allocator = context.temp_allocator)
-        base_instances := make([^]Instance, len = batch.cap, allocator = context.temp_allocator)
-        if batch.len > 0 {
-            intrinsics.mem_copy_non_overlapping(rawptr(frame_instances), batch.frame_instances, size_of(Sprite_Instance) * batch.len)
-            intrinsics.mem_copy_non_overlapping(rawptr(base_instances), batch.base_instances, size_of(Instance) * batch.len)
-        }
-        batch.base_instances = base_instances
-        batch.frame_instances = frame_instances
+    instance_bucket:      gpu.Bucket_Arena(BATCH_STAGING_BUCKETS),
+    data_bucket:          gpu.Bucket_Arena(BATCH_STAGING_BUCKETS),
+}
+
+BATCH_STAGING_BUCKETS    :: 4
+BATCH_STAGING_BUCKET_BYTES :: uint(1 * mem.Megabyte)
+
+Batch :: struct {
+    identifier: string,
+
+    len: u32,
+    cap: u32,
+    last_len: u32,
+
+    instances: [^]Instance,
+
+    instance_data_size: u32,
+    instance_data: [^]u8,
+}
+
+batcher_free_all :: proc(batcher: ^Batcher) {
+    for &batch in batcher.batches {
+        batch.len = 0
+        batch.cap = 0
+    }
+    batcher.instance_offset      = 0
+    batcher.instance_data_offset = 0
+}
+
+batch_init :: proc(identifier: string, instance_data_size: u32) -> Batch {
+    return Batch {
+        identifier = identifier,
+        len = 0,
+        cap = 0,
+        last_len = 0,
+        instances = nil,
+        instance_data_size = instance_data_size,
+        instance_data = nil,
+    }
+}
+
+// Stage a single batch into the bucket arenas.
+//
+// IMPORTANT: call this BEFORE `nuppu.batches_finish()`. Calling it after,
+// in the same frame, will — on Metal — overwrite staging memory that the
+// recorded blit hasn't yet read from (Metal `blitCommandEncoder` reads its
+// source at submit-time, not queue-time). The assumed-per-frame shape is:
+//
+//     flush(...)           // any number of times
+//     flush(...)
+//     batches_finish()     // closes & copies this frame's chunks
+//     ...rendering...      // no flush() calls in here
+//     end_frame()          // command buffer submits; blit reads staged data
+//
+// On WGPU this is enforced by `kick_remap` keeping buckets `.Locked` until
+// the remap callback fires; on Metal the convention is unenforced.
+
+flush :: proc(batch: ^Batch) {
+    if batch.len == 0 { return }
+
+    i_view := gpu.bucket_arena_alloc(
+        &_state.batcher.instance_bucket,
+        size_of(Instance), uint(batch.len), align_of(Instance),
+    )
+    i_size := gpu._capacity(i_view)
+    d_view := gpu.bucket_arena_alloc(
+        &_state.batcher.data_bucket,
+        uint(batch.instance_data_size), uint(batch.len), uint(batch.instance_data_size),
+    )
+    d_size := gpu._capacity(d_view)
+
+    intrinsics.mem_copy_non_overlapping(i_view.cpu, batch.instances, i_size)
+    intrinsics.mem_copy_non_overlapping(d_view.cpu, batch.instance_data, d_size)
+
+    _state.batcher.instance_offset      += u32(i_size)
+    _state.batcher.instance_data_offset += u32(d_size)
+
+    batch.len = 0
+}
+
+// Commit every chunk this frame's `flush()` calls staged to the GPU:
+//   1. `_finish` both bucket arenas (unmap written chunks; they land in
+//      `dirty`).
+//   2. For each dirty chunk, gpu.copy its region into the global GPU
+//      storage buffer starting at offset 0. A single batch can have
+//      spilled across N chunks, so we copy each chunk independently and
+//      advance a local running offset by `chunk.cursor` bytes.
+//   3. Move each dirty chunk into `locked` (past frames, awaiting
+//      remap), then `recall` both arenas — kicks the async remap on
+//      WGPU; no-op on Metal.
+//
+// No `flush` calls should happen after this in the same frame; see `flush`.
+
+batches_finish :: proc() {
+    gpu.bucket_arena_finish(&_state.batcher.instance_bucket)
+    gpu.bucket_arena_finish(&_state.batcher.data_bucket)
+
+    // Per-frame GPU-side offsets start at 0; chunks are copied contiguously.
+    inst_off: u32
+    data_off: u32
+
+    for &bucket in _state.batcher.instance_bucket.buckets {
+        if bucket.state != .Unmapped { continue }
+        view := gpu.sub_alloc(bucket.buffer, 0, bucket.cursor)
+        gpu.copy(instances(), view, inst_off)
+        inst_off += u32(bucket.cursor)
+        bucket.state = .Locked
     }
 
-    batch.base_instances[batch.len] = base_instance
-    batch.frame_instances[batch.len] = instance
+    for &bucket in _state.batcher.data_bucket.buckets {
+        if bucket.state != .Unmapped { continue }
+        view := gpu.sub_alloc(bucket.buffer, 0, bucket.cursor)
+        gpu.copy(instances_data(), view, data_off)
+        data_off += u32(bucket.cursor)
+        bucket.state = .Locked
+    }
+
+    gpu.bucket_arena_recall(&_state.batcher.instance_bucket)
+    gpu.bucket_arena_recall(&_state.batcher.data_bucket)
+
+    // Reset per-frame tallies so `flush` starts from 0 next frame.
+    _state.batcher.instance_offset      = 0
+    _state.batcher.instance_data_offset = 0
+}
+
+
+
+// Single source of truth: _state.batcher.batches holds the batches by value.
+// Helpers return pointers to the slots populated in _ready_up so call sites
+// don't need to know the storage order.
+sprite_batch :: proc() -> ^Batch {
+    return &_state.batcher.batches[0]
+}
+
+mesh_batch :: proc() -> ^Batch {
+    return &_state.batcher.batches[1]
+}
+
+push_to_batch :: proc(batch: ^Batch, instance: Instance, instance_data: []u8) {
+    if batch.len >= batch.cap {
+        batch.cap = math.max(batch.last_len + 64, batch.cap * 2)
+        
+        instances := make([^]Instance, len = batch.cap, allocator = context.temp_allocator)
+        instance_data := make([^]u8, len = batch.cap * batch.instance_data_size, allocator = context.temp_allocator)
+        
+        if batch.len > 0 {
+            intrinsics.mem_copy_non_overlapping(rawptr(instance_data), batch.instance_data, batch.instance_data_size * batch.len)
+            intrinsics.mem_copy_non_overlapping(rawptr(instances), batch.instances, size_of(Instance) * batch.len)
+        }
+
+        batch.instances = instances
+        batch.instance_data = instance_data
+    }
+    
+    batch.instances[batch.len] = instance
+    intrinsics.mem_copy_non_overlapping(
+        &batch.instance_data[batch.len * batch.instance_data_size],
+        &instance_data[0],
+        batch.instance_data_size,
+    )
     batch.len += 1
+    batch.last_len = max(batch.last_len, batch.len)
 }
-
-Instance_Batch :: struct($T: typeid) {
-    len: u32,
-    last_len: u32,
-    cap: u32,
-    base_instances: [^]Instance,
-    frame_instances: [^]T,
-}
-
 
 draw_mesh_builtin :: proc(mesh_type: Built_in_mesh, instance_count: u32 = 1, base_instance: u32 = 0) {
 
