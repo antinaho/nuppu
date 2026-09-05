@@ -130,94 +130,6 @@ Arena :: struct {
     offset: uint,
 }
 
-// Bucket_State :: enum {
-//     Mapped,
-//     Unmapped,
-//     Locked,
-// }
-// Bucket :: struct {
-//     state: Bucket_State,
-//     buffer: ptr,
-//     cursor: uint,
-// }
-
-// Bucket_Arena :: struct($N: int) {
-//     buckets: [N]Bucket,
-//     bucket_capacity: uint,
-// }
-
-// bucket_arena_init :: proc($N: int, capacity: uint, alignment: uint = 16, loc := #caller_location) -> Bucket_Arena(N) {
-//     bucket_arena: Bucket_Arena(N)
-
-//     for I in 0 ..< N {
-//         _ptr   := _malloc(.Staging, 1, int(capacity), int(alignment), "BUCKET")
-//         bucket_arena.buckets[I] = Bucket {
-//             state = .Mapped,
-//             cursor = 0,
-//             buffer = ptr {
-//                 native = _ptr,
-//                 cpu    = _cpu_address(_ptr),
-//                 gpu    = _gpu_address(_ptr),
-//                 meta = Metadata {
-//                     name = "BUCKET",
-//                     created_at = loc,
-//                 },
-//             }
-//         }
-//     }
-
-//     bucket_arena.bucket_capacity = capacity
-//     return bucket_arena
-// }
-
-// // Sub-allocates within the first chunk in `mapped` that has space.
-// // Returns the view (cpu/gpu pointers set) and the byte length of the
-// // allocation. Chunks that don't yet satisfy alignment, are full, or
-// // haven't finished remapping on WGPU (the BufferMapAsync callback has
-// // not yet fired) are skipped.
-// @(require_results)
-// bucket_arena_alloc :: proc(arena: ^Bucket_Arena($N), el_size, el_count, align: uint) -> ptr {
-//     bytes := el_size * el_count
-
-//     for &bucket in arena.buckets {
-//         if bucket.state != .Mapped { continue }
-//         if uintptr(bucket.buffer.cpu) % uintptr(align) != uintptr(bucket.buffer.gpu) % uintptr(align) {
-//             continue
-//         }
-
-//         alignment := max(uint(align), uint(_min_alignment(bucket.buffer)))
-//         bytes_aligned := runtime.align_forward_uint(uint(bytes), alignment)
-
-//         temp := mem.align_forward_uint(bucket.cursor, alignment)
-//         if temp + bytes_aligned > arena.bucket_capacity {
-//             continue
-//         }
-
-//         bucket.cursor = temp + bytes_aligned
-//         return sub_alloc(bucket.buffer, temp, bytes_aligned)
-//     }
-
-//     panic("Bucket_Arena: out of space (all chunks full or remap pending)")
-// }
-
-// // Unmap any chunk that had `cursor > 0` (i.e. CPU wrote to it this frame)
-// // and move it from `mapped` to `dirty`. Chunks with `cursor == 0` stay in
-// // `mapped` untouched. Removal is done after a pre-pass to avoid
-// // mutating-while-iterating.
-// bucket_arena_finish :: proc(arena: ^Bucket_Arena($N)) {
-//     for &chunk in arena.buckets {
-//         if chunk.cursor > 0 && chunk.state == .Mapped {
-//             _unmap(&chunk.buffer.native)
-//             chunk.state = .Unmapped
-//         }
-//     }
-// }
-
-// // Move every `locked` chunk back into `mapped`, reset its cursor, and
-// bucket_arena_recall :: proc(arena: ^Bucket_Arena($N)) {
-//     _bucket_arena_kick_remap(arena)
-// }
-
 Shader :: struct {
     using native: _Shader,
 }
@@ -264,7 +176,6 @@ Sampler_Descriptor :: struct {
 }
 
 Texture :: struct {
-
     using native: _Texture,
 }
 
@@ -457,26 +368,14 @@ deinit :: proc() {
     _state = nil
 }
 
-is_init :: proc() -> bool {
-    return _state.is_init
-}
+is_init :: proc() -> bool { return _state.is_init }
 
-resize_swapchain :: proc(width, height: u32) {
-    _resize_swapchain(width, height)
-}
-
-release_texture :: proc(texture: ^Texture) {
-    _release_texture(texture)
-}
-
-release_ptr :: proc(ptr: ^ptr) {
-    _release_ptr(ptr)
-}
+resize_swapchain : proc(width, height: u32) -> bool : _resize_swapchain
+release_texture: proc(texture: ^Texture) : _release_texture
+release_ptr : proc(ptr: ^ptr) : _release_ptr
 
 // CPU side copy
-copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
-    _copy_to_texture(texture, origin, size, level, data, bytes_per_row)
-}
+copy_to_texture : proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) : _copy_to_texture
 
 depth_stencil_state_init :: proc(desc: Depth_Stencil_State_Descriptor) -> Depth_Stencil_State {
     _depth_pso := _depth_stencil_state_init(desc)
@@ -516,21 +415,10 @@ compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> Compute_Pi
     return result
 }
 
-begin_commands :: proc() {
-    _begin_commands()
-}
-
-commit_commands :: proc() {
-    _commit_commands()
-}
-
-begin_frame :: proc() {
-    _begin_frame()
-}
-
-end_frame :: proc(semaphore: Timeline_Semaphore, frame_n: u64) {
-    _end_frame(semaphore, frame_n)
-}
+begin_commands : proc() : _begin_commands
+commit_commands : proc() : _commit_commands
+begin_frame : proc() : _begin_frame
+end_frame : proc(semaphore: Timeline_Semaphore, frame_n: u64) : _end_frame
 
 acquire_next_swapchain :: proc() -> Texture {
     native := _acquire_next_swapchain()
@@ -540,17 +428,9 @@ acquire_next_swapchain :: proc() -> Texture {
     }
 }
 
-compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
-    _compute_dispatch(num_groups, num_threads_per_group)
-}
-
-set_compute_pipeline :: proc(compute_pipeline: Compute_Pipeline) {
-    _set_compute_pipeline(compute_pipeline)
-}
-
-set_pipeline :: proc(pipeline: Pipeline) {
-    _set_pipeline(pipeline)
-}
+compute_dispatch : proc(num_groups: [3]u32, num_threads_per_group: [3]u32) : _compute_dispatch
+set_compute_pipeline : proc(compute_pipeline: Compute_Pipeline) : _set_compute_pipeline
+set_pipeline : proc(pipeline: Pipeline) : _set_pipeline
 
 sampler_init :: proc(desc: Sampler_Descriptor) -> Sampler {
     native := _sampler_init(desc)
@@ -582,41 +462,21 @@ texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture 
     return texture_init(desc)
 }
 
-set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
-    _set_depth_stencil_state(depth_stencil_state)
-}
-
-begin_render_pass :: proc(color_attachment: Color_Attachment, depth_attachment: Depth_Attachment = {}) {
-    _begin_render_pass(color_attachment, depth_attachment)
-}
-
-end_render_pass :: proc() {
-    _end_render_pass()
-}
-
-set_cull_mode :: proc(cull_mode: Cull_Mode) {
-    _set_cull_mode(cull_mode)
-}
-
-set_front_face_winding :: proc(winding: Front_Face) {
-    _set_front_face_winding(winding)
-}
+set_depth_stencil_state : proc(depth_stencil_state: Depth_Stencil_State) : _set_depth_stencil_state
+begin_render_pass : proc(color_attachment: Color_Attachment, depth_attachment: Depth_Attachment = {}) : _begin_render_pass
+end_render_pass : proc() : _end_render_pass
+set_cull_mode : proc(cull_mode: Cull_Mode) : _set_cull_mode
+set_front_face_winding : proc(winding: Front_Face) : _set_front_face_winding
 
 when ODIN_OS != .JS {
 // Push struct to buffer
-temp_malloc :: proc(bytes: []u8, buffer_index: u32, shader_stage: Shader_Stage) {
-    _temp_malloc(bytes, buffer_index, shader_stage)       
-}
+temp_malloc : proc(bytes: []u8, buffer_index: u32, shader_stage: Shader_Stage) : _temp_malloc
 }
 
 draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
     _draw_indiced_primitives(parameter_block, .Triangle, index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance, .Uint16)
 }
 
-// Allocate a buffer of the given type.
-//   - .Staging     returns ptr with valid .cpu; caller fills data then calls copy() + unmap()
-//   - .GPU_*       returns ptr with .cpu=nil; receive data via copy() from a Staging buffer
-//   - .Readback    returns ptr with .cpu=nil; receive data via copy()
 malloc :: proc(
     bytes: u32,
     alignment:   u32,
@@ -650,14 +510,10 @@ malloc :: proc(
 }
 
 // Release the mapping on a Staging buffer. Must be called before doing any copy() operations on the buffer.
-unmap :: proc(ptr: ^ptr) {
-    _unmap(&ptr.native)
-}
+unmap : proc(ptr: ^ptr) : _unmap
 
 // Copies src data into dst
-copy :: proc(dst, src: ptr) {
-    _copy(dst, src)
-}
+copy : proc(dst, src: ptr) : _copy
 
 // Linear bump arena that allocates staging buffer. Helps if multiple types of staging data is needed to be copied simultaneously.
 arena_init :: proc(
@@ -722,7 +578,6 @@ arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, align: uint, loc := #c
 
 // Helper for arena alloc
 arena_alloc :: proc(arena: ^Arena, $T: typeid, el_count: uint = 1, loc := #caller_location) -> ptr {
-    // assert(_mapped(arena.ptr)) IF staging buffer
     temp := arena_alloc_raw(arena, size_of(T), el_count, align_of(T), loc)
 
     // NOTE add typed return?
@@ -745,24 +600,13 @@ sub_alloc :: proc(parent: ptr, offset, length: u32) -> ptr {
     return result
 }
 
-// Sets shader's parameter block to be used for the next draw call.
-use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination = .Graphics) {
-    _use_parameter_block(block, destination)
-}
+// Sets shader's parameter block to be used for the next draw call/compute dispatch
+use_parameter_block : proc(block: ^Parameter_Block, destination: Parameter_Block_Destination = .Graphics) : _use_parameter_block
 
 // Ends before stage
-barrier :: proc(before: Stage, after: Stage) {
-    _barrier(before, after)
-}
-
-semaphore :: proc(value: u64) -> Timeline_Semaphore {
-    return _semaphore(value)
-}
-
-semaphore_wait :: proc(semaphore: Timeline_Semaphore, value: u64) -> bool {
-    return _semaphore_wait(semaphore, value)
-}
-
+barrier : proc(before: Stage, after: Stage) : _barrier
+semaphore : proc(value: u64) -> Timeline_Semaphore : _semaphore
+semaphore_wait : proc(semaphore: Timeline_Semaphore, value: u64) -> bool : _semaphore_wait
 
 bit_set_to_another :: proc(input: $T/bit_set[$TT; $TI], $Out: typeid, interop: proc(TT) -> $O) -> (result: Out) {
     for f in input { result |= {interop(f)} }
