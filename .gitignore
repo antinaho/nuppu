@@ -2,10 +2,12 @@
 !.gitignore
 
 !build_web.sh
-!built_in.odin
 !comm.odin
-!loader.odin
 !nuppu.odin
+!render.odin
+
+!bit_array/
+!bit_array/bit_array.odin
 
 !gpu/
 !gpu/**
