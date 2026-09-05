@@ -99,12 +99,10 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return true
     }
 
-    _resize_depth_texture :: proc(width, height: u32) {
-        if _state.depth_texture.native.texture == nil {
-            _state.depth_texture = texture_depth_init({u32(width), u32(height)}, .Depth32Float)    
-        } else {
-            _state.depth_texture.native.texture->release()
-            _state.depth_texture = texture_depth_init({u32(width), u32(height)}, .Depth32Float)
+    _release_texture :: proc(texture: ^Texture) {
+        if texture.native.texture != nil {
+            texture.native.texture->release()
+            texture.native.texture = nil
         }
     }
 

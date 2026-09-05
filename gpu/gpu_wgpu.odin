@@ -270,13 +270,14 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         return true
     }
 
-    _resize_depth_texture :: proc(width, height: u32) {
-        if _state.depth_texture.native.view == nil {
-            _state.depth_texture = texture_depth_init({width, height}, .Depth32Float)    
-        } else {
-            wgpu.TextureViewRelease(_state.depth_texture.native.view)
-            wgpu.TextureRelease(_state.depth_texture.native.texture)
-            _state.depth_texture = texture_depth_init({width, height}, .Depth32Float)    
+    _release_texture :: proc(texture: ^Texture) {
+        if texture.native.view != nil {
+            wgpu.TextureViewRelease(texture.native.view)
+            texture.native.view = nil
+        }
+        if texture.native.texture != nil {
+            wgpu.TextureRelease(texture.native.texture)
+            texture.native.texture = nil
         }
     }
 

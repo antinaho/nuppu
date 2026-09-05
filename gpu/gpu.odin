@@ -71,8 +71,6 @@ State :: struct #align(64) {
 
     ctx: runtime.Context,
     is_init: bool,
-
-    depth_texture: Texture,
 }
 
 // Resources inside arrays need to be declared in the same order as they are in the shader
@@ -467,12 +465,8 @@ resize_swapchain :: proc(width, height: u32) {
     _resize_swapchain(width, height)
 }
 
-depth :: proc() -> Texture {
-    return _state.depth_texture
-}
-
-resize_depth :: proc(width, height: u32) {
-    _resize_depth_texture(width, height)
+release_texture :: proc(texture: ^Texture) {
+    _release_texture(texture)
 }
 
 // CPU side copy

@@ -56,6 +56,8 @@ State :: struct #align(64) {
     
     sampler: gpu.Sampler,
 
+    depth_texture: gpu.Texture,
+
 
     frame_semaphore: gpu.Timeline_Semaphore,
     frame_arenas: [dynamic; FRAMES_IN_FLIGHT]^gpu.Arena,
@@ -191,6 +193,19 @@ end_frame :: proc(frame: Frame) {
     recycle_frame_arena(frame.arena)
 }
 
+frame_arena :: proc(frame: Frame) -> ^gpu.Arena {
+    return frame.arena
+}
+
+depth :: proc() -> gpu.Texture {
+    return _state.depth_texture
+}
+
+resize_depth :: proc(width, height: u32) {
+    gpu.release_texture(&_state.depth_texture)
+    _state.depth_texture = gpu.texture_depth_init({width, height}, .Depth32Float)
+}
+
 recycle_frame_arena :: proc(arena: ^gpu.Arena) {
     when ODIN_OS != .JS {
         /* no op */
@@ -267,7 +282,7 @@ _frame :: proc() -> Frame_Result {
     current := platform.window_size_pixel()
     if _state.window_size.x != current.x || _state.window_size.y != current.y {
         gpu.resize_swapchain(u32(current.x), u32(current.y))
-        gpu.resize_depth(u32(current.x), u32(current.y))
+        resize_depth(u32(current.x), u32(current.y))
         _state.window_size = current
     }
 
@@ -286,7 +301,7 @@ _ready_up :: proc() {
 
     _state.window_size = platform.window_size_pixel()
     gpu.resize_swapchain(u32(_state.window_size.x), u32(_state.window_size.y))
-    gpu.resize_depth(u32(_state.window_size.x), u32(_state.window_size.y))
+    resize_depth(u32(_state.window_size.x), u32(_state.window_size.y))
 
     // Global buffers wrapped in arena
     VERTEX_BLOB_SIZE :: 16 * mem.Megabyte

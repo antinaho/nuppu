@@ -134,10 +134,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     //         material_idx = u32(0),
     //     )
     // }
-    // nuppu.flush(nuppu.sprite_batch())
 
-    
-    // nuppu.batches_finish()
     frame_arena := frame.arena
     uniforms := gpu.arena_alloc(frame_arena, nuppu.Engine_Uniform, 1)
 
@@ -164,7 +161,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     }, {
         load_action = .Clear,
         store_action = .Store,
-        texture = gpu.depth(),
+        texture = nuppu.depth(),
     })
 
     gpu.set_pipeline(current.pso)

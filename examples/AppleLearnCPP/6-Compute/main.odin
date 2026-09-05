@@ -275,7 +275,7 @@ render :: proc(prev, curr: ^State, alpha: f32) {
         {
             load_action = .Clear,
             store_action = .Store,
-            texture = gpu.depth(),
+            texture = nuppu.depth(),
         }
     )
 
