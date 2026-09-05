@@ -2,6 +2,7 @@ package main
 
 import nuppu "../../.."
 import gpu "../../../gpu"
+import "../../../platform"
 import "core:fmt"
 import "core:slice"
 import "core:math"
@@ -19,7 +20,7 @@ State :: struct {
     textures: gpu.Texture,
     sampler:  gpu.Sampler,
 
-    camera_pos: [3]f32,
+    camera: nuppu.Camera,
 }
 
 INSTANCE_COUNT :: 32
@@ -80,7 +81,13 @@ _init :: proc() {
         wrap_r     = .ClampToEdge,
     })
 
-    state.camera_pos = {0, 0, 2}
+    state.camera = nuppu.Camera {
+        position = {0, 0, 2},
+        near = 0.1,
+        far = 1_000,
+        fovy = 80,
+        aspect_ratio = nuppu.aspect_ratio(),
+    }
 }
 
 _deinit :: proc() {
@@ -89,6 +96,22 @@ _deinit :: proc() {
 
 _update :: proc() {
     state.angle += nuppu.sim_delta_time() * 0.09
+
+    if platform.input_key_held(.KEY_A) {
+        state.camera.position.x -= nuppu.sim_delta_time() * 1
+    } 
+    if platform.input_key_held(.KEY_D) {
+        state.camera.position.x += nuppu.sim_delta_time() * 1
+    }
+
+
+    if platform.input_key_held(.KEY_W) {
+        state.camera.position.y += nuppu.sim_delta_time() * 1
+    }
+    if platform.input_key_held(.KEY_S) {
+        state.camera.position.y -= nuppu.sim_delta_time() * 1
+    }
+    
 }
 
 _render :: proc(previous, current: ^State, alpha: f32) {
@@ -135,21 +158,8 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     //     )
     // }
 
-    frame_arena := frame.arena
-    uniforms := gpu.arena_alloc(frame_arena, nuppu.Engine_Uniform, 1)
+    nuppu.update_constants(previous.camera, current.camera, alpha)
 
-    uniforms_data := nuppu.frame_uniform(nuppu.Camera{
-        position     = current.camera_pos,
-        near         = 0.1,
-        far          = 1_000,
-        fovy         = 80,
-        aspect_ratio = nuppu.aspect_ratio(),
-    })
-    (^nuppu.Engine_Uniform)(uniforms.cpu)^ = uniforms_data
-
-    gpu.unmap(&frame_arena.ptr)
-
-    gpu.copy(nuppu.global_frame_uniform(), uniforms)
     gpu.barrier(.Transfer, .All)
 
     swapchain := gpu.acquire_next_swapchain()

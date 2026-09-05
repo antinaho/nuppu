@@ -7,6 +7,7 @@ import "core:time"
 import "core:fmt"
 import "core:log"
 import "core:image"
+import glm "core:math/linalg/glsl"
 
 import "./platform"
 import "./gpu"
@@ -191,6 +192,32 @@ end_frame :: proc(frame: Frame) {
     _state.frame_n += 1
 
     recycle_frame_arena(frame.arena)
+}
+
+update_constants :: proc(prev, curr: Camera, alpha: f32) {
+    cam := update_camera(prev, curr, alpha)
+
+    staging, ok := gpu.malloc(
+        size_of(Engine_Uniform), align_of(Engine_Uniform),
+        .Staging, "Frame Uniform Staging",
+    )
+    if !ok {
+        log.error("update_constants: failed to allocate staging buffer")
+        return
+    }
+    defer gpu.release_ptr(&staging)
+
+    uniforms := (^Engine_Uniform)(staging.cpu)
+    uniforms.cam_perspective_transform = glm.mat4Perspective(
+        glm.radians_f32(cam.fovy), cam.aspect_ratio, cam.near, cam.far,
+    )
+    uniforms.cam_ortho_transform = 1
+    uniforms.cam_view_transform   = glm.mat4Translate(-cam.position)
+    uniforms.cam_position        = cam.position
+    uniforms._pad                = 0
+
+    gpu.unmap(&staging)
+    gpu.copy(_state.frame_uniform, staging)
 }
 
 frame_arena :: proc(frame: Frame) -> ^gpu.Arena {

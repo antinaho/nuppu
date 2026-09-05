@@ -281,6 +281,13 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
     }
 
+    _release_ptr :: proc(ptr: ^ptr) {
+        if ptr.native.buffer != nil {
+            wgpu.BufferRelease(ptr.native.buffer)
+            ptr.native.buffer = nil
+        }
+    }
+
     _copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
         destination := wgpu.TexelCopyTextureInfo {
             texture  = texture.native.texture,

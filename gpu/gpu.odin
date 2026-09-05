@@ -469,6 +469,10 @@ release_texture :: proc(texture: ^Texture) {
     _release_texture(texture)
 }
 
+release_ptr :: proc(ptr: ^ptr) {
+    _release_ptr(ptr)
+}
+
 // CPU side copy
 copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
     _copy_to_texture(texture, origin, size, level, data, bytes_per_row)

@@ -22,18 +22,6 @@ Camera :: struct {
     aspect_ratio: f32,
 }
 
-frame_uniform :: proc(camera: Camera) -> Engine_Uniform {
-	uniform_data := Engine_Uniform {
-        cam_perspective_transform = glm.mat4Perspective(glm.radians_f32(camera.fovy), camera.aspect_ratio, camera.near, camera.far),
-		cam_ortho_transform = 1,
-        cam_view_transform = glm.mat4Translate(-camera.position),
-        cam_position = camera.position,
-        _pad = {},
-    }
-
-	return uniform_data
-}
-
 update_camera :: proc(prev_camera: Camera, curr_camera: Camera, alpha: f32) -> Camera {
     return Camera {
         position = math.lerp(prev_camera.position, curr_camera.position, alpha),
