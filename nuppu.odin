@@ -18,6 +18,8 @@ _ :: log
 SIM_TICKS_PER_SECOND :: 180
 SIM_NS_PER_TICK     :: time.Second / SIM_TICKS_PER_SECOND
 
+FRAMES_IN_FLIGHT :: 2
+
 State :: struct #align(64) {
     ctx: runtime.Context,
     initialized: bool,
@@ -48,14 +50,16 @@ State :: struct #align(64) {
     frame_uniform: gpu.ptr,
 
     
-    _instances: gpu.Arena,
-    _instances_data: gpu.Arena,
-    
+    _instances: gpu.ptr,
+    _instances_data: gpu.ptr,
+    instance_batcher: Instance_Batcher,    
     
     sampler: gpu.Sampler,
 
-    batcher: Batcher,
 
+    frame_semaphore: gpu.Timeline_Semaphore,
+    frame_arenas: [dynamic; FRAMES_IN_FLIGHT]^gpu.Arena,
+    frame_n: u64,
 
     // Built-in resources, currently representing quad sprite
     built_in_block: gpu.Parameter_Block,
@@ -71,6 +75,12 @@ State :: struct #align(64) {
 _state: ^State
 
 Frame_Result :: enum { Continue, Skip_Render, Exit }
+
+Frame :: struct {
+    n:         u64,
+    semaphore: gpu.Timeline_Semaphore,
+    arena:     ^gpu.Arena,
+}
 
 App_Desc :: struct($T: typeid) #all_or_none {
     state: ^^T,
@@ -153,13 +163,38 @@ when ODIN_OS != .JS { // JS runtime drives the loop via the exported step() on e
         case .Skip_Render:
             continue
         case .Continue:
-            if _state.gpu_state.frame_n > gpu.FRAMES_IN_FLIGHT {
-                gpu.semaphore_wait(_state.gpu_state.frame_semaphore, _state.gpu_state.frame_n - gpu.FRAMES_IN_FLIGHT)
+            if _state.frame_n > FRAMES_IN_FLIGHT {
+                gpu.semaphore_wait(_state.frame_semaphore, _state.frame_n - FRAMES_IN_FLIGHT)
             }
             desc.render((^T)(_state.previous_state), (^T)(_state.current_state), _render_alpha())
         }
     }
 }
+}
+
+begin_frame :: proc() -> Frame {
+    gpu.begin_frame()
+    n := _state.frame_n
+    arena := _state.frame_arenas[n % FRAMES_IN_FLIGHT]
+    arena.offset = 0
+    return Frame {
+        n         = n,
+        semaphore = _state.frame_semaphore,
+        arena     = arena,
+    }
+}
+
+end_frame :: proc(frame: Frame) {
+    gpu.end_frame(frame.semaphore, frame.n)
+    _state.frame_n += 1
+
+    recycle_frame_arena(frame.arena)
+}
+
+recycle_frame_arena :: proc(arena: ^gpu.Arena) {
+    when ODIN_OS != .JS {
+        /* no op */
+    }
 }
 
 @(private="file", export)
@@ -196,7 +231,7 @@ step :: proc(dt: f32) -> bool {
 _frame :: proc() -> Frame_Result {
 
     free_all(context.temp_allocator)
-    batcher_free_all(&_state.batcher)
+    reset_batches(&_state.instance_batcher)
 
     platform.platform_reset_frame_input()
     platform.poll_events()
@@ -240,7 +275,14 @@ _frame :: proc() -> Frame_Result {
 }
 
 _ready_up :: proc() {
-    _state.gpu_state.frame_semaphore = gpu.semaphore(0)
+    _state.frame_n = 1
+    _state.frame_semaphore = gpu.semaphore(0)
+
+    for _ in 0 ..< FRAMES_IN_FLIGHT {
+        frame_arena := new(gpu.Arena, context.allocator)
+        frame_arena^, _ = gpu.arena_init(4 * 1024 * 1024)
+        append(&_state.frame_arenas, frame_arena)
+    }
 
     _state.window_size = platform.window_size_pixel()
     gpu.resize_swapchain(u32(_state.window_size.x), u32(_state.window_size.y))
@@ -255,21 +297,18 @@ _ready_up :: proc() {
     
     // MAX_MATERIAL_COUNT :: 1 << 8 // If this raises need to increase material idx on sprite instance
     
-    _state.vertex = gpu.arena_init(el_size = VERTEX_BLOB_SIZE, el_count = 1, alignment = 16, usage = .GPU_Storage)
-    _state.index = gpu.arena_init(el_size = size_of(Vertex_Index), el_count = GLOBAL_INDEX_COUNT_MAX, alignment = 4, usage = .GPU_Index)
-    _state._instances = gpu.arena_init(el_size = size_of(Instance), el_count = MAX_INSTANCES, alignment = align_of(Instance), usage = .GPU_Storage)
-    _state._instances_data = gpu.arena_init(el_size = INSTANCE_BLOB_SIZE, el_count = 1, alignment = 16, usage = .GPU_Storage)
+    _state.vertex, _ = gpu.arena_init(VERTEX_BLOB_SIZE, flags = .Default)
+    _state.index, _ = gpu.arena_init(size_of(Vertex_Index) * GLOBAL_INDEX_COUNT_MAX, flags = .Index)
+    _state._instances, _ = gpu.arena_init(size_of(Instance) * MAX_INSTANCES, alignment = align_of(Instance), flags = .Default)
+    _state._instances_data, _ = gpu.arena_init(INSTANCE_BLOB_SIZE, flags = .Default)
+    
+    _state.instance_batcher.instance_buffer, _ = gpu.malloc(size_of(Instance) * MAX_INSTANCES, align_of(Instance), .Staging)
+    _state.instance_batcher.instance_data_buffer_blob, _ = gpu.malloc(INSTANCE_BLOB_SIZE, 16, .Staging)
     //_state.materials = gpu.arena_init(el_size = size_of(Material), el_count = MAX_MATERIAL_COUNT, alignment = 16, usage = .GPU_Storage)
     
     // Global frame uniform
     // Updated and binded once per frame
-    _state.frame_uniform = gpu.malloc(.GPU_Constant, 1, size_of(Engine_Uniform), align_of(Engine_Uniform), "Frame Uniform")
-
-    append(&_state.batcher.batches, batch_init("Sprite", size_of(Sprite_Instance)))
-    append(&_state.batcher.batches, batch_init("Mesh",   size_of(Mesh_Instance)))
-
-    _state.batcher.instance_bucket = gpu.bucket_arena_init(BATCH_STAGING_BUCKETS, BATCH_STAGING_BUCKET_BYTES)
-    _state.batcher.data_bucket     = gpu.bucket_arena_init(BATCH_STAGING_BUCKETS, BATCH_STAGING_BUCKET_BYTES)
+    _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), align_of(Engine_Uniform), .Constant, "Frame Uniform")
 
     // 
     _state.built_in_textures = gpu.texture_init({
@@ -310,9 +349,9 @@ _ready_up :: proc() {
     _state.built_in_block = gpu.Parameter_Block {
         constants = { 0 = _state.frame_uniform },
         read_resources = {
-            0 = {},
-            1 = _state._instances.ptr,
-            2 = _state._instances_data.ptr,
+            0 = _state.vertex.ptr,
+            1 = _state._instances,
+            2 = _state._instances_data,
             3 = _state.built_in_textures,
         },
         read_write_resources = {},
@@ -320,14 +359,6 @@ _ready_up :: proc() {
     }
 
     _state.initialized = true
-}
-
-instances :: proc() -> gpu.ptr {
-    return _state._instances.ptr
-}
-
-instances_data :: proc() -> gpu.ptr {
-    return _state._instances_data.ptr
 }
 
 global_frame_uniform :: proc() -> gpu.ptr {

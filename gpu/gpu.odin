@@ -25,11 +25,6 @@ else {
     #panic("GPU not supported")
 }
 
-FRAMES_IN_FLIGHT :: 3
-FRAME_ARENA_SIZE :: 4 * 1024 * 1024
-
-MIN_ALIGNMENT :: 4 // To respect wgpu
-
 // Limits based of WGSL https://www.w3.org/TR/WGSL/#limits
 __MAX_CONSTANT_BUFFERS     :: 12 // Seperate limit from MAX_BUFFERS
 __MAX_BUFFERS              :: 8  // 8 in total between read + read_write
@@ -77,10 +72,6 @@ State :: struct #align(64) {
     ctx: runtime.Context,
     is_init: bool,
 
-    frame_semaphore: Semaphore,
-    frame_arenas: [dynamic; FRAMES_IN_FLIGHT]^Arena,
-    frame_n: u64,
-
     depth_texture: Texture,
 }
 
@@ -107,20 +98,25 @@ ptr :: struct #all_or_none {
     cpu: rawptr,
     gpu: rawptr,
 
+    flags: Buffer_Flag,
+    alignment: u32,
+    total_capacity_bytes: u32,
+    byte_offset: u32,
+
     meta: Metadata,
 
     using native: _ptr,
 }
 
-Buffer_Type :: enum u8 {
-    Staging,       // CPU visible, mapped at creation; GPU reads as copy source
-    GPU_Storage,   // Device-local; bindable as storage buffer
-    GPU_Constant,  // Device-local; bindable as uniform buffer
-    GPU_Index,     // Device-local; bindable as index buffer
-    Readback,      // CPU visible; GPU writes via copy; CPU reads after fence
+Buffer_Flag :: enum u32 {
+    Staging = 0,  // Host + Device visible
+
+    Default,      // Device local
+    Index,        // Device local
+    Constant,     // Device local
 }
 
-Index__Buffer_Type :: enum u8 {
+Index_Buffer_Type :: enum u8 {
     Uint16,
     Uint32,
 }
@@ -132,110 +128,97 @@ Metadata :: struct
 }
 
 Arena :: struct {
-    ptr: ptr,
+    using ptr: ptr,
     offset: uint,
-    capacity: uint,
 }
 
-// Three stages per chunk:
-//
-//   mapped   - CPU-writable; allocations land here. The chunk's `buffer.is_mapped`
-//              is true.
-//   dirty    - this frame's allocations, written but not yet GPU-copied,
-//              unmapped. `batches_finish` iterates this and gpu.copies each
-//              chunk's region before moving it to `locked`.
-//   locked   - prior frames' chunks whose GPU copies were recorded. They
-//              are unmapped on WGPU until `recall`'s async BufferMapAsync
-//              completes; the semaphore wait in `_frame` keeps us from
-//              writing a chunk the GPU is still reading.
+// Bucket_State :: enum {
+//     Mapped,
+//     Unmapped,
+//     Locked,
+// }
+// Bucket :: struct {
+//     state: Bucket_State,
+//     buffer: ptr,
+//     cursor: uint,
+// }
 
-Bucket_State :: enum {
-    Mapped,
-    Unmapped,
-    Locked,
-}
-Bucket :: struct {
-    state: Bucket_State,
-    buffer: ptr,
-    cursor: uint,
-}
+// Bucket_Arena :: struct($N: int) {
+//     buckets: [N]Bucket,
+//     bucket_capacity: uint,
+// }
 
-Bucket_Arena :: struct($N: int) {
-    buckets: [N]Bucket,
-    bucket_capacity: uint,
-}
+// bucket_arena_init :: proc($N: int, capacity: uint, alignment: uint = 16, loc := #caller_location) -> Bucket_Arena(N) {
+//     bucket_arena: Bucket_Arena(N)
 
-bucket_arena_init :: proc($N: int, capacity: uint, alignment: uint = 16, loc := #caller_location) -> Bucket_Arena(N) {
-    bucket_arena: Bucket_Arena(N)
+//     for I in 0 ..< N {
+//         _ptr   := _malloc(.Staging, 1, int(capacity), int(alignment), "BUCKET")
+//         bucket_arena.buckets[I] = Bucket {
+//             state = .Mapped,
+//             cursor = 0,
+//             buffer = ptr {
+//                 native = _ptr,
+//                 cpu    = _cpu_address(_ptr),
+//                 gpu    = _gpu_address(_ptr),
+//                 meta = Metadata {
+//                     name = "BUCKET",
+//                     created_at = loc,
+//                 },
+//             }
+//         }
+//     }
 
-    for I in 0 ..< N {
-        _ptr   := _malloc(.Staging, 1, int(capacity), int(alignment), "BUCKET")
-        bucket_arena.buckets[I] = Bucket {
-            state = .Mapped,
-            cursor = 0,
-            buffer = ptr {
-                native = _ptr,
-                cpu    = _cpu_address(_ptr),
-                gpu    = _gpu_address(_ptr),
-                meta = Metadata {
-                    name = "BUCKET",
-                    created_at = loc,
-                },
-            }
-        }
-    }
+//     bucket_arena.bucket_capacity = capacity
+//     return bucket_arena
+// }
 
-    bucket_arena.bucket_capacity = capacity
-    return bucket_arena
-}
+// // Sub-allocates within the first chunk in `mapped` that has space.
+// // Returns the view (cpu/gpu pointers set) and the byte length of the
+// // allocation. Chunks that don't yet satisfy alignment, are full, or
+// // haven't finished remapping on WGPU (the BufferMapAsync callback has
+// // not yet fired) are skipped.
+// @(require_results)
+// bucket_arena_alloc :: proc(arena: ^Bucket_Arena($N), el_size, el_count, align: uint) -> ptr {
+//     bytes := el_size * el_count
 
-// Sub-allocates within the first chunk in `mapped` that has space.
-// Returns the view (cpu/gpu pointers set) and the byte length of the
-// allocation. Chunks that don't yet satisfy alignment, are full, or
-// haven't finished remapping on WGPU (the BufferMapAsync callback has
-// not yet fired) are skipped.
-@(require_results)
-bucket_arena_alloc :: proc(arena: ^Bucket_Arena($N), el_size, el_count, align: uint) -> ptr {
-    bytes := el_size * el_count
+//     for &bucket in arena.buckets {
+//         if bucket.state != .Mapped { continue }
+//         if uintptr(bucket.buffer.cpu) % uintptr(align) != uintptr(bucket.buffer.gpu) % uintptr(align) {
+//             continue
+//         }
 
-    for &bucket in arena.buckets {
-        if bucket.state != .Mapped { continue }
-        if uintptr(bucket.buffer.cpu) % uintptr(align) != uintptr(bucket.buffer.gpu) % uintptr(align) {
-            continue
-        }
+//         alignment := max(uint(align), uint(_min_alignment(bucket.buffer)))
+//         bytes_aligned := runtime.align_forward_uint(uint(bytes), alignment)
 
-        alignment := max(uint(align), uint(_min_alignment(bucket.buffer)))
-        bytes_aligned := runtime.align_forward_uint(uint(bytes), alignment)
+//         temp := mem.align_forward_uint(bucket.cursor, alignment)
+//         if temp + bytes_aligned > arena.bucket_capacity {
+//             continue
+//         }
 
-        temp := mem.align_forward_uint(bucket.cursor, alignment)
-        if temp + bytes_aligned > arena.bucket_capacity {
-            continue
-        }
+//         bucket.cursor = temp + bytes_aligned
+//         return sub_alloc(bucket.buffer, temp, bytes_aligned)
+//     }
 
-        bucket.cursor = temp + bytes_aligned
-        return sub_alloc(bucket.buffer, temp, bytes_aligned)
-    }
+//     panic("Bucket_Arena: out of space (all chunks full or remap pending)")
+// }
 
-    panic("Bucket_Arena: out of space (all chunks full or remap pending)")
-}
+// // Unmap any chunk that had `cursor > 0` (i.e. CPU wrote to it this frame)
+// // and move it from `mapped` to `dirty`. Chunks with `cursor == 0` stay in
+// // `mapped` untouched. Removal is done after a pre-pass to avoid
+// // mutating-while-iterating.
+// bucket_arena_finish :: proc(arena: ^Bucket_Arena($N)) {
+//     for &chunk in arena.buckets {
+//         if chunk.cursor > 0 && chunk.state == .Mapped {
+//             _unmap(&chunk.buffer.native)
+//             chunk.state = .Unmapped
+//         }
+//     }
+// }
 
-// Unmap any chunk that had `cursor > 0` (i.e. CPU wrote to it this frame)
-// and move it from `mapped` to `dirty`. Chunks with `cursor == 0` stay in
-// `mapped` untouched. Removal is done after a pre-pass to avoid
-// mutating-while-iterating.
-bucket_arena_finish :: proc(arena: ^Bucket_Arena($N)) {
-    for &chunk in arena.buckets {
-        if chunk.cursor > 0 && chunk.state == .Mapped {
-            _unmap(&chunk.buffer.native)
-            chunk.state = .Unmapped
-        }
-    }
-}
-
-// Move every `locked` chunk back into `mapped`, reset its cursor, and
-bucket_arena_recall :: proc(arena: ^Bucket_Arena($N)) {
-    _bucket_arena_kick_remap(arena)
-}
+// // Move every `locked` chunk back into `mapped`, reset its cursor, and
+// bucket_arena_recall :: proc(arena: ^Bucket_Arena($N)) {
+//     _bucket_arena_kick_remap(arena)
+// }
 
 Shader :: struct {
     using native: _Shader,
@@ -325,7 +308,7 @@ Pixel_Format :: enum u8 {
     Depth32Float,
 }
 
-Semaphore :: distinct rawptr
+Timeline_Semaphore :: distinct rawptr
 
 Stage :: enum u8 {
     Transfer         = 0,
@@ -458,7 +441,6 @@ init :: proc(state: ^State, native_window: rawptr) -> bool {
 
     _state = state
     _state.ctx = context
-    _state.frame_n = 1
 
     success := _init(native_window)
 
@@ -548,9 +530,8 @@ begin_frame :: proc() {
     _begin_frame()
 }
 
-end_frame :: proc() {
-    _end_frame()
-    _state.frame_n += 1
+end_frame :: proc(semaphore: Timeline_Semaphore, frame_n: u64) {
+    _end_frame(semaphore, frame_n)
 }
 
 acquire_next_swapchain :: proc() -> Texture {
@@ -631,7 +612,7 @@ temp_malloc :: proc(bytes: []u8, buffer_index: u32, shader_stage: Shader_Stage) 
 }
 
 draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
-    _draw_indiced_primitives(parameter_block, .Triangle, index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance)
+    _draw_indiced_primitives(parameter_block, .Triangle, index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance, .Uint16)
 }
 
 // Allocate a buffer of the given type.
@@ -639,52 +620,35 @@ draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, index_buffer:
 //   - .GPU_*       returns ptr with .cpu=nil; receive data via copy() from a Staging buffer
 //   - .Readback    returns ptr with .cpu=nil; receive data via copy()
 malloc :: proc(
-    type:        Buffer_Type,
-    el_count:    int,
-    el_size:     int        = 1,
-    alignment:   int        = 16,
+    bytes: u32,
+    alignment:   u32,
+    flag: Buffer_Flag,
     name:        string     = "",
     loc:                    = #caller_location,
-) -> ptr {
-    assert(alignment >= MIN_ALIGNMENT, fmt.tprintf("GPU arena_alloc_raw: alignment too small: %v, extend to %v", alignment, MIN_ALIGNMENT))
-    _ptr := _malloc(type, el_count, el_size, alignment, name)
+) -> (ptr, bool) {
 
-    if type == .Staging {
-        return ptr {
-            native = _ptr,
-            cpu    = _cpu_address(_ptr),
-            gpu    = _gpu_address(_ptr),
-            meta   = Metadata {
-                name = strings.clone(name, context.allocator),
-                created_at = loc,
-            },
-        }
+    if min_alignment := _min_alignment(flag); alignment < min_alignment {
+        log.errorf("In malloc() passed in alignment %i is less than the minimum required for flags %v. Bump to %i", alignment, flag, min_alignment)
+        return {}, false
     }
+    
+    capacity := runtime.align_forward(uint(bytes), uint(alignment))
 
-    result := ptr {
+    _ptr := _malloc(bytes, alignment, flag, name, loc)
+
+    return ptr {
         native = _ptr,
-        cpu    = nil,
+        cpu    = _cpu_address(_ptr) if flag == .Staging else nil,
         gpu    = _gpu_address(_ptr),
+        flags = flag,
+        alignment = alignment,
+        total_capacity_bytes = u32(capacity),
+        byte_offset = 0,
         meta   = Metadata {
             name = strings.clone(name, context.allocator),
             created_at = loc,
         },
-    }
-
-    return result
-}
-
-// Helper for creating index buffer
-malloc_index :: proc(el_count: int, type: Index__Buffer_Type, name: string = {}, loc := #caller_location) -> ptr {
-    el_size: int
-    switch type {
-    case .Uint16:
-        el_size = 2
-    case .Uint32:
-        el_size = 4
-    }
-
-    return malloc(.GPU_Index, el_count, el_size, el_size, name, loc)
+    }, true
 }
 
 // Release the mapping on a Staging buffer. Must be called before doing any copy() operations on the buffer.
@@ -693,26 +657,27 @@ unmap :: proc(ptr: ^ptr) {
 }
 
 // Copies src data into dst
-copy :: proc(dst, src: ptr, dst_offset: u32 = 0, src_offset: u32 = 0) {
-    _copy(
-        dst,
-        src,
-        dst_offset,
-        src_offset,
-    )
+copy :: proc(dst, src: ptr) {
+    _copy(dst, src)
 }
 
 // Linear bump arena that allocates staging buffer. Helps if multiple types of staging data is needed to be copied simultaneously.
 arena_init :: proc(
-    #any_int el_size: uint   = 4 * 1024 * 1024,
-    #any_int el_count: uint  = 1,
-    #any_int alignment: uint = 16,
+    bytes: u32,
+    #any_int alignment: u32 = 16,
     loc:                     = #caller_location,
-    usage: Buffer_Type       = .Staging,
-) -> Arena {
+    flags: Buffer_Flag      = .Staging,
+) -> (Arena, bool) {
     arena: Arena
 
-    _ptr := _malloc(usage, el_count, el_size, alignment, "ARENA")
+    if min_alignment := _min_alignment(flags); alignment < min_alignment {
+        log.errorf("In malloc() passed in alignment %i is less than the minimum required for flags %v. Bump to %i", alignment, flags, min_alignment)
+        return {}, false
+    }
+
+    capacity := runtime.align_forward(uint(bytes), uint(alignment))
+
+    _ptr := _malloc(bytes, alignment, flags, "ARENA", loc)
 
     arena.ptr = {
         meta = Metadata {
@@ -720,37 +685,41 @@ arena_init :: proc(
             created_at = loc,
         },
         native = _ptr,
-        cpu = _cpu_address(_ptr) if usage == .Staging else nil,
+        cpu = _cpu_address(_ptr) if flags == .Staging else nil,
         gpu = _gpu_address(_ptr),
+        flags = flags,
+        alignment = alignment,
+        total_capacity_bytes = u32(capacity),
+        byte_offset = 0,
     }
     arena.offset = 0
-    arena.capacity = _capacity(_ptr)
 
-    return arena
+
+    return arena, true
 }
 
 // Returns ptr with correct field values.
 arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, align: uint, loc := #caller_location) -> ptr {
     // assert(_mapped(arena.ptr)) IF staging buffer
-    alignment := max(u32(align), _min_alignment(arena.ptr))
+    alignment := max(u32(align), arena.ptr.alignment)
     if arena.ptr.cpu != nil && uintptr(arena.ptr.cpu) % uintptr(alignment) != uintptr(arena.ptr.gpu) % uintptr(alignment) {
         panic("Could not satisfy alignment requirements in GPU arena allocation.")
     }
-    
+
     bytes := el_size * el_count
     assert(bytes >= 0 && alignment > 0)
     bytes_aligned := runtime.align_forward_uint(uint(bytes), uint(alignment))
 
     arena.offset = mem.align_forward_uint(arena.offset, uint(alignment))
     temp := arena.offset
-    if arena.offset + bytes_aligned > arena.capacity {
+    if arena.offset + bytes_aligned > uint(arena.total_capacity_bytes) {
         panic("Arena: out of space")
     }
     arena.offset += bytes_aligned
 
-    ptr := sub_alloc(arena.ptr, temp, bytes_aligned)
+    view := sub_alloc(arena.ptr, u32(temp), u32(bytes_aligned))
 
-    return ptr
+    return view
 }
 
 // Helper for arena alloc
@@ -761,29 +730,21 @@ arena_alloc :: proc(arena: ^Arena, $T: typeid, el_count: uint = 1, loc := #calle
     // NOTE add typed return?
     // []T from aligned offset before bytes are added in
     // s := slice.from_ptr((^T)(temp.cpu), int(el_count))
-    
+
     return temp
 }
 
-sub_alloc :: proc(parent: ptr, offset, length: uint) -> ptr {
+sub_alloc :: proc(parent: ptr, offset, length: u32) -> ptr {
+    assert(offset + length <= parent.total_capacity_bytes)
+    assert(length <= parent.total_capacity_bytes - offset)
+
     result := parent
-    result.cpu      = rawptr(uintptr(parent.cpu) + uintptr(offset))
-    result.gpu      = rawptr(uintptr(parent.gpu) + uintptr(offset))
-    result.offset   = offset
-    result.capacity = length
+    result.cpu                  = rawptr(uintptr(parent.cpu) + uintptr(offset))
+    result.gpu                  = rawptr(uintptr(parent.gpu) + uintptr(offset))
+    result.byte_offset          = parent.byte_offset + offset
+    result.total_capacity_bytes = length
 
     return result
-}
-
-// Same as arena() with automatic recycling after use. Always get mapped buffer for render frame.
-// Must be unmapped before copy, just like normal arena.
-@(deferred_out=recycle_frame_arena)
-frame_arena :: proc() -> ^Arena {
-    return _frame_arena()
-}
-
-recycle_frame_arena :: proc(arena: ^Arena) {
-    _recycle_frame_arena(arena)
 }
 
 // Sets shader's parameter block to be used for the next draw call.
@@ -796,11 +757,11 @@ barrier :: proc(before: Stage, after: Stage) {
     _barrier(before, after)
 }
 
-semaphore :: proc(value: u64) -> Semaphore {
+semaphore :: proc(value: u64) -> Timeline_Semaphore {
     return _semaphore(value)
 }
 
-semaphore_wait :: proc(semaphore: Semaphore, value: u64) -> bool {
+semaphore_wait :: proc(semaphore: Timeline_Semaphore, value: u64) -> bool {
     return _semaphore_wait(semaphore, value)
 }
 

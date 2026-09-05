@@ -55,8 +55,9 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     scl :: 0.12
     angle := math.lerp(previous.angle, current.angle, alpha)
     
-    gpu.begin_frame()
-    frame_arena := gpu.frame_arena()
+    frame := nuppu.begin_frame()
+    defer nuppu.end_frame(frame)
+    frame_arena := nuppu.frame_arena(frame)
 
     instances := gpu.arena_alloc(frame_arena, nuppu.Sprite_Instance, INSTANCE_COUNT)
     for &isnt, idx in ([^]nuppu.Sprite_Instance)(instances.cpu)[:INSTANCE_COUNT] {
@@ -115,8 +116,6 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     // 0, 0)
 
     gpu.end_render_pass()
-
-    gpu.end_frame()
 }
 
 desc := nuppu.App_Desc(State) {

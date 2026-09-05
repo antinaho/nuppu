@@ -266,9 +266,6 @@ struct v2f_0
 
         uint material_2 = ((i_0.kind_material_0) >> 16U) & 65535U;
 
-#line 138
-        uint byteOffset_2 = instanceID_0 * 32U;
-
 #line 143
         float4 _S30 = float4(1.0f, 1.0f, 1.0f, 1.0f);
         float2 _S31 = float2(0.0f, 0.0f);
@@ -293,7 +290,7 @@ struct v2f_0
             {
 
 #line 148
-                Sprite_Instance_0 _S34 = ReadSprite_0(byteOffset_2, &kernelContext_2);
+                Sprite_Instance_0 _S34 = ReadSprite_0(i_0.extra_data_0, &kernelContext_2);
 
 #line 153
                 float3 position_2 = _S34.position_color_0.xyz;
@@ -352,7 +349,7 @@ struct v2f_0
             {
 
 #line 178
-                Mesh_Instance_0 _S42 = ReadMesh_0(byteOffset_2, &kernelContext_2);
+                Mesh_Instance_0 _S42 = ReadMesh_0(i_0.extra_data_0, &kernelContext_2);
 
 #line 184
                 float3 position_3 = _S42.position_color_1.xyz;

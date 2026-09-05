@@ -5,7 +5,6 @@ import "core:log"
 import "core:c"
 import "vendor:glfw"
 import "core:time"
-import "core:os"
 
 when PLATFORM_BACKEND == PLATFORM_BACKEND_GLFW { 
 
@@ -15,13 +14,14 @@ when PLATFORM_BACKEND == PLATFORM_BACKEND_GLFW {
 
     _init :: proc(window_size: [2]i32, window_title: string) -> bool {
         
-        when ODIN_DEBUG {
-            os.set_env("MTL_DEBUG_LAYER", "1") // API validation
-            os.set_env("MTL_SHADER_VALIDATION", "1") // Shader validation
-            os.set_env("MTL_CAPTURE_ENABLED", "1") // GPU capture (.gputrace)
-            os.set_env("MTL_HUD_ENABLED", "1") // HUD (performance counters)
-            os.set_env("OBJC_DEBUG_MISSING_POOLS", "YES") // Track missing autorelease pools
-        }
+        // when ODIN_DEBUG {
+
+        // MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 MTL_HUD_ENABLED=1
+        //     os.set_env("MTL_DEBUG_LAYER", "1") // API validation
+        //     os.set_env("MTL_SHADER_VALIDATION", "1") // Shader validation
+        //     os.set_env("MTL_CAPTURE_ENABLED", "1") // GPU capture (.gputrace)
+        //     os.set_env("MTL_HUD_ENABLED", "1") // HUD (performance counters)
+        // }
 
         if window_size.x <= 0 || window_size.y <= 0 {
             log.error("platform_GLFW: _init: Window size must be greater than 0")

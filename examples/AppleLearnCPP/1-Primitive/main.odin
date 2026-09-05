@@ -1,7 +1,7 @@
 package lo
 
 import nuppu "../../.."
-import gpu "../../../gpu"
+import R "../../../render"
 import "core:mem"
 import "core:fmt"
 import "core:slice"
@@ -23,6 +23,8 @@ when ODIN_OS == .JS {
     vertex_code := #load("triangle.wgsl", []u8)
     fragment_code := vertex_code 
 }
+
+     
 
     // Init resources
     shader_vs := gpu.shader_init("my_vert_shader", vertex_code)
@@ -78,8 +80,9 @@ when ODIN_OS == .JS {
 _update :: proc() {}
 
 _render :: proc(previous, current: ^State, alpha: f32) {
-    gpu.begin_frame()
-    frame_arena := gpu.frame_arena()
+    frame := nuppu.begin_frame()
+    defer nuppu.end_frame(frame)
+    frame_arena := nuppu.frame_arena(frame)
 
     swapchain := gpu.acquire_next_swapchain()
     gpu.begin_render_pass({
@@ -103,8 +106,6 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.draw_indiced_primitives(.Triangle, current.mesh.indices, current.mesh.index_count, 0, 1, 0, 0)
 
     gpu.end_render_pass()
-
-    gpu.end_frame()
 }
 
 desc := nuppu.App_Desc(State) {

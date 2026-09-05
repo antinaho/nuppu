@@ -80,8 +80,9 @@ render :: proc(prev, curr: ^Window, alpha: f32) {
     scl :: 0.22
     angle := math.lerp(prev.angle, curr.angle, alpha)
 
-    gpu.begin_frame()
-    frame_arena := gpu.frame_arena()
+    frame := nuppu.begin_frame()
+    defer nuppu.end_frame(frame)
+    frame_arena := nuppu.frame_arena(frame)
 
     instances := gpu.arena_alloc(frame_arena, Instance, INSTANCE_COUNT)
 
@@ -164,8 +165,6 @@ render :: proc(prev, curr: ^Window, alpha: f32) {
     nuppu.draw_mesh_ex(cube_mesh, INSTANCE_COUNT)
 
     gpu.end_render_pass()
-
-    gpu.end_frame()    
 }
 
 desc := nuppu.App_Desc(Window) {

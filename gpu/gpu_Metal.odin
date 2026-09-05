@@ -19,9 +19,6 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _ptr :: struct {
         buffer: ^MTL.Buffer,
-        offset: uint, // Byte offset of this view into `buffer` (0 for top-level allocations)
-        capacity: uint, // Capacity of the ptr, NOT the buffer
-        index_bytes: u8
     }
 
     _Shader :: struct {
@@ -79,12 +76,6 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         native_window->setBackgroundColor(nil)
         
         _state.queue = _state.device->newCommandQueue()
-
-        for _ in 0 ..< FRAMES_IN_FLIGHT {
-            frame_arena := new(Arena, context.allocator)
-            frame_arena^ = arena_init()
-            append(&_state.frame_arenas, frame_arena)
-        }
 
         _state.is_init = true
 
@@ -245,7 +236,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
     }
 
     
-    _end_frame :: proc() {
+    _end_frame :: proc(semaphore: Timeline_Semaphore, frame_n: u64) {
         // The render work (begin_frame -> render -> end_render_pass) was
         // recorded into the command buffer autoreleased into _state.frame_pool.
         // Now present + signal + commit it, then drain the pool. Metal
@@ -254,9 +245,9 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         defer {
             _state.frame_pool->drain()
             _state.frame_pool = nil
-        } 
+        }
         _state.command_buffer->presentDrawable(_state.curr_drawable)
-        _state.command_buffer->encodeSignalEvent((^MTL.SharedEvent)(_state.frame_semaphore), _state.frame_n)
+        _state.command_buffer->encodeSignalEvent((^MTL.SharedEvent)(semaphore), frame_n)
         _state.command_buffer->commit()
 
         _state.command_buffer = {}
@@ -380,7 +371,7 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         _state.render_command_encoder->setFrontFacingWinding(_front_face_winding_interop(winding))
     }
 
-    _draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
+    _draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32, t: Index_Buffer_Type) {
         _state.render_command_encoder->setRenderPipelineState(_state.curr_pipeline)
 
         _use_parameter_block(parameter_block, .Graphics)
@@ -390,53 +381,48 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         }
 
         index_format: MTL.IndexType
-        switch index_buffer.native.index_bytes {
-        case 2:
+        index_bytes: NS.UInteger
+        switch t {
+        case .Uint16:
             index_format = MTL.IndexType.UInt16
-        case 4:
+            index_bytes = 2
+        case .Uint32:
             index_format = MTL.IndexType.UInt32
+            index_bytes = 4
         case: panic("Index buffer format not supported")
         }
 
         _state.render_command_encoder->drawIndexPrimitivesWithBaseVertex(
             _primitive_type_interop(primitive), NS.UInteger(index_count), index_format,
-            index_buffer.native.buffer, NS.UInteger(index_offset * u32(index_buffer.native.index_bytes)), NS.UInteger(instance_count), NS.Integer(base_vertex), NS.UInteger(base_instance)
+            index_buffer.native.buffer, NS.UInteger(index_offset * u32(index_bytes)), NS.UInteger(instance_count), NS.Integer(base_vertex), NS.UInteger(base_instance)
         )
     }
 
     _malloc :: proc(
-        type: Buffer_Type,
-        #any_int el_count: uint,
-        #any_int el_size: uint,
-        #any_int alignment: uint,
+        bytes: u32,
+        alignment: u32,
+        flags: Buffer_Flag,
         name: string,
+        loc := #caller_location,
     ) -> _ptr {
-        bytes := runtime.align_forward_uint(el_count * el_size, alignment)
+        capacity := runtime.align_forward(uint(bytes), uint(alignment))
 
         options: MTL.ResourceOptions
-        switch type {
+        switch flags {
         case .Staging:
             options = MTL.ResourceStorageModeShared
-        case .GPU_Storage:
+        case .Default, .Index, .Constant:
             options = {.StorageModePrivate}
-        case .GPU_Constant:
-            options = {.StorageModePrivate}
-        case .GPU_Index:
-            options = {.StorageModePrivate}
-        case .Readback:
-            options = MTL.ResourceStorageModeShared
         }
-
+        
         buffer := _state->device->newBufferWithLength(
-            length = NS.UInteger(bytes),
+            length = NS.UInteger(capacity),
             options = options,
         )
+        buffer->setLabel(NS.String.alloc()->initWithOdinString(name))
 
         return _ptr {
             buffer = buffer,
-            offset = 0,
-            capacity = uint(bytes),
-            index_bytes = u8(el_size) if type == .GPU_Index else 0,
         }
     }
 
@@ -451,14 +437,6 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         }
     }
 
-    _capacity :: proc(ptr: _ptr) -> uint {
-        return ptr.capacity
-    }
-
-    _min_alignment :: proc(ptr: _ptr) -> u32 {
-        return MIN_ALIGNMENT
-    }
-
     _cpu_address :: proc(p: _ptr) -> rawptr {
         return rawptr(uintptr(p.buffer->contentsPointer()))
     }
@@ -469,15 +447,15 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
 
     _unmap :: proc(ptr: ^_ptr) { /* no op in Metal */ }
 
-    _copy :: proc(dst, src: ptr, dst_offset, src_offset: u32) {
+    _copy :: proc(dst, src: ptr) {
         if _state.blit_command_encoder == nil {
             _state.blit_command_encoder = _state.command_buffer->blitCommandEncoder()
         }
 
         _state.blit_command_encoder->copyFromBuffer(
-            src.native.buffer, NS.UInteger(src.offset + uint(src_offset)),
-            dst.native.buffer, NS.UInteger(dst.offset + uint(dst_offset)),
-            NS.UInteger(src.capacity),
+            src.native.buffer, NS.UInteger(src.byte_offset),
+            dst.native.buffer, NS.UInteger(dst.byte_offset),
+            NS.UInteger(src.total_capacity_bytes),
         )
     }
 
@@ -485,24 +463,17 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         return ptr.cpu != nil
     }
 
-    _frame_arena :: proc() -> ^Arena {
-        arena := _state.frame_arenas[_state.frame_n % FRAMES_IN_FLIGHT]
-        arena.offset = 0
-        return arena
-    }
+    // _bucket_arena_kick_remap :: proc(arena: ^Bucket_Arena($T)) {
+    //     for &bucket in arena.buckets {
+    //         if bucket.state != .Locked { continue }
+    //         bucket.cursor = 0
+    //         bucket.state = .Mapped
+    //     }
+    //     /* no op in Metal; staging buffers stay mapped for life */
+    // }
 
-    _recycle_frame_arena :: proc(arena: ^Arena) {
-        /* no op */
-        // end frame signals the semaphore
-    }
-
-    _bucket_arena_kick_remap :: proc(arena: ^Bucket_Arena($T)) {
-        for &bucket in arena.buckets {
-            if bucket.state != .Locked { continue }
-            bucket.cursor = 0
-            bucket.state = .Mapped
-        }
-        /* no op in Metal; staging buffers stay mapped for life */
+    _min_alignment :: proc(flags: Buffer_Flag) -> u32 {
+        return 4
     }
 
     _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {
@@ -619,13 +590,13 @@ when GPU_BACKEND == GPU_BACKEND_METAL {
         _ = after
     }
 
-    _semaphore :: proc(value: u64) -> Semaphore {
+    _semaphore :: proc(value: u64) -> Timeline_Semaphore {
         event := _state.device->newSharedEvent()
         event->setSignaledValue(value)
-        return Semaphore(event)
+        return Timeline_Semaphore(event)
     }
 
-    _semaphore_wait :: proc(semaphore: Semaphore, value: u64) -> bool {
+    _semaphore_wait :: proc(semaphore: Timeline_Semaphore, value: u64) -> bool {
         event := (^MTL.SharedEvent)(semaphore)
         
         if event->signaledValue() >= value {

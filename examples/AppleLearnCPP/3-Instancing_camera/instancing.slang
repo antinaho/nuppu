@@ -135,7 +135,7 @@ v2f vertexMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) {
     // so the byte offset into instances_data is just instanceID * 32u.
     // The CPU draw call must set base_instance to the offset of this kind's
     // payloads (0 for sprites, sprite_count for meshes).
-    uint byteOffset = instanceID * 32u;
+    uint byteOffset = i.extra_data;
 
     // Output state hoisted so the post-switch assembly can see it.
     // Defaults give a sane no-op for any case we haven't filled yet.

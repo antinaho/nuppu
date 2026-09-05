@@ -37,7 +37,7 @@ _upload_png_to_array_layer :: proc(texture: gpu.Texture, layer: int, data: []u8,
 }
 
 _init :: proc() {
-    vertex_code   := #load("instancing.vs.metal", []u8)
+    vertex_code := #load("instancing.vs.metal", []u8)
     fragment_code := #load("instancing.ps.metal", []u8)
 
     shader_vs := gpu.shader_init("ia_vert", vertex_code)
@@ -83,6 +83,10 @@ _init :: proc() {
     state.camera_pos = {0, 0, 2}
 }
 
+_deinit :: proc() {
+
+}
+
 _update :: proc() {
     state.angle += nuppu.sim_delta_time() * 0.09
 }
@@ -91,14 +95,8 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     scl :: 0.33
     angle := math.lerp(previous.angle, current.angle, alpha)
 
-    nuppu._batch.len = 0
-    nuppu._batch.cap = 0
-
-    nuppu._batch_2.len = 0
-    nuppu._batch_2.cap = 0
-
-    gpu.begin_frame()
-    frame_arena := gpu.frame_arena()
+    frame := nuppu.begin_frame()
+    defer nuppu.end_frame(frame)
 
     for idx in 0 ..< INSTANCE_COUNT {
         i := f32(idx) / f32(INSTANCE_COUNT)
@@ -112,7 +110,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
             material_idx = u32(idx % 2),
         )
     }
-
+    
     for idx in 0 ..< INSTANCE_COUNT {
         i := f32(idx) / f32(INSTANCE_COUNT)
         x_off := (i * 2 - 1) + (1.0 / INSTANCE_COUNT)
@@ -126,19 +124,21 @@ _render :: proc(previous, current: ^State, alpha: f32) {
         )
     }
 
-    nuppu._batch_2.last_len = nuppu._batch_2.len
-    nuppu._batch.last_len = nuppu._batch.len
+    nuppu.finish_instance_upload()
+
+    // for X in 0 ..< 4 {
+    //     nuppu.draw_sprite(
+    //         position      = {f32(X) * 0.3, 0, 0},
+    //         rotation      = {0, 0, angle},
+    //         scale         = {scl * 1.2, scl * 1.2},
+    //         material_idx = u32(0),
+    //     )
+    // }
+    // nuppu.flush(nuppu.sprite_batch())
+
     
-    sprite_instances_base := gpu.arena_alloc_raw(frame_arena, size_of(nuppu.Instance), uint(nuppu._batch.len), align_of(nuppu.Instance))    
-    sprite_instances_data := gpu.arena_alloc_raw(frame_arena, size_of(nuppu.Sprite_Instance), uint(nuppu._batch.len), align_of(nuppu.Sprite_Instance))
-    intrinsics.mem_copy_non_overlapping(sprite_instances_base.cpu, nuppu._batch.base_instances, size_of(nuppu.Instance) * nuppu._batch.len)
-    intrinsics.mem_copy_non_overlapping(sprite_instances_data.cpu, nuppu._batch.frame_instances, size_of(nuppu.Sprite_Instance) * nuppu._batch.len)
-
-    cube_instances_base := gpu.arena_alloc_raw(frame_arena, size_of(nuppu.Instance), uint(nuppu._batch_2.len), align_of(nuppu.Instance))
-    cube_instances_data := gpu.arena_alloc_raw(frame_arena, size_of(nuppu.Mesh_Instance), uint(nuppu._batch_2.len), align_of(nuppu.Mesh_Instance))
-    intrinsics.mem_copy_non_overlapping(cube_instances_base.cpu, nuppu._batch_2.base_instances, size_of(nuppu.Instance) * nuppu._batch_2.len)
-    intrinsics.mem_copy_non_overlapping(cube_instances_data.cpu, nuppu._batch_2.frame_instances, size_of(nuppu.Mesh_Instance) * nuppu._batch_2.len)
-
+    // nuppu.batches_finish()
+    frame_arena := frame.arena
     uniforms := gpu.arena_alloc(frame_arena, nuppu.Engine_Uniform, 1)
 
     uniforms_data := nuppu.frame_uniform(nuppu.Camera{
@@ -153,12 +153,6 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.unmap(&frame_arena.ptr)
 
     gpu.copy(nuppu.global_frame_uniform(), uniforms)
-
-    gpu.copy(nuppu.instances(), sprite_instances_base) // Sprite instances
-    gpu.copy(nuppu.instances(), cube_instances_base, nuppu._batch.len * size_of(nuppu.Instance)) // Cube instances
-
-    gpu.copy(nuppu.instances_data(), sprite_instances_data) // Sprites
-    gpu.copy(nuppu.instances_data(), cube_instances_data, nuppu._batch.len * size_of(nuppu.Sprite_Instance)) // Cubes
     gpu.barrier(.Transfer, .All)
 
     swapchain := gpu.acquire_next_swapchain()
@@ -177,16 +171,18 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.set_depth_stencil_state(current.depth_pso)
 
     nuppu.draw_mesh_builtin(.Quad, INSTANCE_COUNT)
-    nuppu.draw_mesh_builtin(.Cube, INSTANCE_COUNT, nuppu._batch.len)
+    nuppu.draw_mesh_builtin(.Cube, INSTANCE_COUNT, 32)
+    //nuppu.draw_mesh_builtin(.Quad, 4, 32)
+    
 
     gpu.end_render_pass()
-    gpu.end_frame()
 }
 
 desc := nuppu.App_Desc(State) {
     state       = &state,
     window_size = {1000, 1000},
     init        = _init,
+    deinit      = _deinit,
     update      = _update,
     render      = _render,
 }

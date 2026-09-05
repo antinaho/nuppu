@@ -10,8 +10,9 @@ State :: struct { }
 update :: proc() { }
 
 render :: proc(prev, curr: ^State, alpha: f32) {
-    gpu.begin_frame()
-    frame_arena := gpu.frame_arena()
+    frame := nuppu.begin_frame()
+    defer nuppu.end_frame(frame)
+    frame_arena := nuppu.frame_arena(frame)
 
     swapchain := gpu.acquire_next_swapchain()
 
@@ -25,8 +26,6 @@ render :: proc(prev, curr: ^State, alpha: f32) {
     )
 
     gpu.end_render_pass()
-    
-    gpu.end_frame()
 }
 
 desc := nuppu.App_Desc(State) {

@@ -90,8 +90,9 @@ _update :: proc() {
 }
 
 _render :: proc(previous, current: ^State, alpha: f32) {
-    gpu.begin_frame()
-    frame_arena := gpu.frame_arena()
+    frame := nuppu.begin_frame()
+    defer nuppu.end_frame(frame)
+    frame_arena := nuppu.frame_arena(frame)
 
     angle := math.lerp(previous.angle, current.angle, alpha)
 
@@ -99,9 +100,9 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     (^Animation)(fd.cpu)^ = Animation{angle = angle}
 
     gpu.unmap(&frame_arena.ptr)
-    
+
     gpu.copy(current.angle_buf, fd)
-    
+
     gpu.barrier(.Transfer, .All)
 
     swapchain := gpu.acquire_next_swapchain()
@@ -127,8 +128,6 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.draw_indiced_primitives(.Triangle, current.index_gpu, 3, 0, 1, 0, 0)
 
     gpu.end_render_pass()
-
-    gpu.end_frame()
 }
 
 desc := nuppu.App_Desc(State) {

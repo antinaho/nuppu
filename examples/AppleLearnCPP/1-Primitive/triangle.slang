@@ -101,6 +101,14 @@ float4 fragmentMain(v2f in) : SV_Target
 
 
 // slangc examples/AppleLearnCPP/3-Instancing_camera/instancing.slang \
+//     -target wgsl \
+//     -entry vertexMain \
+//     -stage vertex \
+//     -entry fragmentMain \
+//     -stage fragment \
+//     -o examples/AppleLearnCPP/3-Instancing_camera/instancing.wgsl
+
+// slangc examples/AppleLearnCPP/3-Instancing_camera/instancing.slang \
 //     -target metal \
 //     -entry vertexMain \
 //     -stage vertex \

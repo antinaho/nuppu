@@ -37,11 +37,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     _ptr :: struct {
         buffer: wgpu.Buffer,
-        offset: uint, // Byte offset of this view into `buffer` (0 for top-level allocations)
-        capacity: uint, // Capacity of the ptr, NOT the buffer
-        index_bytes: u8,
         is_mapped: bool,
-        min_alignment: u32,
         binding_type: wgpu.BufferBindingType,
     }
 
@@ -374,7 +370,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         _begin_commands()
     }
 
-    _end_frame :: proc() {
+    _end_frame :: proc(semaphore: Timeline_Semaphore, frame_n: u64) {
         finished := wgpu.CommandEncoderFinish(_state.command_encoder, nil)
         defer {
             wgpu.CommandBufferRelease(finished)
@@ -382,7 +378,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
         wgpu.QueueSubmit(_state.queue, []wgpu.CommandBuffer{finished})
         _state.command_encoder = nil
-    
+
         wgpu.SurfacePresent(_state.surface)
     }
 
@@ -695,14 +691,14 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         ptr.is_mapped = false
     }
 
-    _copy :: proc(dst, src: ptr, dst_offset, src_offset: u32) {
+    _copy :: proc(dst, src: ptr) {
         wgpu.CommandEncoderCopyBufferToBuffer(
             _state.command_encoder,
             src.native.buffer,
-            u64(src.native.offset + uint(src_offset)),
+            u64(uint(src.byte_offset)),
             dst.native.buffer,
-            u64(dst.native.offset + uint(dst_offset)),
-            u64(src.capacity),
+            u64(uint(dst.byte_offset)),
+            u64(src.total_capacity_bytes),
         )
     }
 
@@ -958,12 +954,12 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     _barrier :: proc(before: Stage, after: Stage) { /* no op */ }
 
-    _semaphore :: proc(value: u64) -> Semaphore {
+    _semaphore :: proc(value: u64) -> Timeline_Semaphore {
         /* no op */
         return {}
     }
 
-    _semaphore_wait :: proc(semaphore: Semaphore, value: u64) -> bool {
+    _semaphore_wait :: proc(semaphore: Timeline_Semaphore, value: u64) -> bool {
         /* no op */
         return true
     }
