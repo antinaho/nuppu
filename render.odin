@@ -35,6 +35,11 @@ Built_in_mesh :: enum u32 {
     Cube,
 }
 
+Built_in_texture :: enum u32 {
+    Depth,
+    Swapchain,
+}
+
 @(require_results)
 push_mesh_zeroed :: proc(
     vertex_count: u32,

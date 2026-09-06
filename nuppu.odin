@@ -62,7 +62,6 @@ State :: struct #align(64) {
     instance_batcher: Instance_Batcher,    
 
     sampler: gpu.Sampler,
-    depth_texture: gpu.Texture,
 
     frame_semaphore: gpu.Timeline_Semaphore,
     frame_arenas: [dynamic; FRAMES_IN_FLIGHT]^gpu.Arena,
@@ -70,13 +69,13 @@ State :: struct #align(64) {
 
     // Built-in resources, currently representing quad sprite
     built_in_block: gpu.Parameter_Block,
-    //built_in_textures: gpu.Texture,
 
     //
     meshes: bit_array.Bit_Array(Resource(Mesh), MAX_MESHES, Mesh_Handle),
     built_in_meshes: [Built_in_mesh]Mesh_Handle,
 
     textures: bit_array.Bit_Array(Resource(Texture), MAX_TEXTURES, Texture_Handle),
+    built_in_textures: [Built_in_texture]Texture_Handle,
 }
 
 _state: ^State
@@ -241,13 +240,24 @@ frame_arena :: proc(frame: Frame) -> ^gpu.Arena {
     return frame.arena
 }
 
-depth :: proc() -> gpu.Texture {
-    return _state.depth_texture
+depth :: proc() -> Texture_Handle {
+    return _state.built_in_textures[.Depth]
 }
 
 resize_depth :: proc(width, height: u32) {
-    gpu.release_texture(&_state.depth_texture)
-    _state.depth_texture = gpu.texture_depth_init({width, height}, .Depth32Float)
+    if old_handle := _state.built_in_textures[.Depth]; old_handle != Texture_Handle(bit_array.NIL_HANDLE) {
+        if old_tex, ok := get_resource(&_state.textures, old_handle); ok {
+            gpu.release_texture(old_tex)
+            bit_array.remove(&_state.textures, old_handle)
+        }
+    }
+    gpu_tex := gpu.texture_depth_init({width, height}, .Depth32Float)
+    _state.built_in_textures[.Depth] = add_resource(&_state.textures, gpu_tex)
+}
+
+resolve_texture :: proc(handle: Texture_Handle) -> gpu.Texture {
+    tex, _ := get_resource(&_state.textures, handle)
+    return tex^
 }
 
 recycle_frame_arena :: proc(arena: ^gpu.Arena) {
@@ -347,6 +357,8 @@ _ready_up :: proc() {
 
     _state.window_size = platform.window_size_pixel()
     gpu.resize_swapchain(u32(_state.window_size.x), u32(_state.window_size.y))
+
+    bit_array.init(&_state.textures)
     resize_depth(u32(_state.window_size.x), u32(_state.window_size.y))
 
     // Global buffers wrapped in arena
@@ -386,10 +398,6 @@ _ready_up :: proc() {
         wrap_s = .ClampToEdge,
         wrap_t = .ClampToEdge,
     })
-
-
-
-    bit_array.init(&_state.textures)
 
     PNG_DIM :: [2]u32{63, 63}
 
@@ -462,7 +470,18 @@ sim_delta_time :: proc() -> f32 {
     return 1.0 / f32(SIM_TICKS_PER_SECOND)
 }
 
-acquire_next_swapchain : proc() -> gpu.Texture : gpu.acquire_next_swapchain
+acquire_next_swapchain :: proc() -> Texture_Handle {
+    gpu_tex := gpu.acquire_next_swapchain()
+
+    if _state.built_in_textures[.Swapchain] == Texture_Handle(bit_array.NIL_HANDLE) {
+        _state.built_in_textures[.Swapchain] = add_resource(&_state.textures, gpu_tex)
+        return _state.built_in_textures[.Swapchain]
+    }
+
+    tex_ptr, _ := get_resource(&_state.textures, _state.built_in_textures[.Swapchain])
+    tex_ptr^ = gpu_tex
+    return _state.built_in_textures[.Swapchain]
+}
 
 Screen_Bounds :: struct #align(16) {
     // (min_x, min_y) = bottom-left of letterboxed region in NDC
@@ -521,7 +540,7 @@ add_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), res: R
             data = res,
             metadata = Metadata {
                 created_at = loc,
-                created_on_frame = state.frame_n,
+                created_on_frame = _state.frame_n,
             },
         })
     } else {
