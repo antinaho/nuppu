@@ -28,7 +28,20 @@ Mesh :: struct #all_or_none {
     indices:      gpu.ptr,
 }
 
-Mesh_Handle :: distinct bit_array.Handle
+when ODIN_DEBUG {
+    Mesh_Handle :: struct {
+        handle: bit_array.Handle,
+        metadata: Metadata,
+    }
+
+    Mesh_Handle_Nil :: Mesh_Handle{}
+} else {
+    Mesh_Handle :: struct {
+        handle: bit_array.Handle,
+    }
+
+    Mesh_Handle_Nil :: Mesh_Handle{}
+}
 
 Built_in_mesh :: enum u32 {
     Quad,
@@ -58,8 +71,8 @@ push_mesh_zeroed :: proc(
         verts        = verts_view,
         indices      = indices_view,
         })
-        
-    return Mesh_Handle(handle)
+
+    return handle
 }
 
 get_built_in_mesh :: proc(built_in_mesh: Built_in_mesh) -> (^Mesh, bool) #optional_ok {

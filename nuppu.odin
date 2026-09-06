@@ -26,7 +26,26 @@ MAX_TEXTURES :: 256
 
 Texture :: gpu.Texture
 Texture_Descriptor :: gpu.Texture_Descriptor
-Texture_Handle :: distinct bit_array.Handle
+
+Metadata :: struct {
+    created_at: runtime.Source_Code_Location,
+    created_on_frame: u64,
+}
+
+when ODIN_DEBUG {
+    Texture_Handle :: struct {
+        handle: bit_array.Handle,
+        metadata: Metadata,
+    }
+
+    Texture_Handle_Nil :: Texture_Handle{}
+} else {
+    Texture_Handle :: struct {
+        handle: bit_array.Handle,
+    }
+
+    Texture_Handle_Nil :: Texture_Handle{}
+}
 
 State :: struct #align(64) {
     ctx: runtime.Context,
@@ -80,6 +99,12 @@ State :: struct #align(64) {
 
 _state: ^State
 
+when ODIN_DEBUG {
+    // Dedupes stale-handle warnings: each call site fires at most once per process.
+    @(private="file")
+    _debug_warned_call_sites: map[u64]bool
+}
+
 Frame_Result :: enum { Continue, Skip_Render, Exit }
 
 Frame :: struct {
@@ -104,16 +129,9 @@ App_Optional :: struct {
 
 when ODIN_DEBUG {
 
-// Add anything here that might help in debugging
-Metadata :: struct {
-    created_at: runtime.Source_Code_Location,
-    created_on_frame: u64,
-}
-
 Resource :: struct($T: typeid) {
     handle: bit_array.Handle,
     data: T,
-    metadata: Metadata,
 }
 
 } else {
@@ -139,6 +157,10 @@ run :: proc(desc: App_Desc($T)) {
 
     context.logger = logger
     _state.ctx = context
+
+    when ODIN_DEBUG {
+        _debug_warned_call_sites = make(map[u64]bool)
+    }
 
     states, states_err := mem.alloc(size_of(T) * 2, alignment = 64)
     if states_err != nil {
@@ -245,7 +267,7 @@ depth :: proc() -> Texture_Handle {
 }
 
 resize_depth :: proc(width, height: u32) {
-    if old_handle := _state.built_in_textures[.Depth]; old_handle != Texture_Handle(bit_array.NIL_HANDLE) {
+    if old_handle := _state.built_in_textures[.Depth]; old_handle.handle != bit_array.NIL_HANDLE {
         if old_tex, ok := get_resource(&_state.textures, old_handle); ok {
             gpu.release_texture(old_tex)
             bit_array.remove(&_state.textures, old_handle)
@@ -255,9 +277,56 @@ resize_depth :: proc(width, height: u32) {
     _state.built_in_textures[.Depth] = add_resource(&_state.textures, gpu_tex)
 }
 
-resolve_texture :: proc(handle: Texture_Handle) -> gpu.Texture {
-    tex, _ := get_resource(&_state.textures, handle)
-    return tex^
+Load_Action  :: gpu.Load_Action
+Store_Action :: gpu.Store_Action
+Clear_Color  :: gpu.Clear_Color
+
+Color_Attachment :: struct {
+    clear_color:    Clear_Color,
+    load_action:    Load_Action,
+    store_action:   Store_Action,
+    texture:        Texture_Handle,
+    resolve_texture: Texture_Handle,
+}
+
+Depth_Attachment :: struct {
+    load_action:  Load_Action,
+    store_action: Store_Action,
+    texture:      Texture_Handle,
+}
+
+begin_render_pass :: proc(color: Color_Attachment, depth: Depth_Attachment = {}) {
+    color_tex: gpu.Texture
+    if tex, ok := get_resource(&_state.textures, color.texture); ok {
+        color_tex = tex^
+    }
+    color_resolve: gpu.Texture
+    if tex, ok := get_resource(&_state.textures, color.resolve_texture); ok {
+        color_resolve = tex^
+    }
+    depth_tex: gpu.Texture
+    if tex, ok := get_resource(&_state.textures, depth.texture); ok {
+        depth_tex = tex^
+    }
+
+    gpu.begin_render_pass(
+        gpu.Color_Attachment {
+            clear_color    = color.clear_color,
+            load_action    = color.load_action,
+            store_action   = color.store_action,
+            texture        = color_tex,
+            resolve_texture = color_resolve,
+        },
+        gpu.Depth_Attachment {
+            load_action  = depth.load_action,
+            store_action = depth.store_action,
+            texture      = depth_tex,
+        },
+    )
+}
+
+end_render_pass :: proc() {
+    gpu.end_render_pass()
 }
 
 recycle_frame_arena :: proc(arena: ^gpu.Arena) {
@@ -473,7 +542,7 @@ sim_delta_time :: proc() -> f32 {
 acquire_next_swapchain :: proc() -> Texture_Handle {
     gpu_tex := gpu.acquire_next_swapchain()
 
-    if _state.built_in_textures[.Swapchain] == Texture_Handle(bit_array.NIL_HANDLE) {
+    if _state.built_in_textures[.Swapchain].handle == bit_array.NIL_HANDLE {
         _state.built_in_textures[.Swapchain] = add_resource(&_state.textures, gpu_tex)
         return _state.built_in_textures[.Swapchain]
     }
@@ -535,26 +604,49 @@ compute_screen_layout :: proc(window_w, window_h: i32, internal_w, internal_h: i
 }
 
 add_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), res: Res, loc := #caller_location) -> H {
+    handle, _ := bit_array.add(array, Resource(Res) {
+        data = res,
+    })
     when ODIN_DEBUG {
-        resource_handle := bit_array.add(array, Resource(Res) {
-            data = res,
-            metadata = Metadata {
-                created_at = loc,
-                created_on_frame = _state.frame_n,
-            },
-        })
-    } else {
-        resource_handle := bit_array.add(array, Resource(Res) {
-            data = res,
-        })
+        handle.metadata = Metadata {
+            created_at = loc,
+            created_on_frame = _state.frame_n,
+        }
     }
-
-    return resource_handle
+    return handle
 }
 
-get_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), handle: H) -> (^Res, bool) {
+get_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), handle: H, loc := #caller_location) -> (^Res, bool) {
     resource_ptr, ok := bit_array.get(array, handle)
+    when ODIN_DEBUG {
+        if !ok && handle.handle != bit_array.NIL_HANDLE {
+            h := debug_warn_hash(loc)
+            if h not_in _debug_warned_call_sites {
+                index, _ := bit_array.unpack_handle(handle.handle)
+                log.warnf(
+                    "[nuppu] stale handle idx=%v — created at %v:%v on frame %v (lookup at %v:%v)",
+                    index,
+                    handle.metadata.created_at.file_path,
+                    handle.metadata.created_at.line,
+                    handle.metadata.created_on_frame,
+                    loc.file_path,
+                    loc.line,
+                )
+                _debug_warned_call_sites[h] = true
+            }
+        }
+    }
     return &resource_ptr.data, ok
+}
+
+debug_warn_hash :: proc(loc: runtime.Source_Code_Location) -> u64 {
+    h: u64 = 0xcbf29ce484222325 // FNV-1a 64-bit offset basis
+    for i in 0..<len(loc.file_path) {
+        h = (h ~ u64(loc.file_path[i])) * 0x100000001b3 // FNV-1a prime
+    }
+    h = (h ~ u64(loc.line))   * 0x100000001b3
+    h = (h ~ u64(loc.column)) * 0x100000001b3
+    return h
 }
 
 //
