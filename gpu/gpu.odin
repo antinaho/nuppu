@@ -2,7 +2,6 @@
 package nuppu_gpu
 
 import "base:runtime"
-import "core:mem"
 import "core:log"
 import "core:strings"
 import "core:fmt"
@@ -58,7 +57,7 @@ MAX_LAYOUT_BINDINGS       :: MAX_CONSTANT_BUFFERS + MAX_BUFFERS + MAX_SAMPLED_TE
 #assert(MAX_READ_WRITE_RESOURCES <= __MAX_READ_WRITE_RESOURCES)
 #assert(MAX_LAYOUT_BINDINGS <= __MAX_LAYOUT_BINDINGS)
 
-MAX_TEXTURE_SIZE :: 4096
+MAX_2D_TEXTURE_SIZE :: 4096
 
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
@@ -68,8 +67,6 @@ _state: ^State
 
 State :: struct #align(64) {
     using impl: _State,
-
-    ctx: runtime.Context,
     is_init: bool,
 }
 
@@ -125,11 +122,6 @@ Metadata :: struct
     created_at: runtime.Source_Code_Location,
 }
 
-Arena :: struct {
-    using ptr: ptr,
-    offset: uint,
-}
-
 Shader :: struct {
     using native: _Shader,
 }
@@ -175,7 +167,8 @@ Sampler_Descriptor :: struct {
     wrap_r: Sampler_Address_Mode,
 }
 
-Texture :: struct {
+Texture :: struct #all_or_none {
+    dimensions: [3]u32,
     using native: _Texture,
 }
 
@@ -184,7 +177,7 @@ Texture_Type :: enum u8 {
     _2D_Array,
 }
 
-Texture_Descriptor :: struct #all_or_none {
+Texture_Descriptor :: struct {
     dimensions: [2]u32,
     format: Pixel_Format,
     storage: StorageMode,
@@ -207,7 +200,7 @@ Texture_Usage_Flag :: enum {
 }
 Texture_Usage :: bit_set[Texture_Usage_Flag; u8]
 
-Color :: [4]u8
+Clear_Color :: [4]u8
 
 Pixel_Format :: enum u8 {
     None,
@@ -226,7 +219,7 @@ Stage :: enum u8 {
 }
 
 Color_Attachment :: struct {
-    clear_color: Color,
+    clear_color: Clear_Color,
     load_action: Load_Action,
     store_action: Store_Action,
     texture: Texture,
@@ -343,39 +336,37 @@ Blend_Factor :: enum i32 {
 	OneMinusSrc1Alpha = 0x00000011,
 }
 
-init :: proc(state: ^State, native_window: rawptr) -> bool {
-    if _state != nil {
-        return true
-    }
+init :: proc(
+    state           : ^State,
+    native_window   : rawptr,
+    swapchain_format: Pixel_Format = .BGRA8Unorm
+) -> bool {
+    if _state != nil { return true }
 
     _state = state
-    _state.ctx = context
 
-    success := _init(native_window)
+    success := _init(native_window, swapchain_format)
 
     return success
 }
 
+is_init :: proc() -> bool { return _state.is_init }
+
 deinit :: proc() {
-    if _state == nil {
-        return
-    }
+    if _state == nil { return }
     
     _deinit()
-    
-    // destroy resources and other stuff
 
     _state = nil
 }
 
-is_init :: proc() -> bool { return _state.is_init }
-
 resize_swapchain : proc(width, height: u32) -> bool : _resize_swapchain
+
 release_texture: proc(texture: ^Texture) : _release_texture
 release_ptr : proc(ptr: ^ptr) : _release_ptr
 
 // CPU side copy
-copy_to_texture : proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) : _copy_to_texture
+copy_to_texture : proc(texture: Texture, origin, size: [3]u32, level: u32, data: rawptr, bytes_per_row: u32) : _copy_to_texture
 
 depth_stencil_state_init :: proc(desc: Depth_Stencil_State_Descriptor) -> Depth_Stencil_State {
     _depth_pso := _depth_stencil_state_init(desc)
@@ -385,8 +376,8 @@ depth_stencil_state_init :: proc(desc: Depth_Stencil_State_Descriptor) -> Depth_
     }
 }
 
-shader_init :: proc(name: string, code: []u8) -> Shader {
-    native := _shader_init(name, code)
+shader_init :: proc(identifier: string, code: []u8) -> Shader {
+    native := _shader_init(identifier, code)
 
     return Shader {
         native = native,
@@ -420,13 +411,7 @@ commit_commands : proc() : _commit_commands
 begin_frame : proc() : _begin_frame
 end_frame : proc(semaphore: Timeline_Semaphore, frame_n: u64) : _end_frame
 
-acquire_next_swapchain :: proc() -> Texture {
-    native := _acquire_next_swapchain()
-
-    return Texture {
-        native = native,
-    }
-}
+acquire_next_swapchain : proc() -> Texture : _acquire_next_swapchain
 
 compute_dispatch : proc(num_groups: [3]u32, num_threads_per_group: [3]u32) : _compute_dispatch
 set_compute_pipeline : proc(compute_pipeline: Compute_Pipeline) : _set_compute_pipeline
@@ -440,16 +425,21 @@ sampler_init :: proc(desc: Sampler_Descriptor) -> Sampler {
     }
 }
 
+// TODO make _texture_init return Texture
 texture_init :: proc(desc: Texture_Descriptor) -> Texture {
-    assert(desc.dimensions.x <= MAX_TEXTURE_SIZE)
-    assert(desc.dimensions.y <= MAX_TEXTURE_SIZE)
+    assert(desc.dimensions.x <= MAX_2D_TEXTURE_SIZE)
+    assert(desc.dimensions.y <= MAX_2D_TEXTURE_SIZE)
     native := _texture_init(desc)
 
-    tex := Texture { native = native }
+    tex := Texture { 
+        dimensions = {desc.dimensions.x, desc.dimensions.y, max(1, desc.layer_count)},
+        native = native 
+    }
 
     return tex
 }
 
+// Helper for depth texture
 texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture {
     desc := Texture_Descriptor {
         dimensions = dimensions,
@@ -514,91 +504,6 @@ unmap : proc(ptr: ^ptr) : _unmap
 
 // Copies src data into dst
 copy : proc(dst, src: ptr) : _copy
-
-// Linear bump arena that allocates staging buffer. Helps if multiple types of staging data is needed to be copied simultaneously.
-arena_init :: proc(
-    bytes: u32,
-    #any_int alignment: u32 = 16,
-    loc:                     = #caller_location,
-    flags: Buffer_Flag      = .Staging,
-) -> (Arena, bool) {
-    arena: Arena
-
-    if min_alignment := _min_alignment(flags); alignment < min_alignment {
-        log.errorf("In malloc() passed in alignment %i is less than the minimum required for flags %v. Bump to %i", alignment, flags, min_alignment)
-        return {}, false
-    }
-
-    capacity := runtime.align_forward(uint(bytes), uint(alignment))
-
-    _ptr := _malloc(bytes, alignment, flags, "ARENA", loc)
-
-    arena.ptr = {
-        meta = Metadata {
-            name = "ARENA",
-            created_at = loc,
-        },
-        native = _ptr,
-        cpu = _cpu_address(_ptr) if flags == .Staging else nil,
-        gpu = _gpu_address(_ptr),
-        flags = flags,
-        alignment = alignment,
-        total_capacity_bytes = u32(capacity),
-        byte_offset = 0,
-    }
-    arena.offset = 0
-
-
-    return arena, true
-}
-
-// Returns ptr with correct field values.
-arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, align: uint, loc := #caller_location) -> ptr {
-    // assert(_mapped(arena.ptr)) IF staging buffer
-    alignment := max(u32(align), arena.ptr.alignment)
-    if arena.ptr.cpu != nil && uintptr(arena.ptr.cpu) % uintptr(alignment) != uintptr(arena.ptr.gpu) % uintptr(alignment) {
-        panic("Could not satisfy alignment requirements in GPU arena allocation.")
-    }
-
-    bytes := el_size * el_count
-    assert(bytes >= 0 && alignment > 0)
-    bytes_aligned := runtime.align_forward_uint(uint(bytes), uint(alignment))
-
-    arena.offset = mem.align_forward_uint(arena.offset, uint(alignment))
-    temp := arena.offset
-    if arena.offset + bytes_aligned > uint(arena.total_capacity_bytes) {
-        panic("Arena: out of space")
-    }
-    arena.offset += bytes_aligned
-
-    view := sub_alloc(arena.ptr, u32(temp), u32(bytes_aligned))
-
-    return view
-}
-
-// Helper for arena alloc
-arena_alloc :: proc(arena: ^Arena, $T: typeid, el_count: uint = 1, loc := #caller_location) -> ptr {
-    temp := arena_alloc_raw(arena, size_of(T), el_count, align_of(T), loc)
-
-    // NOTE add typed return?
-    // []T from aligned offset before bytes are added in
-    // s := slice.from_ptr((^T)(temp.cpu), int(el_count))
-
-    return temp
-}
-
-sub_alloc :: proc(parent: ptr, offset, length: u32) -> ptr {
-    assert(offset + length <= parent.total_capacity_bytes)
-    assert(length <= parent.total_capacity_bytes - offset)
-
-    result := parent
-    result.cpu                  = rawptr(uintptr(parent.cpu) + uintptr(offset))
-    result.gpu                  = rawptr(uintptr(parent.gpu) + uintptr(offset))
-    result.byte_offset          = parent.byte_offset + offset
-    result.total_capacity_bytes = length
-
-    return result
-}
 
 // Sets shader's parameter block to be used for the next draw call/compute dispatch
 use_parameter_block : proc(block: ^Parameter_Block, destination: Parameter_Block_Destination = .Graphics) : _use_parameter_block

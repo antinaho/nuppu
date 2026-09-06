@@ -54,19 +54,21 @@ _State :: struct {
     curr_compute_pipeline: Compute_Pipeline,
 }
 
-_init :: proc(native_window: rawptr) -> bool {
+_init :: proc(
+    native_window   : rawptr,
+    swapchain_format: Pixel_Format
+) -> bool {
 
     native_window := cast(^NS.Window)(native_window)
-    scale := native_window->backingScaleFactor()
-
+    
     _state.device = MTL.CreateSystemDefaultDevice()
-
+    
     metal_layer := CA.MetalLayer.layer()
     metal_layer->setDevice(_state.device)
-    metal_layer->setPixelFormat(.BGRA8Unorm)
+    metal_layer->setPixelFormat(_pixel_format_interop(swapchain_format))
     metal_layer->setFramebufferOnly(false)
     metal_layer->setFrame(native_window->frame())
-    metal_layer->setContentsScale(scale)
+    metal_layer->setContentsScale(native_window->backingScaleFactor())
     _state.metal_layer = metal_layer
 
     native_window->contentView()->setLayer(metal_layer)
@@ -111,7 +113,7 @@ _release_ptr :: proc(ptr: ^ptr) {
     }
 }
 
-_copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
+_copy_to_texture :: proc(texture: Texture, origin, size: [3]u32, level: u32, data: rawptr, bytes_per_row: u32) {
     native := texture.native
 
     region := MTL.Region {
@@ -258,7 +260,7 @@ _end_frame :: proc(semaphore: Timeline_Semaphore, frame_n: u64) {
     _state.render_command_encoder = {}
 }
 
-_acquire_next_swapchain :: proc() -> _Texture {
+_acquire_next_swapchain :: proc() -> Texture {
     drawable := _state.metal_layer->nextDrawable()
     if drawable == nil {
         panic("In gpu_Metal.odin: _acquire_next_swapchain: Couldn't acquire next drawable")
@@ -272,7 +274,11 @@ _acquire_next_swapchain :: proc() -> _Texture {
     
     _state.curr_drawable = drawable
 
-    return native
+    
+    return Texture {
+        dimensions = {u32(native.texture->width()), u32(native.texture->height()), 1},
+        native = native,
+    }
 }
 
 _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
@@ -549,7 +555,6 @@ _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Blo
         append(&data, uintptr(S.native->gpuResourceID()))
     }
 
-    MAX_PUSH_BYTE_SIZE :: 64 * 64
     assert(len(data) <= 64)
 
     if destination == .Graphics {
@@ -558,7 +563,6 @@ _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Blo
     } else {
         _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Compute)
     }
-    
 }
 
 _barrier :: proc(before: Stage, after: Stage) {
@@ -632,7 +636,7 @@ _compute_command_encoder :: proc() -> ^MTL.ComputeCommandEncoder {
     return _state.compute_command_encoder
 }
 
-_to_clear_color :: proc(color: Color) -> MTL.ClearColor {
+_to_clear_color :: proc(color: Clear_Color) -> MTL.ClearColor {
     return MTL.ClearColor {
         red   = f64(color.x) / 255.0,
         green = f64(color.y) / 255.0,
