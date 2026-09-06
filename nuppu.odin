@@ -21,6 +21,13 @@ SIM_NS_PER_TICK     :: time.Second / SIM_TICKS_PER_SECOND
 
 FRAMES_IN_FLIGHT :: 2
 
+MAX_MESHES :: 256
+MAX_TEXTURES :: 256
+
+Texture :: gpu.Texture
+Texture_Descriptor :: gpu.Texture_Descriptor
+Texture_Handle :: distinct bit_array.Handle
+
 State :: struct #align(64) {
     ctx: runtime.Context,
     initialized: bool,
@@ -49,16 +56,13 @@ State :: struct #align(64) {
     vertex: gpu.Arena,
     index: gpu.Arena,
     frame_uniform: gpu.ptr,
-
     
     _instances: gpu.ptr,
     _instances_data: gpu.ptr,
     instance_batcher: Instance_Batcher,    
-    
+
     sampler: gpu.Sampler,
-
     depth_texture: gpu.Texture,
-
 
     frame_semaphore: gpu.Timeline_Semaphore,
     frame_arenas: [dynamic; FRAMES_IN_FLIGHT]^gpu.Arena,
@@ -66,14 +70,14 @@ State :: struct #align(64) {
 
     // Built-in resources, currently representing quad sprite
     built_in_block: gpu.Parameter_Block,
-    built_in_textures: gpu.Texture,
+    //built_in_textures: gpu.Texture,
 
     //
-    meshes: bit_array.Bit_Array(Resource(Mesh), 128),
-    built_in_meshes: [Built_in_mesh]bit_array.Handle,
+    meshes: bit_array.Bit_Array(Resource(Mesh), MAX_MESHES, Mesh_Handle),
+    built_in_meshes: [Built_in_mesh]Mesh_Handle,
+
+    textures: bit_array.Bit_Array(Resource(Texture), MAX_TEXTURES, Texture_Handle),
 }
-
-
 
 _state: ^State
 
@@ -99,16 +103,28 @@ App_Optional :: struct {
     deinit: proc(),
 }
 
+when ODIN_DEBUG {
+
+// Add anything here that might help in debugging
+Metadata :: struct {
+    created_at: runtime.Source_Code_Location,
+    created_on_frame: u64,
+}
+
 Resource :: struct($T: typeid) {
     handle: bit_array.Handle,
     data: T,
     metadata: Metadata,
 }
 
-Metadata :: struct {
-    name: string,
-    created_at: runtime.Source_Code_Location,
+} else {
+
+Resource :: struct($T: typeid) {
+    handle: bit_array.Handle,
+    data: T,
 }
+
+} // ODIN_DEBUG
 
 run :: proc(desc: App_Desc($T)) {
 
@@ -147,6 +163,7 @@ run :: proc(desc: App_Desc($T)) {
 
     platform.init(&_state.application_state, desc.window_size, desc.window_title)
     _state.prev_time = platform.get_time_ns()
+ 
     gpu.init(&_state.gpu_state, platform.native_window())
 
 when ODIN_OS != .JS { // JS runtime drives the loop via the exported step() on each tick.
@@ -316,6 +333,8 @@ _frame :: proc() -> Frame_Result {
     return .Continue
 }
 
+
+
 _ready_up :: proc() {
     _state.frame_n = 1
     _state.frame_semaphore = gpu.semaphore(0)
@@ -346,21 +365,18 @@ _ready_up :: proc() {
     
     _state.instance_batcher.instance_buffer, _ = gpu.malloc(size_of(Instance) * MAX_INSTANCES, align_of(Instance), .Staging)
     _state.instance_batcher.instance_data_buffer_blob, _ = gpu.malloc(INSTANCE_BLOB_SIZE, 16, .Staging)
-    //_state.materials = gpu.arena_init(el_size = size_of(Material), el_count = MAX_MATERIAL_COUNT, alignment = 16, usage = .GPU_Storage)
     
-    // Global frame uniform
-    // Updated and binded once per frame
     _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), align_of(Engine_Uniform), .Constant, "Frame Uniform")
 
     // 
-    _state.built_in_textures = gpu.texture_init({
-        dimensions  = {63, 63},
-        format      = .RGBA8Unorm,
-        type        = ._2D_Array,
-        storage     = .Shared,
-        usage       = {.Sampled},
-        layer_count = 16,
-    })
+    // _state.built_in_textures = gpu.texture_init({
+    //     dimensions  = {63, 63},
+    //     format      = .RGBA8Unorm,
+    //     type        = ._2D_Array,
+    //     storage     = .Shared,
+    //     usage       = {.Sampled},
+    //     layer_count = 16,
+    // })
 
     _state.sampler = gpu.sampler_init({
         mag_filter = .Nearest,
@@ -373,19 +389,40 @@ _ready_up :: proc() {
 
 
 
-    _upload_png_to_array_layer :: proc(texture: gpu.Texture, layer: int, data: []u8, label: string) {
-        img, img_err := image.load_from_bytes(data, {.alpha_add_if_missing}, context.temp_allocator)
-        if img_err != nil {
-            panic(fmt.tprintf("3-Instancing_camera: failed to decode %s: %v", label, img_err))
-        }
-        defer image.destroy(img, context.temp_allocator)
+    bit_array.init(&_state.textures)
 
-        gpu.copy_to_texture(texture, {0, 0, layer}, {img.width, img.height, 1}, 0, raw_data(img.pixels.buf[:]), u32(img.width * 4))
+    PNG_DIM :: [2]u32{63, 63}
+
+    
+    textures_handle := texture_init_ex(Texture_Descriptor {
+        dimensions = PNG_DIM,
+        format = .RGBA8Unorm,
+        storage = .Shared,
+        usage = {.Sampled},
+        layer_count = 2,
+        type = ._2D_Array,
+    })
+    texture_array, _ := get_resource(&_state.textures, textures_handle)
+
+    {
+        img, img_err := image.load_from_bytes(#load("./examples/AppleLearnCPP/3-Instancing_camera/bowser.png", []u8), {.alpha_add_if_missing}, context.temp_allocator)
+        if img_err != nil {
+            panic(fmt.tprintf("nuppu: failed to decode bowser.png: %v", img_err))
+        }
+        gpu.copy_to_texture(texture_array^, {0, 0, 0}, {PNG_DIM.x, PNG_DIM.y, 1}, 0, raw_data(img.pixels.buf[:]), PNG_DIM.x * 4)
+        image.destroy(img, context.temp_allocator)
     }
 
-    _upload_png_to_array_layer(_state.built_in_textures, 0, #load("./examples/AppleLearnCPP/3-Instancing_camera/bowser.png", []u8), "bowser.png")
-    _upload_png_to_array_layer(_state.built_in_textures, 1, #load("./examples/AppleLearnCPP/3-Instancing_camera/peach.png", []u8), "peach.png")
+    {
+        img, img_err := image.load_from_bytes(#load("./examples/AppleLearnCPP/3-Instancing_camera/peach.png", []u8), {.alpha_add_if_missing}, context.temp_allocator)
+        if img_err != nil {
+            panic(fmt.tprintf("nuppu: failed to decode peach.png: %v", img_err))
+        }
+        gpu.copy_to_texture(texture_array^, {0, 0, 1}, {PNG_DIM.x, PNG_DIM.y, 1}, 0, raw_data(img.pixels.buf[:]), PNG_DIM.x * 4)
+        image.destroy(img, context.temp_allocator)
+    }
 
+    bit_array.init(&_state.meshes)
     create_built_in_meshes()
 
     _state.built_in_block = gpu.Parameter_Block {
@@ -394,7 +431,7 @@ _ready_up :: proc() {
             0 = _state.vertex.ptr,
             1 = _state._instances,
             2 = _state._instances_data,
-            3 = _state.built_in_textures,
+            3 = texture_array^,
         },
         read_write_resources = {},
         samplers = { 0 = _state.sampler },
@@ -424,6 +461,8 @@ aspect_ratio :: proc() -> f32 {
 sim_delta_time :: proc() -> f32 {
     return 1.0 / f32(SIM_TICKS_PER_SECOND)
 }
+
+acquire_next_swapchain : proc() -> gpu.Texture : gpu.acquire_next_swapchain
 
 Screen_Bounds :: struct #align(16) {
     // (min_x, min_y) = bottom-left of letterboxed region in NDC
@@ -476,16 +515,62 @@ compute_screen_layout :: proc(window_w, window_h: i32, internal_w, internal_h: i
     }
 }
 
-add_resource :: proc(array: ^bit_array.Bit_Array(Resource($T), $N), res: T, meta: Metadata) -> bit_array.Handle {
-    resource_handle := bit_array.add(array, Resource(T) {
-        data = res,
-        metadata = meta,
-    })
+add_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), res: Res, loc := #caller_location) -> H {
+    when ODIN_DEBUG {
+        resource_handle := bit_array.add(array, Resource(Res) {
+            data = res,
+            metadata = Metadata {
+                created_at = loc,
+                created_on_frame = state.frame_n,
+            },
+        })
+    } else {
+        resource_handle := bit_array.add(array, Resource(Res) {
+            data = res,
+        })
+    }
 
     return resource_handle
 }
 
-get_resource :: proc(array: ^bit_array.Bit_Array(Resource($T), $N), handle: bit_array.Handle) -> (^T, bool) {
+get_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), handle: H) -> (^Res, bool) {
     resource_ptr, ok := bit_array.get(array, handle)
     return &resource_ptr.data, ok
+}
+
+//
+
+
+
+// Simple 2D texture
+texture_2D_init :: proc(
+    dimensions: [2]u32,
+    data: rawptr = nil,
+) -> Texture_Handle {
+    desc := gpu.Texture_Descriptor {
+        dimensions = dimensions,
+        format = .RGBA8Unorm,
+        storage = .Shared,
+        usage = {.Sampled},
+        layer_count = 1,
+        type = ._2D,
+    }
+
+    return texture_init_ex(desc, data)
+}
+
+texture_init_ex :: proc(
+    descriptor: Texture_Descriptor,
+    data: rawptr = nil,
+) -> Texture_Handle {
+
+    texture := gpu.texture_init(descriptor)
+
+    handle := add_resource(&_state.textures, texture)
+
+    if data != nil {
+        gpu.copy_to_texture(texture, {0, 0, 0}, {descriptor.dimensions.x, descriptor.dimensions.y, 1}, 0, data, descriptor.dimensions.x * 4)
+    }
+
+    return handle
 }

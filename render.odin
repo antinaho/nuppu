@@ -19,7 +19,6 @@ Vertex :: struct #align(16) {
 
 Vertex_Index :: u16
 
-
 Mesh :: struct #all_or_none {
     vertex_count: u32,
     index_count:  u32,
@@ -28,6 +27,8 @@ Mesh :: struct #all_or_none {
     verts:        gpu.ptr,
     indices:      gpu.ptr,
 }
+
+Mesh_Handle :: distinct bit_array.Handle
 
 Built_in_mesh :: enum u32 {
     Quad,
@@ -39,7 +40,7 @@ push_mesh_zeroed :: proc(
     vertex_count: u32,
     index_count: u32,
     loc := #caller_location,
-) -> bit_array.Handle {
+) -> Mesh_Handle {
 
     verts_view   := gpu.arena_alloc(&_state.vertex, Vertex, uint(vertex_count))
     indices_view := gpu.arena_alloc_raw(&_state.index, size_of(Vertex_Index), uint(index_count), 4)
@@ -51,19 +52,16 @@ push_mesh_zeroed :: proc(
         index_base   = indices_view.byte_offset / size_of(Vertex_Index),
         verts        = verts_view,
         indices      = indices_view,
-        }, {
-            name = "Mesh",
-            created_at = loc,
         })
         
-    return handle
+    return Mesh_Handle(handle)
 }
 
 get_built_in_mesh :: proc(built_in_mesh: Built_in_mesh) -> (^Mesh, bool) #optional_ok {
     return get_mesh(_state.built_in_meshes[built_in_mesh])
 }
 
-get_mesh :: proc(handle: bit_array.Handle) -> (^Mesh, bool) { return get_resource(&_state.meshes, handle) }
+get_mesh :: proc(handle: Mesh_Handle) -> (^Mesh, bool) { return get_resource(&_state.meshes, handle) }
 
 draw_sprite :: proc(
     position:     [3]f32,
