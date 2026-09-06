@@ -28,20 +28,7 @@ Mesh :: struct #all_or_none {
     indices:      gpu.ptr,
 }
 
-when ODIN_DEBUG {
-    Mesh_Handle :: struct {
-        handle: bit_array.Handle,
-        metadata: Metadata,
-    }
 
-    Mesh_Handle_Nil :: Mesh_Handle{}
-} else {
-    Mesh_Handle :: struct {
-        handle: bit_array.Handle,
-    }
-
-    Mesh_Handle_Nil :: Mesh_Handle{}
-}
 
 Built_in_mesh :: enum u32 {
     Quad,

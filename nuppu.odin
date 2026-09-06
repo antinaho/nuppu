@@ -33,18 +33,36 @@ Metadata :: struct {
 }
 
 when ODIN_DEBUG {
+    Mesh_Handle :: struct {
+        handle: bit_array.Handle,
+        metadata: Metadata,
+    }
+    Mesh_Handle_Nil :: Mesh_Handle{}
+
     Texture_Handle :: struct {
         handle: bit_array.Handle,
         metadata: Metadata,
     }
-
     Texture_Handle_Nil :: Texture_Handle{}
-} else {
-    Texture_Handle :: struct {
-        handle: bit_array.Handle,
+
+    _debug_warned_call_sites: map[u64]bool
+
+    debug_warn_hash :: proc(loc: runtime.Source_Code_Location) -> u64 {
+        h: u64 = 0xcbf29ce484222325 // FNV-1a 64-bit offset basis
+        for i in 0..<len(loc.file_path) {
+            h = (h ~ u64(loc.file_path[i])) * 0x100000001b3 // FNV-1a prime
+        }
+        h = (h ~ u64(loc.line))   * 0x100000001b3
+        h = (h ~ u64(loc.column)) * 0x100000001b3
+        return h
     }
 
+} else {
+    Texture_Handle :: struct { handle: bit_array.Handle, }
     Texture_Handle_Nil :: Texture_Handle{}
+    
+    Mesh_Handle :: struct { handle: bit_array.Handle, }
+    Mesh_Handle_Nil :: Mesh_Handle{}
 }
 
 State :: struct #align(64) {
@@ -99,11 +117,7 @@ State :: struct #align(64) {
 
 _state: ^State
 
-when ODIN_DEBUG {
-    // Dedupes stale-handle warnings: each call site fires at most once per process.
-    @(private="file")
-    _debug_warned_call_sites: map[u64]bool
-}
+
 
 Frame_Result :: enum { Continue, Skip_Render, Exit }
 
@@ -127,21 +141,10 @@ App_Optional :: struct {
     deinit: proc(),
 }
 
-when ODIN_DEBUG {
-
 Resource :: struct($T: typeid) {
     handle: bit_array.Handle,
     data: T,
 }
-
-} else {
-
-Resource :: struct($T: typeid) {
-    handle: bit_array.Handle,
-    data: T,
-}
-
-} // ODIN_DEBUG
 
 run :: proc(desc: App_Desc($T)) {
 
@@ -639,17 +642,6 @@ get_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), handle
     return &resource_ptr.data, ok
 }
 
-debug_warn_hash :: proc(loc: runtime.Source_Code_Location) -> u64 {
-    h: u64 = 0xcbf29ce484222325 // FNV-1a 64-bit offset basis
-    for i in 0..<len(loc.file_path) {
-        h = (h ~ u64(loc.file_path[i])) * 0x100000001b3 // FNV-1a prime
-    }
-    h = (h ~ u64(loc.line))   * 0x100000001b3
-    h = (h ~ u64(loc.column)) * 0x100000001b3
-    return h
-}
-
-//
 
 
 
