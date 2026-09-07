@@ -20,7 +20,6 @@ Entity :: struct {
     rotation : [3]f32,
     scale    : [3]f32,
     flags    : u32,
-    variant  : any,
 }
 
 NIL_ENTITY_HANDLE :: Entity_Handle {}
@@ -179,4 +178,130 @@ remove_entity :: proc(
     data.free = i32(handle.index)
 
     return true
+}
+
+// ============================================================================
+// Scene node hierarchy
+//
+// Children of a parent form a circular doubly-linked intrusive list:
+//   - empty:        parent.first_child == NIL_ENTITY_HANDLE
+//   - one child B:  parent.first_child = B; B.next_sibling = B; B.prev_sibling = B
+//   - N children:   parent.first_child = head; tail.next_sibling wraps to head;
+//                   head.prev_sibling wraps to tail
+//
+// Sibling manipulation is internal. Only add/remove of parent and child is
+// exposed. remove_entity does NOT auto-detach; caller must unlink first.
+// ============================================================================
+
+@(private="file")
+_attach :: proc(
+    manager: ^Entity_Manager($EU),
+    parent, child: Entity_Handle,
+) -> bool {
+    if parent == child { return false }
+
+    p, p_ok := _resolve(manager, parent)
+    c, c_ok := _resolve(manager, child)
+    if !p_ok || !c_ok { return false }
+
+    if c.parent != NIL_ENTITY_HANDLE {
+        _unlink_from_circle(manager, child)
+    }
+
+    if p.first_child == NIL_ENTITY_HANDLE {
+        p.first_child  = child
+        c.next_sibling = child
+        c.prev_sibling = child
+    } else {
+        head_h := p.first_child
+        head, head_ok := _resolve(manager, head_h)
+        if !head_ok { return false }
+        _link_after(manager, head.prev_sibling, child)
+    }
+    c.parent = parent
+    return true
+}
+
+@(private="file")
+_unlink_from_circle :: proc(
+    manager: ^Entity_Manager($EU),
+    node: Entity_Handle,
+) -> bool {
+    n, n_ok := _resolve(manager, node)
+    if !n_ok || n.parent == NIL_ENTITY_HANDLE { return false }
+    p, p_ok := _resolve(manager, n.parent)
+    if !p_ok { return false }
+
+    if n.next_sibling == node {
+        p.first_child = NIL_ENTITY_HANDLE
+    } else {
+        prev_h, next_h := n.prev_sibling, n.next_sibling
+        prev, prev_ok := _resolve(manager, prev_h)
+        next, next_ok := _resolve(manager, next_h)
+        if !prev_ok || !next_ok { return false }
+        prev.next_sibling = next_h
+        next.prev_sibling = prev_h
+        if p.first_child == node {
+            p.first_child = next_h
+        }
+    }
+
+    n.parent       = NIL_ENTITY_HANDLE
+    n.next_sibling = NIL_ENTITY_HANDLE
+    n.prev_sibling = NIL_ENTITY_HANDLE
+    return true
+}
+
+@(private="file")
+_link_after :: proc(
+    manager: ^Entity_Manager($EU),
+    prev, new: Entity_Handle,
+) -> bool {
+    p, p_ok := _resolve(manager, prev)
+    n, n_ok := _resolve(manager, new)
+    if !p_ok || !n_ok { return false }
+
+    old_next_h := p.next_sibling
+    n.next_sibling = old_next_h
+    n.prev_sibling = prev
+    if old_next_h != NIL_ENTITY_HANDLE {
+        old_next, old_next_ok := _resolve(manager, old_next_h)
+        if !old_next_ok { return false }
+        old_next.prev_sibling = new
+    }
+    p.next_sibling = new
+    return true
+}
+
+add_parent :: proc(
+    manager: ^Entity_Manager($EU),
+    self, parent: Entity_Handle,
+) -> bool {
+    if parent == NIL_ENTITY_HANDLE { return false }
+    return _attach(manager, parent, self)
+}
+
+remove_parent :: proc(
+    manager: ^Entity_Manager($EU),
+    self: Entity_Handle,
+) -> bool {
+    n, ok := _resolve(manager, self)
+    if !ok || n.parent == NIL_ENTITY_HANDLE { return false }
+    return _unlink_from_circle(manager, self)
+}
+
+add_child :: proc(
+    manager: ^Entity_Manager($EU),
+    self, child: Entity_Handle,
+) -> bool {
+    return _attach(manager, self, child)
+}
+
+remove_child :: proc(
+    manager: ^Entity_Manager($EU),
+    self, child: Entity_Handle,
+) -> bool {
+    c, ok := _resolve(manager, child)
+    if !ok || c.parent != self { return false }
+    return _unlink_from_circle(manager, child)
 }
