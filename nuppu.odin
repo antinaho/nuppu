@@ -16,6 +16,8 @@ import "bit_array"
 _ :: fmt
 _ :: log
 
+UNION_LEN :: intrinsics.type_union_variant_count
+
 SIM_TICKS_PER_SECOND :: 180
 SIM_NS_PER_TICK     :: time.Second / SIM_TICKS_PER_SECOND
 
@@ -27,12 +29,13 @@ MAX_TEXTURES :: 256
 Texture :: gpu.Texture
 Texture_Descriptor :: gpu.Texture_Descriptor
 
-Metadata :: struct {
-    created_at: runtime.Source_Code_Location,
-    created_on_frame: u64,
-}
-
+// Handles carry metadata on debug builds
 when ODIN_DEBUG {
+    Metadata :: struct {
+        created_at: runtime.Source_Code_Location,
+        created_on_frame: u64,
+    }
+
     Mesh_Handle :: struct {
         handle: bit_array.Handle,
         metadata: Metadata,
@@ -414,8 +417,6 @@ _frame :: proc() -> Frame_Result {
 
     return .Continue
 }
-
-
 
 _ready_up :: proc() {
     _state.frame_n = 1
