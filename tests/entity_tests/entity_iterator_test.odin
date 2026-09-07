@@ -6,14 +6,12 @@ import nuppu "../../"
 
 @(test)
 test_iterator_empty :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 4,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 4,
-    }
-    nuppu.entity_manager_init(manager, capacities)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 4)
 
     it := nuppu.entity_iterator_init(manager, Door)
     acc: bool // true if we iterated at least once
@@ -26,14 +24,12 @@ test_iterator_empty :: proc(t: ^testing.T) {
 
 @(test)
 test_iterator_skips_sentinel :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 4,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 4,
-    }
-    nuppu.entity_manager_init(manager, capacities)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 4)
 
     door := nuppu.entity_add(manager, Door)
     testing.expect(t, door != nil, "add should succeed")
@@ -54,14 +50,12 @@ test_iterator_skips_sentinel :: proc(t: ^testing.T) {
 
 @(test)
 test_iterator_yields_all :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 4,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 4,
-    }
-    nuppu.entity_manager_init(manager, capacities, 0, context.allocator)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 4)
 
     n :: 3
     handles: [n]nuppu.Entity_Handle
@@ -92,14 +86,12 @@ test_iterator_yields_all :: proc(t: ^testing.T) {
 
 @(test)
 test_iterator_skips_removed :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 4,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 4,
-    }
-    nuppu.entity_manager_init(manager, capacities, 0, context.allocator)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 4)
 
     a, ok1 := nuppu.entity_add(manager, Door)
     b, ok2 := nuppu.entity_add(manager, Door)
@@ -123,14 +115,12 @@ test_iterator_skips_removed :: proc(t: ^testing.T) {
 
 @(test)
 test_iterator_after_reuse :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 4,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 4,
-    }
-    nuppu.entity_manager_init(manager, capacities, 0, context.allocator)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 4)
 
     a, ok1 := nuppu.entity_add(manager, Door)
     testing.expect_value(t, ok1, true)
@@ -158,14 +148,12 @@ test_iterator_after_reuse :: proc(t: ^testing.T) {
 
 @(test)
 test_iterator_type_specific :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 4,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 4,
-    }
-    nuppu.entity_manager_init(manager, capacities, 0, context.allocator)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 4)
 
     d, ok1 := nuppu.entity_add(manager, Door)
     f1, ok2 := nuppu.entity_add(manager, Frog)
@@ -204,14 +192,12 @@ test_iterator_type_specific :: proc(t: ^testing.T) {
 
 @(test)
 test_iterator_handles_resolve :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 4,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 4,
-    }
-    nuppu.entity_manager_init(manager, capacities, 0, context.allocator)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 4)
 
     d1, ok1 := nuppu.entity_add(manager, Door)
     d2, ok2 := nuppu.entity_add(manager, Door)

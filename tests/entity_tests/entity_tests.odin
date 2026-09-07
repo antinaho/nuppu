@@ -14,21 +14,14 @@ Frog :: struct {
     jump: f32,
 }
 
-Test_Union :: union {
-    Frog,
-    Door,
-}
-
 @(test)
 test_add_get_roundtrip :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 4,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 2,
-    }
-    nuppu.entity_manager_init(manager, capacities, 0, context.allocator)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 2)
 
     door := nuppu.entity_add(manager, Door)
     testing.expect(t, door != nil, "entity_add should return a pointer")
@@ -45,14 +38,12 @@ test_add_get_roundtrip :: proc(t: ^testing.T) {
 
 @(test)
 test_stale_handle_after_remove :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 2,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 2,
-    }
-    nuppu.entity_manager_init(manager, capacities, 0, context.allocator)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 2)
 
     door := nuppu.entity_add(manager, Door)
     if door == nil { return }
@@ -67,14 +58,13 @@ test_stale_handle_after_remove :: proc(t: ^testing.T) {
 
 @(test)
 test_reuse_bumps_generation :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 2,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 2,
-    }
-    nuppu.entity_manager_init(manager, capacities, 0, context.allocator)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 4)
+    nuppu.entity_manager_add_variant(manager, Frog, 2)
+    
 
     first := nuppu.entity_add(manager, Door)
     if first == nil { return }
@@ -94,14 +84,12 @@ test_reuse_bumps_generation :: proc(t: ^testing.T) {
 
 @(test)
 test_pool_full_returns_nil :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Union))
+    manager, _ := new(nuppu.Entity_Manager)
     defer nuppu.entity_manager_deinit(manager)
 
-    capacities := []int{
-        intrinsics.type_variant_index_of(Test_Union, Door) = 3,
-        intrinsics.type_variant_index_of(Test_Union, Frog) = 2,
-    }
-    nuppu.entity_manager_init(manager, capacities, 0, context.allocator)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Door, 3)
+    nuppu.entity_manager_add_variant(manager, Frog, 2)
 
     a := nuppu.entity_add(manager, Door)
     b := nuppu.entity_add(manager, Door)

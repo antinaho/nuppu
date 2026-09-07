@@ -13,15 +13,15 @@ Test_Node_Union :: union {
 }
 
 @(private="file")
-make_node_manager :: proc(capacity: int = 16) -> ^nuppu.Entity_Manager(Test_Node_Union) {
-    manager, _ := new(nuppu.Entity_Manager(Test_Node_Union))
-    caps := []int{0}
-    nuppu.entity_manager_init(manager, caps, capacity, context.allocator)
+make_node_manager :: proc(capacity: int = 16) -> ^nuppu.Entity_Manager {
+    manager, _ := new(nuppu.Entity_Manager)
+    nuppu.entity_manager_init(manager)
+    nuppu.entity_manager_add_variant(manager, Node, capacity)
     return manager
 }
 
 @(private="file")
-make_node :: proc(manager: ^nuppu.Entity_Manager(Test_Node_Union)) -> ^Node {
+make_node :: proc(manager: ^nuppu.Entity_Manager) -> ^Node {
     node, ok := nuppu.entity_add(manager, Node)
     if !ok { return nil }
     return node
