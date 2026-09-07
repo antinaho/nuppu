@@ -20,6 +20,9 @@
 !platform/
 !platform/**
 
+!tests/
+!tests/**
+
 !web/
 !web/index.html
 
