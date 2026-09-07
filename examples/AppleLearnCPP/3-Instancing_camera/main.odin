@@ -34,7 +34,7 @@ _upload_png_to_array_layer :: proc(texture: gpu.Texture, layer: int, data: []u8,
     }
     defer image.destroy(img, context.temp_allocator)
 
-    gpu.copy_to_texture(texture, {0, 0, layer}, {img.width, img.height, 1}, 0, raw_data(img.pixels.buf[:]), u32(img.width * 4))
+    gpu.copy_to_texture(texture, {0, 0, u32(layer)}, {u32(img.width), u32(img.height), 1}, 0, raw_data(img.pixels.buf[:]), u32(img.width * 4))
 }
 
 _init :: proc() {
@@ -162,16 +162,17 @@ _render :: proc(previous, current: ^State, alpha: f32) {
 
     gpu.barrier(.Transfer, .All)
 
-    swapchain := gpu.acquire_next_swapchain()
-    gpu.begin_render_pass({
+    swapchain_handle := nuppu.acquire_next_swapchain()
+    depth_handle     := nuppu.depth()
+    nuppu.begin_render_pass({
         clear_color  = {12, 12, 12, 255},
         load_action  = .Clear,
         store_action = .Store,
-        texture      = swapchain,
+        texture      = swapchain_handle,
     }, {
         load_action = .Clear,
         store_action = .Store,
-        texture = nuppu.depth(),
+        texture = depth_handle,
     })
 
     gpu.set_pipeline(current.pso)
@@ -182,7 +183,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     //nuppu.draw_mesh_builtin(.Quad, 4, 32)
     
 
-    gpu.end_render_pass()
+    nuppu.end_render_pass()
 }
 
 desc := nuppu.App_Desc(State) {
