@@ -15,9 +15,12 @@ NIL_HANDLE :: Handle {}
 Bit_Array :: struct($T: typeid, $N: u64, $H: typeid)
     where N > 0 &&
           N < (1 << 23) &&
-          intrinsics.type_has_field (T, "handle"),
-          intrinsics.type_field_type(T, "handle") == Handle &&
-          intrinsics.type_has_field (H, "handle"),
+          intrinsics.type_has_field (T, "handle") &&
+          (
+              intrinsics.type_field_type(T, "handle") == Handle ||
+              intrinsics.type_field_type(T, "handle") == H
+          ) &&
+          intrinsics.type_has_field (H, "handle") &&
           intrinsics.type_field_type(H, "handle") == Handle
 {
     items:  [N]T,
@@ -43,6 +46,16 @@ unpack_handle :: proc "contextless" (handle: $T/Handle) -> (index: u32, generati
     return
 }
 
+// Peel the raw Handle out of a slot's `handle` field, which is either
+// exactly `Handle` (raw) or the `H` wrapper (one extra `.handle` indirection).
+slot_raw :: proc "contextless" (item: ^$T) -> Handle {
+    when intrinsics.type_field_type(T, "handle") == Handle {
+        return item.handle
+    } else {
+        return item.handle.handle
+    }
+}
+
 init :: proc "contextless" (array: ^Bit_Array($T, $N, $H)) {
     if array.is_init { return }
 
@@ -66,14 +79,26 @@ add :: proc "contextless" (
     }
 
     ptr := &handle_map.items[free_slot]
-    _, prev_gen := unpack_handle(ptr.handle)
+
+    prev_raw: Handle
+    when intrinsics.type_field_type(T, "handle") == Handle {
+        prev_raw = ptr.handle
+    } else {
+        prev_raw = ptr.handle.handle
+    }
+    _, prev_gen := unpack_handle(prev_raw)
 
     ptr^ = item
 
-    ptr.handle = pack_handle(u32(free_slot), prev_gen + 1)
+    raw := pack_handle(u32(free_slot), prev_gen + 1)
+    when intrinsics.type_field_type(T, "handle") == Handle {
+        ptr.handle = raw
+    } else {
+        ptr.handle = H{ handle = raw }
+    }
     set_1(&handle_map.bucket, free_slot)
 
-    return H{ handle = ptr.handle }, true
+    return H{ handle = raw }, true
 }
 
 @(require_results)
@@ -98,7 +123,7 @@ get :: proc "contextless" (
         return nil, false
     }
 
-    _, cur_gen := unpack_handle(handle_map.items[req_index].handle)
+    _, cur_gen := unpack_handle(slot_raw(&handle_map.items[req_index]))
     if cur_gen != req_gen {
         return nil, false
     }
@@ -125,7 +150,7 @@ remove :: proc "contextless" (
         return false
     }
 
-    _, cur_gen := unpack_handle(handle_map.items[req_index].handle)
+    _, cur_gen := unpack_handle(slot_raw(&handle_map.items[req_index]))
     if cur_gen != req_gen {
         return false
     }
