@@ -12,6 +12,8 @@
 !gpu/
 !gpu/**
 
+!entity.odin
+
 !examples/
 !examples/**
 
