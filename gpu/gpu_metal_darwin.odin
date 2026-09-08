@@ -502,7 +502,7 @@ _gpu_address :: proc(p: _ptr) -> rawptr {
     return rawptr(uintptr(p.buffer->gpuAddress()))
 }
 
-_unmap :: proc(ptr: ^ptr) { /* no op in Metal */ }
+_unmap :: proc(ptr: ^ptr, offset: i64 = 0, length: i64 = -1) { /* no op in Metal */ }
 
 _copy :: proc(dst, src: ptr) {
     if _state.blit_command_encoder == nil {

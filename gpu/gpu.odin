@@ -506,7 +506,7 @@ malloc :: proc(
 }
 
 // Release the mapping on a Staging buffer. Must be called before doing any copy() operations on the buffer.
-unmap : proc(ptr: ^ptr) : _unmap
+unmap : proc(ptr: ^ptr, offset: i64 = 0, length: i64 = -1) : _unmap
 
 // Copies src data into dst
 copy : proc(dst, src: ptr) : _copy
