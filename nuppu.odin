@@ -23,6 +23,9 @@ SIM_NS_PER_TICK     :: time.Second / SIM_TICKS_PER_SECOND
 
 FRAMES_IN_FLIGHT :: 2
 
+MAX_FRAME_DT_NS :: u64(f64(time.Second) * 0.1)
+MAX_SIM_TICKS :: 5
+
 MAX_MESHES :: 256
 MAX_TEXTURES :: 256
 
@@ -72,9 +75,6 @@ State :: struct #align(64) {
     ctx: runtime.Context,
     initialized: bool,
 
-    curr_time: u64,
-    prev_time: u64,
-    frame_dur_ns: u64,
     accumulator: u64,
     num_sim_ticks: u64,
 
@@ -191,9 +191,11 @@ run :: proc(desc: App_Desc($T)) {
     }
 
     platform.init(&_state.application_state, desc.window_size, desc.window_title)
-    _state.prev_time = platform.get_time_ns()
- 
-    gpu.init(&_state.gpu_state, platform.native_window())
+    gpu.init(&_state.gpu_state, platform.native_window(), .BGRA8Unorm)
+
+    if hz, ok := platform.display_refresh_hz(); ok {
+        set_gpu_hz_target(hz)
+    }
 
 when ODIN_OS != .JS { // JS runtime drives the loop via the exported step() on each tick.
 
@@ -388,13 +390,17 @@ _frame :: proc() -> Frame_Result {
         return .Exit
     }
     
-    time_ns := platform.get_time_ns()
-    _state.curr_time = time_ns
-    _state.frame_dur_ns = time_ns - _state.prev_time
-    _state.prev_time = time_ns
-    _state.accumulator += _state.frame_dur_ns
+    interval_ns := gpu.frame_interval_ns()
+
+    if interval_ns > MAX_FRAME_DT_NS {
+        interval_ns = MAX_FRAME_DT_NS
+    }
+    _state.accumulator += interval_ns
 
     _state.num_sim_ticks = _state.accumulator / u64(SIM_NS_PER_TICK)
+    if _state.num_sim_ticks > MAX_SIM_TICKS {
+        _state.num_sim_ticks = MAX_SIM_TICKS
+    }
     _state.accumulator -= _state.num_sim_ticks * u64(SIM_NS_PER_TICK)
 
     if _state.num_sim_ticks > 0 {
@@ -549,6 +555,12 @@ aspect_ratio :: proc() -> f32 {
 
 sim_delta_time :: proc() -> f32 {
     return 1.0 / f32(SIM_TICKS_PER_SECOND)
+}
+
+set_gpu_hz_target :: proc(hz: u32) {
+    clamped := hz
+    if clamped > platform.MAX_HZ { clamped = platform.MAX_HZ }
+    gpu.set_hz(clamped)
 }
 
 acquire_next_swapchain :: proc() -> Texture_Handle {

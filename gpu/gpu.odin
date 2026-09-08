@@ -67,6 +67,7 @@ _state: ^State
 
 State :: struct #align(64) {
     using impl: _State,
+    ctx: runtime.Context,
     is_init: bool,
 }
 
@@ -339,15 +340,14 @@ Blend_Factor :: enum i32 {
 init :: proc(
     state           : ^State,
     native_window   : rawptr,
-    swapchain_format: Pixel_Format = .BGRA8Unorm
+    swapchain_format: Pixel_Format = .BGRA8Unorm,
 ) -> bool {
     if _state != nil { return true }
 
     _state = state
+    _state.ctx = context
 
-    success := _init(native_window, swapchain_format)
-
-    return success
+    return _init(native_window, swapchain_format)
 }
 
 is_init :: proc() -> bool { return _state.is_init }
@@ -412,6 +412,12 @@ begin_frame : proc() : _begin_frame
 end_frame : proc(semaphore: Timeline_Semaphore, frame_n: u64) : _end_frame
 
 acquire_next_swapchain : proc() -> Texture : _acquire_next_swapchain
+
+// Frame interval between 2 swapchain presents.
+frame_interval_ns : proc() -> u64 : _frame_interval_ns
+
+// Set the target refresh rate used for presentation pacing (limits gpu presents to this rate)
+set_hz : proc(hz: u32) : _set_hz
 
 compute_dispatch : proc(num_groups: [3]u32, num_threads_per_group: [3]u32) : _compute_dispatch
 set_compute_pipeline : proc(compute_pipeline: Compute_Pipeline) : _set_compute_pipeline

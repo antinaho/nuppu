@@ -112,6 +112,17 @@ when PLATFORM_BACKEND == PLATFORM_BACKEND_GLFW {
         return u64(glfw.GetTime() * f64(time.Second))
     }
 
+    _display_refresh_hz :: proc() -> (u32, bool) {
+        // Returns nil during monitor reconfiguration and 0 on some
+        // external displays with bad EDID — both treated as unknown.
+        mode := glfw.GetVideoMode(glfw.GetPrimaryMonitor())
+        if mode == nil {
+            return 0, false
+        }
+        hz := u32(mode.refresh_rate)
+        return hz, hz > 0
+    }
+
     _window_aspect_ratio :: proc() -> f32 {
         dims := _window_size_logical()
         return f32(dims.x) / f32(dims.y)

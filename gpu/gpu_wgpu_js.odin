@@ -159,7 +159,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         compute_pipeline_cache_next: u32,
     }
 
-    _init :: proc(native_window: rawptr) -> bool {
+    _init :: proc(native_window: rawptr, swapchain_format: Pixel_Format) -> bool {
 
         _state.instance = wgpu.CreateInstance(nil)
         if _state.instance == nil {
@@ -1257,6 +1257,16 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             return .Load
         }
         unreachable()
+    }
+
+    _frame_interval_ns :: proc() -> (u64, bool) {
+        // No presentedTime equivalent in WebGPU; engine falls back to
+        // its default frame budget when this returns false.
+        return 0, false
+    }
+
+    _set_hz :: proc(hz: u32) {
+        // Browsers pace rAF to vsync; nothing to do here.
     }
 
 }

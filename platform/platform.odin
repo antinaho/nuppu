@@ -192,6 +192,22 @@ get_time_ns :: proc() -> u64 {
     return _get_time_ns()
 }
 
+// Upper bound on the refresh rate used for presentation pacing and sim
+// tick budgeting. Overridable at build time via `-define:MAX_HZ=N` or
+// `odin.json` definitions.
+when ODIN_OS == .JS {
+    MAX_HZ :: #config(MAX_HZ, 60)
+} else {
+    MAX_HZ :: #config(MAX_HZ, 144)
+}
+
+// Returns the display's nominal refresh rate in Hz, and whether the
+// value is known. The raw display rate — the caller is expected to
+// clamp against MAX_HZ.
+display_refresh_hz :: proc() -> (u32, bool) {
+    return _display_refresh_hz()
+}
+
 normalize_ticks :: proc(num_ticks: u64) {
 	_state.input.delta_mouse = (_state.input.mouse_position_window - _state.input.previous_mouse_position) / f64(num_ticks)
     _state.input.scroll_value = _state.input.scroll_value / f64(num_ticks)

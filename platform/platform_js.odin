@@ -94,6 +94,11 @@ when PLATFORM_BACKEND == PLATFORM_BACKEND_WEB {
         return u64(time.tick_now()._nsec)
     }
 
+    _display_refresh_hz :: proc() -> (u32, bool) {
+        // Browsers pace rAF to vsync; no application-side pacing needed.
+        return 0, false
+    }
+
     _window_aspect_ratio :: proc() -> f32 {
         dims := _window_size_logical()
         return f32(dims.x) / f32(dims.y)

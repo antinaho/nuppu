@@ -37,7 +37,7 @@ _Compute_Pipeline :: ^MTL.ComputePipelineState
 
 _Pipeline :: ^MTL.RenderPipelineState
 
-_State :: struct {
+    _State :: struct {
     device: ^MTL.Device,
     metal_layer: ^CA.MetalLayer,
     queue: ^MTL.CommandQueue,
@@ -52,17 +52,35 @@ _State :: struct {
 
     curr_pipeline: Pipeline,
     curr_compute_pipeline: Compute_Pipeline,
+
+    present_min_duration: MTL.CFTimeInterval,
+    
+    prev_presented_time: MTL.CFTimeInterval, // in seconds
+    present_duration: MTL.CFTimeInterval, // in seconds
+
+    presentation_handler: ^NS.Block,
+}
+
+_present_handler :: proc "c" (user_data: rawptr, drawable: ^CA.MetalDrawable) {
+    context = _state.ctx
+    state := cast(^_State)(user_data)
+    src := drawable->presentedTime()
+
+    presentation_duration := src - state.prev_presented_time
+
+    state.present_duration = presentation_duration
+    state.prev_presented_time = src
 }
 
 _init :: proc(
     native_window   : rawptr,
-    swapchain_format: Pixel_Format
+    swapchain_format: Pixel_Format,
 ) -> bool {
 
     native_window := cast(^NS.Window)(native_window)
-    
+
     _state.device = MTL.CreateSystemDefaultDevice()
-    
+
     metal_layer := CA.MetalLayer.layer()
     metal_layer->setDevice(_state.device)
     metal_layer->setPixelFormat(_pixel_format_interop(swapchain_format))
@@ -74,8 +92,21 @@ _init :: proc(
     native_window->contentView()->setLayer(metal_layer)
     native_window->setOpaque(true)
     native_window->setBackgroundColor(nil)
-    
+
     _state.queue = _state.device->newCommandQueue()
+
+    _state.present_min_duration = 0
+    _state.present_duration = 0
+    _state.prev_presented_time = 0
+    block, _ := NS.Block.createGlobalWithParam(
+        user_data = rawptr(_state),
+        user_proc = _present_handler,
+        allocator = context.allocator,
+    )
+    if block == nil {
+        log.panic("gpu_metal_darwin: _init: failed to create presented handler block")
+    }
+    _state.presentation_handler = block
 
     _state.is_init = true
 
@@ -83,6 +114,12 @@ _init :: proc(
 }
 
 _deinit :: proc() {
+    _state.presentation_handler = nil
+
+    if _state.curr_drawable != nil {
+        _state.curr_drawable->release()
+        _state.curr_drawable = nil
+    }
     _state.metal_layer->release()
     _state.queue->release()
     _state.device->release()
@@ -242,16 +279,15 @@ _begin_frame :: proc() {
 
 
 _end_frame :: proc(semaphore: Timeline_Semaphore, frame_n: u64) {
-    // The render work (begin_frame -> render -> end_render_pass) was
-    // recorded into the command buffer autoreleased into _state.frame_pool.
-    // Now present + signal + commit it, then drain the pool. Metal
-    // retains the buffer post-commit so the autorelease reference can
-    // be safely released by the drain.
     defer {
         _state.frame_pool->drain()
         _state.frame_pool = nil
     }
-    _state.command_buffer->presentDrawable(_state.curr_drawable)
+    if _state.present_min_duration > 0 {
+        _state.command_buffer->presentDrawableAfterMinimumDuration(_state.curr_drawable, _state.present_min_duration)
+    } else {
+        _state.command_buffer->presentDrawable(_state.curr_drawable)
+    }
     _state.command_buffer->encodeSignalEvent((^MTL.SharedEvent)(semaphore), frame_n)
     _state.command_buffer->commit()
 
@@ -266,6 +302,8 @@ _acquire_next_swapchain :: proc() -> Texture {
         panic("In gpu_Metal.odin: _acquire_next_swapchain: Couldn't acquire next drawable")
     }
 
+    drawable->addPresentedHandler(_state.presentation_handler)
+
     native := _Texture {
         type = ._2D,
         texture = drawable->texture(),
@@ -273,11 +311,21 @@ _acquire_next_swapchain :: proc() -> Texture {
     }
     
     _state.curr_drawable = drawable
-
     
     return Texture {
         dimensions = {u32(native.texture->width()), u32(native.texture->height()), 1},
         native = native,
+    }
+}
+
+_frame_interval_ns :: proc() -> u64 {
+    return u64(time.Duration(_state.present_duration * MTL.CFTimeInterval(time.Second)))
+}
+
+_set_hz :: proc(hz: u32) {
+    _state.present_min_duration = 0
+    if hz > 0 {
+        _state.present_min_duration = MTL.CFTimeInterval(1) / MTL.CFTimeInterval(hz)
     }
 }
 
