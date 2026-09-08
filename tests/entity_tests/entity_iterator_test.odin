@@ -7,7 +7,7 @@ import nuppu "../../"
 @(test)
 test_iterator_empty :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)
@@ -25,7 +25,7 @@ test_iterator_empty :: proc(t: ^testing.T) {
 @(test)
 test_iterator_skips_sentinel :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)
@@ -51,7 +51,7 @@ test_iterator_skips_sentinel :: proc(t: ^testing.T) {
 @(test)
 test_iterator_yields_all :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)
@@ -87,7 +87,7 @@ test_iterator_yields_all :: proc(t: ^testing.T) {
 @(test)
 test_iterator_skips_removed :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)
@@ -116,7 +116,7 @@ test_iterator_skips_removed :: proc(t: ^testing.T) {
 @(test)
 test_iterator_after_reuse :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)
@@ -149,7 +149,7 @@ test_iterator_after_reuse :: proc(t: ^testing.T) {
 @(test)
 test_iterator_type_specific :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)
@@ -193,7 +193,7 @@ test_iterator_type_specific :: proc(t: ^testing.T) {
 @(test)
 test_iterator_handles_resolve :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)

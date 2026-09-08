@@ -17,7 +17,7 @@ Frog :: struct {
 @(test)
 test_add_get_roundtrip :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)
@@ -39,7 +39,7 @@ test_add_get_roundtrip :: proc(t: ^testing.T) {
 @(test)
 test_stale_handle_after_remove :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)
@@ -59,7 +59,7 @@ test_stale_handle_after_remove :: proc(t: ^testing.T) {
 @(test)
 test_reuse_bumps_generation :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 4)
@@ -85,7 +85,7 @@ test_reuse_bumps_generation :: proc(t: ^testing.T) {
 @(test)
 test_pool_full_returns_nil :: proc(t: ^testing.T) {
     manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
     nuppu.entity_manager_add_variant(manager, Door, 3)

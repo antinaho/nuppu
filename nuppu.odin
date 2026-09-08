@@ -90,7 +90,7 @@ State :: struct #align(64) {
         init: proc(),
         update: proc(),
         deinit: proc(),
-        render: proc(prev, curr: rawptr, alpha: f32),
+        render: proc(curr: rawptr, alpha: f32),
     },
 
     vertex: gpu.Arena,
@@ -116,6 +116,8 @@ State :: struct #align(64) {
 
     textures: bit_array.Bit_Array(Resource(Texture), MAX_TEXTURES, Texture_Handle),
     built_in_textures: [Built_in_texture]Texture_Handle,
+
+    entity_manager: ^Entity_Manager,
 }
 
 _state: ^State
@@ -134,7 +136,7 @@ App_Desc :: struct($T: typeid) #all_or_none {
     state: ^^T,
     window_size: [2]i32,
     update: proc(),
-	render: proc(previous, current: ^T, alpha: f32),
+	render: proc(current: ^T, alpha: f32),
     using _: App_Optional,
 }
 
@@ -206,6 +208,7 @@ when ODIN_OS != .JS { // JS runtime drives the loop via the exported step() on e
             if desc.deinit != nil {
                 desc.deinit()
             }
+            entity_manager_destroy(_state.entity_manager)
             return
         case .Skip_Render:
             continue
@@ -213,7 +216,7 @@ when ODIN_OS != .JS { // JS runtime drives the loop via the exported step() on e
             if _state.frame_n > FRAMES_IN_FLIGHT {
                 gpu.semaphore_wait(_state.frame_semaphore, _state.frame_n - FRAMES_IN_FLIGHT)
             }
-            desc.render((^T)(_state.previous_state), (^T)(_state.current_state), _render_alpha())
+            desc.render((^T)(_state.current_state), _render_alpha())
         }
     }
 }
@@ -362,11 +365,12 @@ step :: proc(dt: f32) -> bool {
         if _state.desc.deinit != nil {
             _state.desc.deinit()
         }
+        entity_manager_destroy(_state.entity_manager)
         return false
     case .Skip_Render:
         return true
     case .Continue:
-        _state.desc.render(_state.previous_state, _state.current_state, _render_alpha())
+        _state.desc.render(_state.current_state, _render_alpha())
         return true
     }
     return true
@@ -397,6 +401,7 @@ _frame :: proc() -> Frame_Result {
         platform.normalize_ticks(_state.num_sim_ticks)
         for _ in 0 ..< _state.num_sim_ticks {
             runtime.mem_copy_non_overlapping(_state.previous_state, _state.current_state, _state.update_state_size)
+            entity_interpolation_snapshot(_state.entity_manager)
             _state.desc.update()
             platform.release_input()
         }
@@ -433,6 +438,9 @@ _ready_up :: proc() {
 
     bit_array.init(&_state.textures)
     resize_depth(u32(_state.window_size.x), u32(_state.window_size.y))
+
+    _state.entity_manager = new(Entity_Manager)
+    entity_manager_init(_state.entity_manager)
 
     // Global buffers wrapped in arena
     VERTEX_BLOB_SIZE :: 16 * mem.Megabyte

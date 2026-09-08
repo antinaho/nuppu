@@ -20,11 +20,19 @@ Entity :: struct {
 
     next_free:    u32,
     position:     [3]f32,
+    prev_position:[3]f32,
     rotation:     [3]f32, // TODO: currently euler => quaternion
+    prev_rotation:[3]f32,
     scale:        [3]f32,
+    prev_scale:   [3]f32,
 }
 
 NIL_ENTITY_HANDLE :: Entity_Handle {}
+
+Entity_Flag  :: enum {
+    Interpolate,
+}
+Entity_Flags :: bit_set[Entity_Flag]
 
 Entity_Handle :: struct {
     index:       ENTITY_INDEX,
@@ -37,6 +45,7 @@ Entity_Manager :: struct
     types:    [dynamic]typeid,
     variants: [dynamic]Entity_Data,
     sizes:    [dynamic]i64,
+    variant_flags: [dynamic]Entity_Flags,
 
     root_data: Entity,
     root:      Entity_Handle,
@@ -52,7 +61,7 @@ Entity_Data :: struct {
     free:   i32,
 }
 
-entity_manager_add_variant :: proc(manager: ^Entity_Manager, $T: typeid, capacity: int = 1024)
+entity_manager_add_variant :: proc(manager: ^Entity_Manager, $T: typeid, capacity: int = 1024, flags: Entity_Flags = {})
     where intrinsics.type_is_struct(T)
 {
     assert(manager.is_init)
@@ -61,10 +70,11 @@ entity_manager_add_variant :: proc(manager: ^Entity_Manager, $T: typeid, capacit
     if slice.contains(manager.types[:], T) {
         return // already added
     }
-    
+
     append(&manager.types, T)
-    size_t := size_of(T) 
+    size_t := size_of(T)
     append(&manager.sizes, i64(size_t))
+    append(&manager.variant_flags, flags)
 
     data, _ := runtime.make_aligned([]byte, capacity * size_t, alignment = 4096, allocator = manager.allocator)
     intrinsics.mem_zero(raw_data(data), capacity * size_t)
@@ -110,6 +120,7 @@ entity_manager_init :: proc(
     manager.variants = make([dynamic]Entity_Data, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
     manager.sizes = make([dynamic]i64, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
     manager.types = make([dynamic]typeid, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
+    manager.variant_flags = make([dynamic]Entity_Flags, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
 
     manager.root_data = Entity {
         parent = NIL_ENTITY_HANDLE,
@@ -128,7 +139,7 @@ entity_manager_init :: proc(
     manager.root = manager.root_data.handle
 }
 
-entity_manager_deinit :: proc(
+entity_manager_destroy :: proc(
     manager: ^Entity_Manager,
     allocator := context.allocator,
 ) {
@@ -144,6 +155,7 @@ entity_manager_deinit :: proc(
     delete(manager.variants)
     delete(manager.sizes)
     delete(manager.types)
+    delete(manager.variant_flags)
 
     mem.free(rawptr(manager), allocator)
 }
@@ -430,4 +442,49 @@ entity_root :: proc(manager: ^Entity_Manager) -> ^Entity {
     assert_contextless(manager.is_init)
 
     return &manager.root_data
+}
+
+// ============================================================================
+// Interpolation
+//
+// Each registered variant can be tagged with entity_manager_add_variant(..., flags).
+// Variants with the .Interpolate flag have their prev_position / prev_rotation /
+// prev_scale snapshotted on every call to entity_interpolation_snapshot.
+//
+// Call entity_interpolation_snapshot at the start of every fixed sim tick — before
+// mutating positions. Render-side call transform(e, alpha) to read the lerped
+// value; alpha is the inter-tick interpolation factor (0..1) you already pass
+// to your render proc.
+//
+// Why: the variant buffer is opaque (typed slots, polymorphic walk), so we
+// re-read raw bytes from offset 0 — guaranteed to be the Entity base because
+// entity_manager_add_variant validates it has an Entity member at offset 0.
+// ============================================================================
+
+entity_interpolation_snapshot :: proc(manager: ^Entity_Manager) {
+    assert_contextless(manager.is_init)
+
+    for variant_idx in 0..<len(manager.variant_flags) {
+        if .Interpolate not_in manager.variant_flags[variant_idx] { continue }
+
+        data := &manager.variants[variant_idx]
+        size := manager.sizes[variant_idx]
+
+        for slot_idx in 1..=u32(data.top) {
+            base := uintptr(data.buffer) + uintptr(slot_idx) * uintptr(size)
+            slot := cast(^Entity)(base)
+            if slot.handle.index == 0 { continue } // free slot
+
+            slot.prev_position = slot.position
+            slot.prev_rotation = slot.rotation
+            slot.prev_scale    = slot.scale
+        }
+    }
+}
+
+transform :: proc(e: ^Entity, alpha: f32) -> (pos, rot, scl: [3]f32) {
+    pos = e.prev_position + (e.position - e.prev_position) * alpha
+    rot = e.prev_rotation + (e.rotation - e.prev_rotation) * alpha
+    scl = e.prev_scale    + (e.scale    - e.prev_scale)    * alpha
+    return
 }

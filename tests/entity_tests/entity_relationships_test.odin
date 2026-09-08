@@ -34,7 +34,7 @@ make_node :: proc(manager: ^nuppu.Entity_Manager) -> ^Node {
 @(test)
 test_fresh_node_has_no_relations :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     node := make_node(manager)
     testing.expect(t, node != nil, "node is not nil")
 
@@ -51,7 +51,7 @@ test_fresh_node_has_no_relations :: proc(t: ^testing.T) {
 @(test)
 test_add_parent_nil_rejected :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     node := make_node(manager)
     testing.expect(t, node != nil, "node is not nil")
 
@@ -64,7 +64,7 @@ test_add_parent_nil_rejected :: proc(t: ^testing.T) {
 @(test)
 test_add_parent_self_cycle_rejected :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     node := make_node(manager)
     testing.expect(t, node != nil, "node is not nil")
 
@@ -74,7 +74,7 @@ test_add_parent_self_cycle_rejected :: proc(t: ^testing.T) {
 @(test)
 test_add_child_self_cycle_rejected :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     node := make_node(manager)
     testing.expect(t, node != nil, "node is not nil")
 
@@ -84,7 +84,7 @@ test_add_child_self_cycle_rejected :: proc(t: ^testing.T) {
 @(test)
 test_single_child_forms_self_circle :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
     child  := make_node(manager)
     testing.expect(t, parent != nil, "node is not nil")
@@ -104,7 +104,7 @@ test_single_child_forms_self_circle :: proc(t: ^testing.T) {
 @(test)
 test_multiple_children_wrap_at_tail :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
     testing.expect(t, parent != nil, "node is not nil")
     parent_h := parent.handle
@@ -154,7 +154,7 @@ test_multiple_children_wrap_at_tail :: proc(t: ^testing.T) {
 @(test)
 test_remove_parent_root_fails :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     node := make_node(manager)
     if node == nil { return }
 
@@ -164,7 +164,7 @@ test_remove_parent_root_fails :: proc(t: ^testing.T) {
 @(test)
 test_remove_parent_clears_handles :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
     child  := make_node(manager)
     if parent == nil || child == nil { return }
@@ -185,7 +185,7 @@ test_remove_parent_clears_handles :: proc(t: ^testing.T) {
 @(test)
 test_remove_only_child_clears_parent :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
     child  := make_node(manager)
     if parent == nil || child == nil { return }
@@ -200,7 +200,7 @@ test_remove_only_child_clears_parent :: proc(t: ^testing.T) {
 @(test)
 test_remove_child_head_promotes_next :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
     if parent == nil { return }
     parent_h := parent.handle
@@ -243,7 +243,7 @@ test_remove_child_head_promotes_next :: proc(t: ^testing.T) {
 @(test)
 test_remove_child_tail_keeps_head :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
     if parent == nil { return }
     parent_h := parent.handle
@@ -277,7 +277,7 @@ test_remove_child_tail_keeps_head :: proc(t: ^testing.T) {
 @(test)
 test_remove_child_middle_closes_gap :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
     if parent == nil { return }
     parent_h := parent.handle
@@ -308,7 +308,7 @@ test_remove_child_middle_closes_gap :: proc(t: ^testing.T) {
 @(test)
 test_remove_child_rejects_not_mine :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     a := make_node(manager)
     b := make_node(manager)
     c := make_node(manager)
@@ -332,7 +332,7 @@ test_remove_child_rejects_not_mine :: proc(t: ^testing.T) {
 @(test)
 test_add_parent_auto_unlinks_old :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     a := make_node(manager)
     b := make_node(manager)
     c := make_node(manager)
@@ -362,7 +362,7 @@ test_add_child_inside_circle_stays_attached :: proc(t: ^testing.T) {
     // A node already in the middle of a circle: adding it under a new parent
     // must detach it from its old position first.
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     a := make_node(manager)
     b := make_node(manager)
     x := make_node(manager)
@@ -403,7 +403,7 @@ test_add_child_inside_circle_stays_attached :: proc(t: ^testing.T) {
 @(test)
 test_remove_entity_unlinks_from_parent :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
     child  := make_node(manager)
     if parent == nil || child == nil { return }
@@ -423,7 +423,7 @@ test_remove_entity_unlinks_from_parent :: proc(t: ^testing.T) {
 @(test)
 test_remove_root_child_unlinks_from_root :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     node := make_node(manager)
     if node == nil { return }
 
@@ -440,7 +440,7 @@ test_remove_root_child_unlinks_from_root :: proc(t: ^testing.T) {
 @(test)
 test_remove_root_rejected :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     root := nuppu.entity_root(manager)
     testing.expect_value(t, nuppu.entity_remove(manager, root.handle), false)
 }
@@ -448,7 +448,7 @@ test_remove_root_rejected :: proc(t: ^testing.T) {
 @(test)
 test_child_remove_root_rejected :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     node := make_node(manager)
     if node == nil { return }
     root_h := nuppu.entity_root(manager).handle
@@ -462,7 +462,7 @@ test_child_remove_root_rejected :: proc(t: ^testing.T) {
 @(test)
 test_reparent_from_root_via_parent_add :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     a := make_node(manager)
     b := make_node(manager)
     if a == nil || b == nil { return }
@@ -483,7 +483,7 @@ test_reparent_from_root_via_parent_add :: proc(t: ^testing.T) {
 @(test)
 test_explicit_unlink_then_remove :: proc(t: ^testing.T) {
     manager := make_node_manager()
-    defer nuppu.entity_manager_deinit(manager)
+    defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
     child  := make_node(manager)
     if parent == nil || child == nil { return }
