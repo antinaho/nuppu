@@ -19,8 +19,6 @@ State :: struct {
     depth_pso: gpu.Depth_Stencil_State,
     textures: gpu.Texture,
     sampler:  gpu.Sampler,
-
-    camera: nuppu.Camera,
 }
 
 INSTANCE_COUNT :: 32
@@ -81,13 +79,7 @@ _init :: proc() {
         wrap_r     = .ClampToEdge,
     })
 
-    state.camera = nuppu.Camera {
-        position = {0, 0, 2},
-        near = 0.1,
-        far = 1_000,
-        fovy = 80,
-        aspect_ratio = nuppu.aspect_ratio(),
-    }
+    nuppu.update_camera({0, 0, 2}, {}, 0.1, 1_000, 80)
 }
 
 _deinit :: proc() {
@@ -97,28 +89,32 @@ _deinit :: proc() {
 _update :: proc() {
     state.angle += nuppu.sim_delta_time() * 0.09
 
-    if platform.input_key_held(.KEY_A) {
-        state.camera.position.x -= nuppu.sim_delta_time() * 1
-    } 
-    if platform.input_key_held(.KEY_D) {
-        state.camera.position.x += nuppu.sim_delta_time() * 1
-    }
+    
+    // cam := (^nuppu.Camera)(nuppu.entity_get(nuppu._state.entity_manager, nuppu._state.main_camera))
 
+    MS :: 1.25
+    if platform.input_key_held(.KEY_A) {
+        nuppu.move(nuppu.camera(), {-nuppu.sim_delta_time() * MS, 0, 0})
+    }
+    if platform.input_key_held(.KEY_D) {
+        nuppu.move(nuppu.camera(), {nuppu.sim_delta_time() * MS, 0, 0})
+    }
 
     if platform.input_key_held(.KEY_W) {
-        state.camera.position.y += nuppu.sim_delta_time() * 1
+        nuppu.move(nuppu.camera(), {0, nuppu.sim_delta_time() * MS, 0})
     }
     if platform.input_key_held(.KEY_S) {
-        state.camera.position.y -= nuppu.sim_delta_time() * 1
+        nuppu.move(nuppu.camera(), {0, -nuppu.sim_delta_time() * MS, 0})
     }
-    
+
 }
 
-_render :: proc(previous, current: ^State, alpha: f32) {
+_render :: proc(current: ^State, alpha: f32) {
     scl :: 0.33
-    angle := math.lerp(previous.angle, current.angle, alpha)
+    angle := current.angle
 
     frame := nuppu.begin_frame()
+    nuppu.update_constants()
     defer nuppu.end_frame(frame)
 
     for idx in 0 ..< INSTANCE_COUNT {
@@ -127,6 +123,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
         y_off := math.sin((i + angle) * 2 * math.PI)
 
         nuppu.draw_sprite(
+            frame,
             position      = {x_off, y_off, 0},
             rotation      = {0, 0, angle},
             scale         = {scl, scl},
@@ -140,6 +137,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
         y_off := math.sin((i + angle) * 2 * math.PI)
 
         nuppu.draw_cube(
+            frame,
             position      = {-y_off, -x_off, x_off * 0.5},
             rotation      = {0, angle, 0},
             scale         = {scl, scl, scl},
@@ -147,7 +145,7 @@ _render :: proc(previous, current: ^State, alpha: f32) {
         )
     }
 
-    nuppu.finish_instance_upload()
+    nuppu.finish_instance_upload(frame)
 
     // for X in 0 ..< 4 {
     //     nuppu.draw_sprite(
@@ -158,7 +156,6 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     //     )
     // }
 
-    nuppu.update_constants(previous.camera, current.camera, alpha)
 
     gpu.barrier(.Transfer, .All)
 
@@ -178,8 +175,9 @@ _render :: proc(previous, current: ^State, alpha: f32) {
     gpu.set_pipeline(current.pso)
     gpu.set_depth_stencil_state(current.depth_pso)
 
-    nuppu.draw_mesh_builtin(.Quad, INSTANCE_COUNT)
-    nuppu.draw_mesh_builtin(.Cube, INSTANCE_COUNT, 32)
+    nuppu.draw_all_instances(frame)
+    // nuppu.draw_mesh_builtin(.Quad, INSTANCE_COUNT)
+    // nuppu.draw_mesh_builtin(.Cube, INSTANCE_COUNT, 32)
     //nuppu.draw_mesh_builtin(.Quad, 4, 32)
     
 

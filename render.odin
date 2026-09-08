@@ -7,6 +7,7 @@ import "bit_array"
 import "base:intrinsics"
 import "base:runtime"
 import "core:slice"
+import "core:log"
 
 #assert(size_of(Vertex) == 32)
 Vertex :: struct #align(16) {
@@ -27,8 +28,6 @@ Mesh :: struct #all_or_none {
     verts:        gpu.ptr,
     indices:      gpu.ptr,
 }
-
-
 
 Built_in_mesh :: enum u32 {
     Quad,
@@ -69,6 +68,7 @@ get_built_in_mesh :: proc(built_in_mesh: Built_in_mesh) -> (^Mesh, bool) #option
 get_mesh :: proc(handle: Mesh_Handle) -> (^Mesh, bool) { return get_resource(&_state.meshes, handle) }
 
 draw_sprite :: proc(
+    frame: Frame,
     position:     [3]f32,
     color:        [4]f32 = {1, 1, 1, 1},
     uv_min:       [2]f32 = {0, 0},
@@ -79,10 +79,11 @@ draw_sprite :: proc(
 ) {
     sprite_instance := pack_sprite_instance(position, color, uv_min, uv_size, rotation, scale, material_idx)
 
-    push_instance(&_state.instance_batcher, .Sprite, .Default, slice.bytes_from_ptr(&sprite_instance, size_of(Sprite_Instance)))
+    push_instance(frame, &_state.draw_batcher, Instance{.Sprite, .Default, {}}, sprite_instance)
 }
 
 draw_cube :: proc(
+    frame: Frame,
     position:     [3]f32,
     color:        [4]f32 = {1, 1, 1, 1},
     rotation:     [3]f32 = {0, 0, 0},
@@ -90,15 +91,9 @@ draw_cube :: proc(
     material_idx: u32    = 0,
 ) {
 
-    base_instance := Instance {
-        kind = .Mesh,
-        material_idx = .Default,
-        extra_data = {},
-    }
-
     mesh_instance := pack_mesh_instance(position, color, rotation, scale, material_idx)
 
-    push_instance(&_state.instance_batcher, .Mesh, .Default, slice.bytes_from_ptr(&mesh_instance, size_of(Mesh_Instance)))
+    push_instance(frame, &_state.draw_batcher, Instance{.Mesh, .Default, {}}, mesh_instance)
 }
 
 Instance_Kind :: enum u16 {
@@ -115,7 +110,7 @@ Instance :: struct #align(8) {
     kind: Instance_Kind,
     material_idx: Material_Kind,
 
-    extra_data: u32,
+    _extra_data: u32,
 }
 
 #assert(size_of(Mesh_Instance) == 32)
@@ -129,86 +124,184 @@ Mesh_Instance :: struct #all_or_none #align(16) {
     _pad: [3]u8,
 }
 
-Instance_Batcher :: struct {
-    instance_buffer: gpu.ptr,
-    instance_data_buffer_blob: gpu.ptr,
-
-    instance_offset:      int,
-    instance_data_offset: int,
+Instance_Batch :: struct {
+    base_instances   : gpu.ptr,
+    variant_instances: gpu.ptr,
+    variant_byte_offset: u32, // byte offset of variant start in the batcher's blob
+    
+    cap              : i32, // how many instances of a given variant buffer can fit into single slice, NOT the cap of the buffer
+    top              : [FRAMES_IN_FLIGHT]i32, // the amount of instance + instance data
 }
 
-push_instance :: proc(batcher: ^Instance_Batcher, kind: Instance_Kind, material: Material_Kind, instance_data: []u8) {
-    if len(instance_data) == 0 {
+Draw_Batcher :: struct {
+    types               : [dynamic]typeid,
+    sizes               : [dynamic]i64,
+    instances           : [dynamic]Instance_Batch,
+    meshes              : [dynamic]Mesh_Handle,
+
+    instance_base_buffer: gpu.ptr,
+    instance_data_buffer: gpu.ptr,
+
+    instances_total: i64,
+
+    base_watermark: u32,
+    data_watermark: u32,
+    allocator: runtime.Allocator,
+    is_init: bool,
+}
+
+init_draw_batcher :: proc(batcher: ^Draw_Batcher, max_instances: u32, max_instance_data_size: u32, allocator := context.allocator) {
+    batcher.instance_base_buffer, _ = gpu.malloc(size_of(Instance) * max_instances * FRAMES_IN_FLIGHT, align_of(Instance), .Staging)
+    batcher.instance_data_buffer, _ = gpu.malloc(max_instance_data_size * FRAMES_IN_FLIGHT, 16, .Staging)
+
+    INITIAL_CAPACITY :: 16
+    batcher.allocator = allocator
+    batcher.instances_total = i64(max_instances)
+
+    batcher.types = make([dynamic]typeid, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
+    batcher.sizes = make([dynamic]i64, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
+    batcher.instances = make([dynamic]Instance_Batch, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
+    batcher.meshes = make([dynamic]Mesh_Handle, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
+
+    batcher.is_init = true
+}
+
+draw_batcher_add_variant :: proc(batcher: ^Draw_Batcher, $T: typeid, mesh: Mesh_Handle, capacity: int = 1024) {
+    assert(batcher.is_init)
+
+    if slice.contains(batcher.types[:], T) {
+        return // already added
+    }
+
+    append(&batcher.meshes, mesh)
+    append(&batcher.types, T)
+    size_t := size_of(T)
+    append(&batcher.sizes, i64(size_t))
+    
+    assert(align_of(T) % 16 == 0)
+
+    batch := Instance_Batch {
+        base_instances = gpu.sub_alloc(batcher.instance_base_buffer, batcher.base_watermark, u32(FRAMES_IN_FLIGHT * capacity * size_of(Instance))),
+        variant_instances = gpu.sub_alloc(batcher.instance_data_buffer, batcher.data_watermark, u32(FRAMES_IN_FLIGHT * capacity * size_t)),
+        cap = i32(capacity),
+        top = {},
+    }
+    batch.variant_byte_offset = u32(uintptr(batch.variant_instances.cpu) - uintptr(batcher.instance_data_buffer.cpu))
+
+    append(&batcher.instances, batch)
+
+    batcher.base_watermark += u32(FRAMES_IN_FLIGHT * capacity * size_of(Instance))
+    batcher.data_watermark += u32(FRAMES_IN_FLIGHT * capacity * size_t)
+}
+
+batcher_reset :: proc(frame: Frame, batcher: ^Draw_Batcher) {
+    for &data in batcher.instances {
+        data.top[frame.n % FRAMES_IN_FLIGHT] = 0
+    }
+}
+
+push_instance :: proc(frame: Frame, batcher: ^Draw_Batcher, instance: Instance, instance_data: $T) {
+    assert(batcher.is_init)
+    variant_idx, found := slice.linear_search(batcher.types[:], T)
+    assert(found, "push_instance: type not registered")
+
+    data := &batcher.instances[variant_idx] // data
+    size := batcher.sizes[variant_idx] // size of variant instance
+    frame_n := frame.n // current frame
+    top := &data.top[frame_n % FRAMES_IN_FLIGHT]
+    top_idx := top^ // how many instances pushed this frame
+    if top_idx >= data.cap {
+        log.error("push_instance: out of capacity")
         return
     }
-
-    batcher.instance_data_offset = runtime.align_forward(batcher.instance_data_offset, 16)
-
-    instance := Instance {
-        kind = kind,
-        material_idx = material,
-        extra_data = u32(batcher.instance_data_offset),
+    
+    base_instance_ptr := \
+    uintptr(data.base_instances.cpu) \
+    + uintptr( (frame_n % FRAMES_IN_FLIGHT) * size_of(Instance) * u64(data.cap)) \
+    + uintptr(top_idx * size_of(Instance))
+    
+    base_data_ptr := \ 
+    uintptr(data.variant_instances.cpu) \
+    + uintptr( (frame_n % FRAMES_IN_FLIGHT) * u64(size) * u64(data.cap)) \
+    + uintptr(u64(top_idx) * u64(size))
+    
+    // Hardcode for now
+    _instance := Instance {
+        kind = instance.kind,
+        material_idx = instance.material_idx,
+        _extra_data = u32(u64(data.variant_byte_offset) \
+        + (frame_n % FRAMES_IN_FLIGHT) * u64(size) * u64(data.cap) \
+        + u64(top_idx) * u64(size)),
     }
 
-    // Write base instance data
-    ([^]Instance)(batcher.instance_buffer.cpu)[batcher.instance_offset] = instance
-    batcher.instance_offset += 1
+    // Write
+    ([^]Instance)(rawptr(base_instance_ptr))[0] = _instance
+    
+    dest := ([^]u8)(rawptr(base_data_ptr))
+    i := instance_data
+    mem.copy(&dest[0], &i, int(size))
 
-    // Write aligned instance data
-    dest := ([^]u8)(batcher.instance_data_buffer_blob.cpu)
-    mem.copy(&dest[batcher.instance_data_offset], raw_data(instance_data), len(instance_data))
-    batcher.instance_data_offset += len(instance_data)
+    top^ += 1
 }
 
-finish_instance_upload :: proc() {
-    gpu.unmap(&_state.instance_batcher.instance_buffer)
-    gpu.unmap(&_state.instance_batcher.instance_data_buffer_blob)
+finish_instance_upload :: proc(frame: Frame) {
+    f := u32(frame.n % FRAMES_IN_FLIGHT)
 
-    gpu.copy(_state._instances, _state.instance_batcher.instance_buffer)
-    gpu.copy(_state._instances_data, _state.instance_batcher.instance_data_buffer_blob)
+    for &data, I in _state.draw_batcher.instances {
+        gpu.unmap(&data.base_instances, 
+            i64( i64(frame.n % FRAMES_IN_FLIGHT) * i64(size_of(Instance) ) * i64(data.cap)),
+            i64(size_of(Instance) * data.cap))
+        gpu.unmap(&data.variant_instances, 
+            i64( i64(frame.n % FRAMES_IN_FLIGHT) * i64(_state.draw_batcher.sizes[I]) * i64(data.cap)),
+            i64( i64(_state.draw_batcher.sizes[I]) * i64(data.cap)))
+    }
 
-    // Needed for wgpu to start mapping again
+    for &data, I in _state.draw_batcher.instances {
+        size_t := u32(_state.draw_batcher.sizes[I])
+        hdr_slot  := u32(data.cap) * u32(size_of(Instance))
+        data_slot := u32(data.cap) * size_t
+
+        src_hdr := gpu.sub_alloc(data.base_instances,    f * hdr_slot,  hdr_slot)
+        src_dat := gpu.sub_alloc(data.variant_instances, f * data_slot, data_slot)
+
+        hdr_off  := u32(data.base_instances.byte_offset)  // where headers belong
+        data_off := u32(data.variant_byte_offset)         // where payloads belong
+
+        dst_hdr := gpu.sub_alloc(_state.instances,      hdr_off  + f * hdr_slot,  hdr_slot)
+        dst_dat := gpu.sub_alloc(_state.instances_data, data_off + f * data_slot, data_slot)
+
+        gpu.copy(dst_hdr, src_hdr)
+        gpu.copy(dst_dat, src_dat)
+    }
+
+    // TODO: Needed for wgpu to start mapping again
     // gpu.recall(&batcher.instance_buffer)
     // gpu.recall(&batcher.instance_data_buffer_blob)
 }
 
-reset_batches :: proc(batcher: ^Instance_Batcher) {
-    batcher.instance_offset      = 0
-    batcher.instance_data_offset = 0
-}
+draw_all_instances :: proc(frame: Frame) {
+    f := frame.n % FRAMES_IN_FLIGHT
+    base_instance :i32= 0
+    for batch, i in _state.draw_batcher.instances {
+        mesh_handle := _state.draw_batcher.meshes[i]
+        mesh, ok := get_mesh(mesh_handle)
+        if !ok { continue }
 
+        count := u32(batch.top[f])
+        if count == 0 { continue }
 
-draw_instances :: proc() {
+        gpu.draw_indiced_primitives(
+            &_state.built_in_block,
+            _state.index.ptr,
+            mesh.index_count,
+            mesh.index_base,
+            count,
+            mesh.vertex_base,
+            u32(base_instance),
+        )
 
-}
-
-draw_mesh_builtin :: proc(mesh_type: Built_in_mesh, instance_count: u32 = 1, base_instance: u32 = 0) {
-
-    mesh := get_built_in_mesh(mesh_type)
-
-    gpu.draw_indiced_primitives(
-        &_state.built_in_block,
-        _state.index.ptr,
-        mesh.index_count,
-        mesh.index_base,
-        instance_count,
-        mesh.vertex_base,
-        base_instance
-    )
-}
-
-draw_mesh_ex :: proc(mesh: ^Mesh, parameter_block: ^gpu.Parameter_Block, instance_count: u32) {
-    base_instance :u32= 0
-
-    gpu.draw_indiced_primitives(
-        parameter_block,
-        _state.index.ptr,
-        mesh.index_count,
-        mesh.index_base,
-        instance_count,
-        mesh.vertex_base,
-        base_instance
-    )
+        base_instance += batch.cap * FRAMES_IN_FLIGHT
+    }
 }
 
 create_built_in_meshes :: proc() {

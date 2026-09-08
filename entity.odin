@@ -21,7 +21,7 @@ Entity :: struct {
     next_free:    u32,
     position:     [3]f32,
     prev_position:[3]f32,
-    rotation:     [3]f32, // TODO: currently euler => quaternion
+    rotation:     [3]f32, // TODO: currently euler
     prev_rotation:[3]f32,
     scale:        [3]f32,
     prev_scale:   [3]f32,
@@ -42,16 +42,16 @@ Entity_Handle :: struct {
 
 Entity_Manager :: struct
 {
-    types:    [dynamic]typeid,
-    variants: [dynamic]Entity_Data,
-    sizes:    [dynamic]i64,
+    types:         [dynamic]typeid,
+    variants:      [dynamic]Entity_Data,
+    sizes:         [dynamic]i64,
     variant_flags: [dynamic]Entity_Flags,
 
-    root_data: Entity,
-    root:      Entity_Handle,
-    is_init:   bool,
+    root_data:     Entity,
+    root:          Entity_Handle,
+    is_init:       bool,
 
-    allocator: runtime.Allocator,
+    allocator:     runtime.Allocator,
 }
 
 Entity_Data :: struct {

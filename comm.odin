@@ -11,27 +11,6 @@ import "core:strconv"
 import "core:strings"
 import glm "core:math/linalg/glsl"
 
-// Camera
-
-Camera :: struct {
-    position: [3]f32,
-
-    near: f32,
-    far: f32,
-    fovy: f32,
-    aspect_ratio: f32,
-}
-
-update_camera :: proc(prev_camera: Camera, curr_camera: Camera, alpha: f32) -> Camera {
-    return Camera {
-        position = math.lerp(prev_camera.position, curr_camera.position, alpha),
-        near = math.lerp(prev_camera.near, curr_camera.near, alpha),
-        far = math.lerp(prev_camera.far, curr_camera.far, alpha),
-        fovy = math.lerp(prev_camera.fovy, curr_camera.fovy, alpha),
-        aspect_ratio = curr_camera.aspect_ratio,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Math
 

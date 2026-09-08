@@ -97,9 +97,9 @@ State :: struct #align(64) {
     index: gpu.Arena,
     frame_uniform: gpu.ptr,
     
-    _instances: gpu.ptr,
-    _instances_data: gpu.ptr,
-    instance_batcher: Instance_Batcher,    
+    instances: gpu.ptr,
+    instances_data: gpu.ptr,
+    draw_batcher: Draw_Batcher,
 
     sampler: gpu.Sampler,
 
@@ -118,10 +118,38 @@ State :: struct #align(64) {
     built_in_textures: [Built_in_texture]Texture_Handle,
 
     entity_manager: ^Entity_Manager,
+    main_camera: Entity_Handle,
+}
+
+camera :: proc "contextless" () -> Entity_Handle {
+    return _state.main_camera
+}
+
+Camera :: struct {
+    using e: Entity,
+
+    near: f32,
+    far: f32,
+    fovy: f32,
+    aspect_ratio: f32,
+}
+
+update_camera :: proc(
+    position: [3]f32,
+    rotation: [3]f32,
+    near: f32,
+    far: f32,
+    fovy: f32,
+) {
+    cam := (^Camera)(entity_get(_state.entity_manager, _state.main_camera))
+    cam.position = position
+    cam.rotation = rotation
+    cam.near = near
+    cam.far = far
+    cam.fovy = fovy
 }
 
 _state: ^State
-
 
 
 Frame_Result :: enum { Continue, Skip_Render, Exit }
@@ -229,11 +257,16 @@ begin_frame :: proc() -> Frame {
     n := _state.frame_n
     arena := _state.frame_arenas[n % FRAMES_IN_FLIGHT]
     arena.offset = 0
-    return Frame {
+
+    frame := Frame {
         n         = n,
         semaphore = _state.frame_semaphore,
         arena     = arena,
     }
+
+    batcher_reset(frame, &_state.draw_batcher)
+    
+    return frame
 }
 
 end_frame :: proc(frame: Frame) {
@@ -243,8 +276,8 @@ end_frame :: proc(frame: Frame) {
     recycle_frame_arena(frame.arena)
 }
 
-update_constants :: proc(prev, curr: Camera, alpha: f32) {
-    cam := update_camera(prev, curr, alpha)
+update_constants :: proc() {
+    cam := (^Camera)(entity_get(_state.entity_manager, _state.main_camera))
 
     staging, ok := gpu.malloc(
         size_of(Engine_Uniform), align_of(Engine_Uniform),
@@ -267,6 +300,7 @@ update_constants :: proc(prev, curr: Camera, alpha: f32) {
 
     gpu.unmap(&staging)
     gpu.copy(_state.frame_uniform, staging)
+    gpu.barrier(.Transfer, .All)
 }
 
 frame_arena :: proc(frame: Frame) -> ^gpu.Arena {
@@ -381,7 +415,7 @@ step :: proc(dt: f32) -> bool {
 _frame :: proc() -> Frame_Result {
 
     free_all(context.temp_allocator)
-    reset_batches(&_state.instance_batcher)
+    //reset_batches(&_state.instance_batcher)
 
     platform.platform_reset_frame_input()
     platform.poll_events()
@@ -424,6 +458,9 @@ _frame :: proc() -> Frame_Result {
         gpu.resize_swapchain(u32(current.x), u32(current.y))
         resize_depth(u32(current.x), u32(current.y))
         _state.window_size = current
+
+        camera_ptr := (^Camera)(entity_get(_state.entity_manager, _state.main_camera))
+        camera_ptr.aspect_ratio = platform.window_aspect_ratio()
     }
 
     return .Continue
@@ -448,6 +485,17 @@ _ready_up :: proc() {
     _state.entity_manager = new(Entity_Manager)
     entity_manager_init(_state.entity_manager)
 
+    entity_manager_add_variant(_state.entity_manager, Camera, capacity = 2, flags = {.Interpolate})
+    camera := entity_add(_state.entity_manager, Camera) 
+    
+    camera.scale = {1, 1, 1}
+    camera.near = 0.01
+    camera.far = 1_000
+    camera.fovy = 90
+    camera.aspect_ratio = platform.window_aspect_ratio()
+
+    _state.main_camera = camera.handle
+    
     // Global buffers wrapped in arena
     VERTEX_BLOB_SIZE :: 16 * mem.Megabyte
     GLOBAL_INDEX_COUNT_MAX :: 1 << 16
@@ -459,23 +507,10 @@ _ready_up :: proc() {
     
     _state.vertex, _ = gpu.arena_init(VERTEX_BLOB_SIZE, flags = .Default)
     _state.index, _ = gpu.arena_init(size_of(Vertex_Index) * GLOBAL_INDEX_COUNT_MAX, flags = .Index)
-    _state._instances, _ = gpu.arena_init(size_of(Instance) * MAX_INSTANCES, alignment = align_of(Instance), flags = .Default)
-    _state._instances_data, _ = gpu.arena_init(INSTANCE_BLOB_SIZE, flags = .Default)
-    
-    _state.instance_batcher.instance_buffer, _ = gpu.malloc(size_of(Instance) * MAX_INSTANCES, align_of(Instance), .Staging)
-    _state.instance_batcher.instance_data_buffer_blob, _ = gpu.malloc(INSTANCE_BLOB_SIZE, 16, .Staging)
+    _state.instances, _ = gpu.arena_init(size_of(Instance) * MAX_INSTANCES, alignment = align_of(Instance), flags = .Default)
+    _state.instances_data, _ = gpu.arena_init(INSTANCE_BLOB_SIZE, flags = .Default)
     
     _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), align_of(Engine_Uniform), .Constant, "Frame Uniform")
-
-    // 
-    // _state.built_in_textures = gpu.texture_init({
-    //     dimensions  = {63, 63},
-    //     format      = .RGBA8Unorm,
-    //     type        = ._2D_Array,
-    //     storage     = .Shared,
-    //     usage       = {.Sampled},
-    //     layer_count = 16,
-    // })
 
     _state.sampler = gpu.sampler_init({
         mag_filter = .Nearest,
@@ -520,12 +555,16 @@ _ready_up :: proc() {
     bit_array.init(&_state.meshes)
     create_built_in_meshes()
 
+    init_draw_batcher(&_state.draw_batcher, MAX_INSTANCES, INSTANCE_BLOB_SIZE)
+    draw_batcher_add_variant(&_state.draw_batcher, Sprite_Instance, _state.built_in_meshes[.Quad], 67)
+    draw_batcher_add_variant(&_state.draw_batcher, Mesh_Instance, _state.built_in_meshes[.Cube], 67)
+
     _state.built_in_block = gpu.Parameter_Block {
         constants = { 0 = _state.frame_uniform },
         read_resources = {
             0 = _state.vertex.ptr,
-            1 = _state._instances,
-            2 = _state._instances_data,
+            1 = _state.instances,
+            2 = _state.instances_data,
             3 = texture_array^,
         },
         read_write_resources = {},
@@ -662,9 +701,6 @@ get_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), handle
     }
     return &resource_ptr.data, ok
 }
-
-
-
 
 // Simple 2D texture
 texture_2D_init :: proc(
