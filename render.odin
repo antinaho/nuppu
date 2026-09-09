@@ -79,7 +79,7 @@ draw_sprite :: proc(
 ) {
     sprite_instance := pack_sprite_instance(position, color, uv_min, uv_size, rotation, scale, material_idx)
 
-    push_instance(frame, &_state.draw_batcher, Instance{.Sprite, .Default, {}}, sprite_instance)
+    push_instance(frame, &_state.draw_batcher, Instance{.Sprite, .Default, {}}, sprite_instance, _state.built_in_meshes[.Quad])
 }
 
 draw_cube :: proc(
@@ -93,7 +93,7 @@ draw_cube :: proc(
 
     mesh_instance := pack_mesh_instance(position, color, rotation, scale, material_idx)
 
-    push_instance(frame, &_state.draw_batcher, Instance{.Mesh, .Default, {}}, mesh_instance)
+    push_instance(frame, &_state.draw_batcher, Instance{.Mesh, .Default, {}}, mesh_instance, _state.built_in_meshes[.Cube])
 }
 
 Instance_Kind :: enum u16 {
@@ -133,11 +133,16 @@ Instance_Batch :: struct {
     top              : [FRAMES_IN_FLIGHT]i32, // the amount of instance + instance data
 }
 
+Batch_Mesh :: struct {
+    mesh:  Mesh_Handle,
+    count: [FRAMES_IN_FLIGHT]u32,
+}
+
 Draw_Batcher :: struct {
     types               : [dynamic]typeid,
     sizes               : [dynamic]i64,
     instances           : [dynamic]Instance_Batch,
-    meshes              : [dynamic]Mesh_Handle,
+    mesh_counts         : map[Mesh_Handle][3]u32,
 
     instance_base_buffer: gpu.ptr,
     instance_data_buffer: gpu.ptr,
@@ -161,19 +166,28 @@ init_draw_batcher :: proc(batcher: ^Draw_Batcher, max_instances: u32, max_instan
     batcher.types = make([dynamic]typeid, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
     batcher.sizes = make([dynamic]i64, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
     batcher.instances = make([dynamic]Instance_Batch, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
-    batcher.meshes = make([dynamic]Mesh_Handle, len=0, cap = INITIAL_CAPACITY, allocator = allocator)
+    batcher.mesh_counts = make(map[Mesh_Handle][3]u32, capacity = INITIAL_CAPACITY, allocator = allocator)
 
     batcher.is_init = true
 }
 
-draw_batcher_add_variant :: proc(batcher: ^Draw_Batcher, $T: typeid, mesh: Mesh_Handle, capacity: int = 1024) {
+draw_batcher_add_mesh :: proc(batcher: ^Draw_Batcher, mesh: Mesh_Handle) {
+    assert(batcher.is_init)
+
+    if mesh in batcher.mesh_counts {
+        return // already added
+    }
+
+    batcher.mesh_counts[mesh] = {}
+}
+
+draw_batcher_add_variant :: proc(batcher: ^Draw_Batcher, $T: typeid, capacity: int = 1024) {
     assert(batcher.is_init)
 
     if slice.contains(batcher.types[:], T) {
         return // already added
     }
 
-    append(&batcher.meshes, mesh)
     append(&batcher.types, T)
     size_t := size_of(T)
     append(&batcher.sizes, i64(size_t))
@@ -195,15 +209,30 @@ draw_batcher_add_variant :: proc(batcher: ^Draw_Batcher, $T: typeid, mesh: Mesh_
 }
 
 batcher_reset :: proc(frame: Frame, batcher: ^Draw_Batcher) {
+    f := frame.n % FRAMES_IN_FLIGHT
+
     for &data in batcher.instances {
-        data.top[frame.n % FRAMES_IN_FLIGHT] = 0
+        data.top[f] = 0
+    }
+
+    for _, &count in batcher.mesh_counts {
+        count[f] = 0
     }
 }
 
-push_instance :: proc(frame: Frame, batcher: ^Draw_Batcher, instance: Instance, instance_data: $T) {
+push_instance :: proc(frame: Frame, batcher: ^Draw_Batcher, instance: Instance, instance_data: $T, mesh: Mesh_Handle) {
     assert(batcher.is_init)
     variant_idx, found := slice.linear_search(batcher.types[:], T)
     assert(found, "push_instance: type not registered")
+
+    if mesh not_in batcher.mesh_counts {
+        panic("push_instance: mesh not registered")
+    }
+
+    f := frame.n % FRAMES_IN_FLIGHT
+    ms := &batcher.mesh_counts[mesh]
+    c := &ms[f]
+    c^ += 1
 
     data := &batcher.instances[variant_idx] // data
     size := batcher.sizes[variant_idx] // size of variant instance
@@ -283,22 +312,26 @@ draw_all_instances :: proc(frame: Frame) {
     f := frame.n % FRAMES_IN_FLIGHT
     base_instance :i32= 0
     for batch, i in _state.draw_batcher.instances {
-        mesh_handle := _state.draw_batcher.meshes[i]
-        mesh, ok := get_mesh(mesh_handle)
-        if !ok { continue }
 
-        count := u32(batch.top[f])
-        if count == 0 { continue }
+        for mesh, count in _state.draw_batcher.mesh_counts {
+            
+            mesh, ok := get_mesh(mesh)
+            if !ok { continue }
 
-        gpu.draw_indiced_primitives(
-            &_state.built_in_block,
-            _state.index.ptr,
-            mesh.index_count,
-            mesh.index_base,
-            count,
-            mesh.vertex_base,
-            u32(base_instance),
-        )
+            // count := u32(batch.top[f])
+            count_frame := count[f]
+            if count_frame == 0 { continue }
+
+            gpu.draw_indiced_primitives(
+                &_state.built_in_block,
+                _state.index.ptr,
+                mesh.index_count,
+                mesh.index_base,
+                count_frame,
+                mesh.vertex_base,
+                u32(base_instance),
+            )
+        }
 
         base_instance += batch.cap * FRAMES_IN_FLIGHT
     }

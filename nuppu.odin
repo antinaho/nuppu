@@ -556,8 +556,10 @@ _ready_up :: proc() {
     create_built_in_meshes()
 
     init_draw_batcher(&_state.draw_batcher, MAX_INSTANCES, INSTANCE_BLOB_SIZE)
-    draw_batcher_add_variant(&_state.draw_batcher, Sprite_Instance, _state.built_in_meshes[.Quad], 67)
-    draw_batcher_add_variant(&_state.draw_batcher, Mesh_Instance, _state.built_in_meshes[.Cube], 67)
+    draw_batcher_add_variant(&_state.draw_batcher, Sprite_Instance, 67)
+    draw_batcher_add_mesh(&_state.draw_batcher, _state.built_in_meshes[.Quad])
+    draw_batcher_add_variant(&_state.draw_batcher, Mesh_Instance, 67)
+    draw_batcher_add_mesh(&_state.draw_batcher, _state.built_in_meshes[.Cube])
 
     _state.built_in_block = gpu.Parameter_Block {
         constants = { 0 = _state.frame_uniform },
