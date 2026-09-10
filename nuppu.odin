@@ -96,9 +96,7 @@ State :: struct #align(64) {
     vertex: gpu.Arena,
     index: gpu.Arena,
     frame_uniform: gpu.ptr,
-    
-    instances: gpu.ptr,
-    instances_data: gpu.ptr,
+
     draw_batcher: Draw_Batcher,
 
     sampler: gpu.Sampler,
@@ -126,7 +124,7 @@ camera :: proc "contextless" () -> Entity_Handle {
 }
 
 Camera :: struct {
-    using e: Entity,
+    using e: ^Entity,
 
     near: f32,
     far: f32,
@@ -141,12 +139,13 @@ update_camera :: proc(
     far: f32,
     fovy: f32,
 ) {
-    cam := (^Camera)(entity_get(_state.entity_manager, _state.main_camera))
+    cam, ok := entity_get_typed(_state.entity_manager, _state.main_camera, Camera)
+    if !ok { return }
     cam.position = position
     cam.rotation = rotation
-    cam.near = near
-    cam.far = far
-    cam.fovy = fovy
+    cam.near  = near
+    cam.far   = far
+    cam.fovy  = fovy
 }
 
 _state: ^State
@@ -265,7 +264,7 @@ begin_frame :: proc() -> Frame {
     }
 
     batcher_reset(frame, &_state.draw_batcher)
-    
+
     return frame
 }
 
@@ -277,13 +276,14 @@ end_frame :: proc(frame: Frame) {
 }
 
 update_constants :: proc() {
-    cam := (^Camera)(entity_get(_state.entity_manager, _state.main_camera))
+    cam, ok := entity_get_typed(_state.entity_manager, _state.main_camera, Camera)
+    if !ok { return }
 
-    staging, ok := gpu.malloc(
+    staging, ok2 := gpu.malloc(
         size_of(Engine_Uniform), align_of(Engine_Uniform),
         .Staging, "Frame Uniform Staging",
     )
-    if !ok {
+    if !ok2 {
         log.error("update_constants: failed to allocate staging buffer")
         return
     }
@@ -294,6 +294,7 @@ update_constants :: proc() {
         glm.radians_f32(cam.fovy), cam.aspect_ratio, cam.near, cam.far,
     )
     uniforms.cam_ortho_transform = 1
+    uniforms.cam_world_transform  = glm.mat4Translate(-cam.position)  // identity entity-world; just the camera shift
     uniforms.cam_view_transform   = glm.mat4Translate(-cam.position)
     uniforms.cam_position        = cam.position
     uniforms._pad                = 0
@@ -459,8 +460,10 @@ _frame :: proc() -> Frame_Result {
         resize_depth(u32(current.x), u32(current.y))
         _state.window_size = current
 
-        camera_ptr := (^Camera)(entity_get(_state.entity_manager, _state.main_camera))
-        camera_ptr.aspect_ratio = platform.window_aspect_ratio()
+        camera_ptr, ok := entity_get_typed(_state.entity_manager, _state.main_camera, Camera)
+        if ok {
+            camera_ptr.aspect_ratio = platform.window_aspect_ratio()
+        }
     }
 
     return .Continue
@@ -485,31 +488,28 @@ _ready_up :: proc() {
     _state.entity_manager = new(Entity_Manager)
     entity_manager_init(_state.entity_manager)
 
-    entity_manager_add_variant(_state.entity_manager, Camera, capacity = 2, flags = {.Interpolate})
-    camera := entity_add(_state.entity_manager, Camera) 
-    
-    camera.scale = {1, 1, 1}
-    camera.near = 0.01
-    camera.far = 1_000
-    camera.fovy = 90
-    camera.aspect_ratio = platform.window_aspect_ratio()
+    // Camera
+    {
+        entity_manager_add_variant(_state.entity_manager, Camera, 6, flags = {.Interpolate})
+        camera_handle := entity_add(_state.entity_manager, Camera) 
+        camera := entity_get_typed(_state.entity_manager, camera_handle, Camera)
 
-    _state.main_camera = camera.handle
+        camera.scale = {1, 1, 1}
+        camera.near = 0.01
+        camera.far = 1_000
+        camera.fovy = 90
+        camera.aspect_ratio = platform.window_aspect_ratio()
     
+        _state.main_camera = camera.handle
+    }
+
     // Global buffers wrapped in arena
     VERTEX_BLOB_SIZE :: 16 * mem.Megabyte
     GLOBAL_INDEX_COUNT_MAX :: 1 << 16
-    
-    MAX_INSTANCES :: 10_000
-    INSTANCE_BLOB_SIZE :: 64 * mem.Megabyte
-    
-    // MAX_MATERIAL_COUNT :: 1 << 8 // If this raises need to increase material idx on sprite instance
-    
+
     _state.vertex, _ = gpu.arena_init(VERTEX_BLOB_SIZE, flags = .Default)
     _state.index, _ = gpu.arena_init(size_of(Vertex_Index) * GLOBAL_INDEX_COUNT_MAX, flags = .Index)
-    _state.instances, _ = gpu.arena_init(size_of(Instance) * MAX_INSTANCES, alignment = align_of(Instance), flags = .Default)
-    _state.instances_data, _ = gpu.arena_init(INSTANCE_BLOB_SIZE, flags = .Default)
-    
+
     _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), align_of(Engine_Uniform), .Constant, "Frame Uniform")
 
     _state.sampler = gpu.sampler_init({
@@ -555,18 +555,21 @@ _ready_up :: proc() {
     bit_array.init(&_state.meshes)
     create_built_in_meshes()
 
-    init_draw_batcher(&_state.draw_batcher, MAX_INSTANCES, INSTANCE_BLOB_SIZE)
-    draw_batcher_add_variant(&_state.draw_batcher, Sprite_Instance, 67)
+    init_draw_batcher(&_state.draw_batcher)
+    
+    draw_batcher_add_variant(&_state.draw_batcher, Sprite_Instance)
     draw_batcher_add_mesh(&_state.draw_batcher, _state.built_in_meshes[.Quad])
-    draw_batcher_add_variant(&_state.draw_batcher, Mesh_Instance, 67)
+    draw_batcher_add_variant(&_state.draw_batcher, Mesh_Instance)
     draw_batcher_add_mesh(&_state.draw_batcher, _state.built_in_meshes[.Cube])
+    
+    init_draw_batcher_buffers(&_state.draw_batcher)
 
     _state.built_in_block = gpu.Parameter_Block {
         constants = { 0 = _state.frame_uniform },
         read_resources = {
             0 = _state.vertex.ptr,
-            1 = _state.instances,
-            2 = _state.instances_data,
+            1 = _state.draw_batcher.instance_base_buffer,
+            2 = _state.draw_batcher.instance_data_buffer,
             3 = texture_array^,
         },
         read_write_resources = {},
