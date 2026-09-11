@@ -9,11 +9,14 @@
 !bit_array/
 !bit_array/bit_array.odin
 
+!material.odin
+
 !gpu/
 !gpu/**
 
 !entity.odin
 !entity_common.odin
+!bits.odin
 
 !examples/
 !examples/**
