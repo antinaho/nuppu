@@ -7,17 +7,20 @@ import "core:log"
 import "core:slice"
 
 ENTITY_INDEX      :: u32
+ENTITY_INDEX_BITS :: 8*size_of(ENTITY_INDEX)
 ENTITY_GENERATION :: u16
 ENTITY_VARIANT    :: u16
 ROOT_VARIANT_IDX  :: max(ENTITY_VARIANT)
 
 PLATFORM_BITS :: 8*size_of(uint)
-MAX_SHIFT :: PLATFORM_BITS>>1
+MAX_SHIFT :: (PLATFORM_BITS>>1) - 1 // 31; max_chunks must stay >= 1
 _LOG2_PLATFORM_BITS :: intrinsics.constant_log2(PLATFORM_BITS)
 
-CHUNK_CAP :: proc "contextless" (chunk_size: int, chunk_index: int) -> int { return chunk_size << uint(chunk_index) }
-CHUNK_START :: proc "contextless" (chunk_size: int, chunk_index: int) -> int { return CHUNK_CAP(chunk_size, chunk_index) - chunk_size }
-CHUNK_BITMASK_COUNT :: proc "contextless" (chunk_size: int, chunk_index: int) -> int { return chunk_size << uint(chunk_index) >> _LOG2_PLATFORM_BITS }
+NO_PARTIAL :: max(int) // No chunk currently has a free slot.
+
+CHUNK_CAP           :: #force_inline proc "contextless"  (first_chunk_size: int, chunk_index: int) -> int { return first_chunk_size << uint(chunk_index) }
+CHUNK_START         :: #force_inline proc "contextless"  (first_chunk_size: int, chunk_index: int) -> int { return CHUNK_CAP(first_chunk_size, chunk_index) - first_chunk_size }
+CHUNK_BITMASK_COUNT :: #force_inline proc "contextless"  (first_chunk_size: int, chunk_index: int) -> int { return first_chunk_size << uint(chunk_index) >> _LOG2_PLATFORM_BITS }
 
 Entity :: struct {
     handle:       Entity_Handle, // this
@@ -38,8 +41,6 @@ Entity :: struct {
     prev_scale:   [3]f32,
 }
 
-NIL_ENTITY_HANDLE :: Entity_Handle {}
-
 Entity_Flag  :: enum u32 {
     Interpolate,
     Has_Mesh,
@@ -51,40 +52,32 @@ Entity_Handle :: struct {
     gen:         ENTITY_GENERATION,
     variant:     ENTITY_VARIANT,
 }
+NIL_ENTITY_HANDLE :: Entity_Handle {}
 
-// A contiguous run of slots. Chunks are never moved or freed while the
-// container is alive, so &entities[i] stays valid for the element's lifetime.
-//
-// Occupancy is tracked with a bitmap owned by the container
 Entity_Chunk :: struct {
-    entities:  [^]Entity, // count base entities
-    variants:  [^]byte,   // count * Entity_Data.elem_size specialization bytes
-    occupied:  [^]u64,    // bitmesh: i set => slot i is live
-    free_hint: int,       // first word that may contain a free bit
-    live:      int,       // number of live slots
+    entities:  [^]Entity,     // count * entities
+    variants:  [^]byte,       // count * size_t specialization bytes
+    occupied:  [^]Bit_Mask64, // bitmask: bit i set => slot i is live
+    free_hint: int,           // first occupied index that may contain a free bit
+    live:      int,           // number of live entities in this chunk
 }
 
 // One container per registered entity type. Slot 0 is a reserved sentinel.
-//
-// Storage is a chunked array: chunk k holds `chunk_size << k` slots and lives
-// at a fixed address for the container's lifetime. The base Entity array is
-// typed; the specialization data is type-erased bytes with a runtime stride.
 Entity_Data :: struct {
-    elem_size:  int,
-    flags:      Entity_Flags,
-    chunk_size: int, // power of two, >= 64
-    chunk_shift:int, 
+    chunks:           [dynamic]Entity_Chunk,
+    first_chunk_size: int, // power of two, >= 64;
 
-    chunks:     [dynamic]Entity_Chunk,
-
-    len:        int, // high-water slot count (includes sentinel)
-    cap:        int, // total allocated slots
-    partial:    int, // lowest chunk index that has free slots; -1 = none
+    top:              int, // high-water slot count (includes sentinel)
+                           // not necessarily the same as the number of entities
+    cap:              int, // total allocated slots
+    partial:          int, // lowest chunk index with free slots; NO_PARTIAL = none
 }
 
 Entity_Manager :: struct
 {
     types:         [dynamic]typeid,
+    type_sizes:    [dynamic]int,
+    flags:         [dynamic]Entity_Flags,
     variants:      [dynamic]Entity_Data,
 
     root_data:     Entity,
@@ -94,44 +87,31 @@ Entity_Manager :: struct
     allocator:     runtime.Allocator,
 }
 
-// ============================================================================
-// Container internals
-// ============================================================================
 
-// Maps a global index to (chunk index, offset within chunk)
-@(private="file")
-_data_chunk_for :: proc "contextless" (data: ^Entity_Data, index: int) -> (ci: int, off: int) #no_bounds_check {
-    j := u64(index) + u64(data.chunk_size)
-    e := u64(63) - u64(intrinsics.count_leading_zeros(j))
-    p := u64(1) << uint(e)
-    ci  = int(e) - data.chunk_shift
-    off = int(j - p)
+// Global index => chunk index + offset into chunk.
+_data_chunk_for :: proc "contextless" (
+    data: ^Entity_Data,
+    index: int
+) -> (ci: int, off: int) #no_bounds_check {
+    j := index + data.first_chunk_size
+    e := 63 - intrinsics.count_leading_zeros(j)
+    p := 1 << uint(e)
+    ci  = e - intrinsics.count_trailing_zeros(data.first_chunk_size)
+    off = j - p
     return
 }
 
-// Slot accessors so callers (e.g. the renderer) don't reach into chunks.
-// `index` must be < data.len.
-entity_data_entity :: proc "contextless" (data: ^Entity_Data, index: int) -> ^Entity #no_bounds_check {
-    ci, off := _data_chunk_for(data, index)
-    return &data.chunks[ci].entities[off]
-}
-
-entity_data_variant :: proc "contextless" (data: ^Entity_Data, index: int) -> rawptr #no_bounds_check {
-    ci, off := _data_chunk_for(data, index)
-    c := &data.chunks[ci]
-    return rawptr(uintptr(c.variants) + uintptr(off * data.elem_size))
-}
-
 // Validates a handle against its container and returns the container plus the
-// chunk/offset it maps to. Shared by entity_get, entity_get_typed and
-// entity_remove so the validation lives in one place.
-@(private="file")
-_data_resolve :: proc "contextless" (manager: ^Entity_Manager, handle: Entity_Handle) -> (data: ^Entity_Data, ci: int, off: int, ok: bool) #no_bounds_check {
+// chunk + offset it maps to.
+_data_resolve :: proc "contextless" (
+    manager: ^Entity_Manager,
+    handle: Entity_Handle
+) -> (data: ^Entity_Data, ci: int, off: int, ok: bool) #no_bounds_check {
     if handle.index == 0 || handle.gen == 0 { return nil, 0, 0, false }
     if handle.variant >= ENTITY_VARIANT(len(manager.variants)) { return nil, 0, 0, false }
 
     data = &manager.variants[handle.variant]
-    if handle.index >= ENTITY_INDEX(data.len) { return nil, 0, 0, false }
+    if u64(handle.index) >= u64(data.top) { return nil, 0, 0, false }
 
     ci, off = _data_chunk_for(data, int(handle.index))
     slot := &data.chunks[ci].entities[off]
@@ -140,19 +120,15 @@ _data_resolve :: proc "contextless" (manager: ^Entity_Manager, handle: Entity_Ha
     return data, ci, off, true
 }
 
-@(private="file")
 _chunk_free_slot :: proc "contextless" (c: ^Entity_Chunk, off: int) #no_bounds_check {
     w := off >> _LOG2_PLATFORM_BITS
-    c.occupied[w] &~= u64(1) << uint(off & 63)
+    mask64_clear_one(&c.occupied[w], off & 63)
     c.live -= 1
     if w < c.free_hint {
         c.free_hint = w
     }
 }
 
-// ============================================================================
-// Manager
-// ============================================================================
 
 entity_manager_init :: proc(
     manager: ^Entity_Manager,
@@ -167,8 +143,10 @@ entity_manager_init :: proc(
     manager.allocator  = allocator
 
     INITIAL_CAPACITY :: 16
-    manager.variants = make([dynamic]Entity_Data, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
-    manager.types    = make([dynamic]typeid, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
+    manager.variants   = make([dynamic]Entity_Data, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
+    manager.types      = make([dynamic]typeid, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
+    manager.type_sizes = make([dynamic]int, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
+    manager.flags      = make([dynamic]Entity_Flags, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
 
     manager.root_data = Entity {
         parent       = NIL_ENTITY_HANDLE,
@@ -188,7 +166,7 @@ entity_manager_init :: proc(
 }
 
 entity_manager_add_variant :: proc(manager: ^Entity_Manager, $T: typeid, $SHIFT: uint, flags: Entity_Flags = {})
-    where intrinsics.type_is_struct(T) && SHIFT >= 6 && SHIFT <= MAX_SHIFT
+    where intrinsics.type_is_struct(T) && SHIFT >= 6 /* SHIFT = 6 => 64 slots the minimum we use */  && SHIFT <= MAX_SHIFT
 {
     assert(manager.is_init)
 
@@ -202,6 +180,7 @@ entity_manager_add_variant :: proc(manager: ^Entity_Manager, $T: typeid, $SHIFT:
     size := 1 << SHIFT
 
     // First field of T must be a ^Entity back-pointer to its base slot.
+    // Currently only 1 level deep check
     {
         ti  := runtime.type_info_core(type_info_of(T))^
         sti, ok := ti.variant.(runtime.Type_Info_Struct)
@@ -215,12 +194,11 @@ entity_manager_add_variant :: proc(manager: ^Entity_Manager, $T: typeid, $SHIFT:
     }
 
     append(&manager.types, T)
+    append(&manager.flags, flags)
+    append(&manager.type_sizes, size_of(T))
     append(&manager.variants, Entity_Data {
-        elem_size   = size_of(T),
-        flags       = flags,
-        chunk_size  = size,
-        chunk_shift = int(SHIFT),
-        partial     = -1,
+        first_chunk_size = int(size),
+        partial          = NO_PARTIAL,
     })
 
     // Reserve slot 0 as the nil sentinel.
@@ -231,21 +209,21 @@ entity_manager_add_variant :: proc(manager: ^Entity_Manager, $T: typeid, $SHIFT:
 
 entity_manager_destroy :: proc(
     manager: ^Entity_Manager,
-    allocator := context.allocator,
 ) {
     if manager == nil { return }
 
-    for &data in manager.variants {
+    for &data, i in manager.variants {
         for &chunk, k in data.chunks {
-            count := CHUNK_CAP(data.chunk_size, k)
+            count := CHUNK_CAP(data.first_chunk_size, k)
             if chunk.entities != nil {
                 mem.delete_slice(chunk.entities[:count], manager.allocator)
             }
             if chunk.variants != nil {
-                mem.delete_slice(([^]byte)(chunk.variants)[:count * data.elem_size], manager.allocator)
+                size_t := manager.type_sizes[i]
+                mem.delete_slice(([^]byte)(chunk.variants)[:count * size_t], manager.allocator)
             }
             if chunk.occupied != nil {
-                mem.delete_slice(chunk.occupied[:CHUNK_BITMASK_COUNT(data.chunk_size, k)], manager.allocator)
+                mem.delete_slice(chunk.occupied[:CHUNK_BITMASK_COUNT(data.first_chunk_size, k)], manager.allocator)
             }
         }
         delete(data.chunks)
@@ -253,7 +231,11 @@ entity_manager_destroy :: proc(
 
     delete(manager.variants)
     delete(manager.types)
-    mem.free(rawptr(manager), allocator)
+    delete(manager.type_sizes)
+    delete(manager.flags)
+    mem.free(rawptr(manager), manager.allocator)
+
+    manager^ = {}
 }
 
 @(require_results)
@@ -269,19 +251,27 @@ entity_add :: proc (
 
     data := &manager.variants[variant_idx]
 
-    if data.partial < 0 {
-        idx   := len(data.chunks)
-        cap   := CHUNK_CAP(data.chunk_size, idx)
-        masks := CHUNK_BITMASK_COUNT(data.chunk_size, idx)
+    if data.partial == NO_PARTIAL {
+        // Index space is bounded by ENTITY_INDEX, so the highest usable chunk
+        // index is ENTITY_INDEX_BITS - 1 - log2(first_chunk_size).
+        max_chunks := ENTITY_INDEX_BITS - intrinsics.count_trailing_zeros(data.first_chunk_size)
+        if len(data.chunks) >= max_chunks {
+            panic("entity_add: max chunk count reached; entity index space exhausted")
+        }
 
+        idx   := len(data.chunks)
+        cap   := CHUNK_CAP(data.first_chunk_size, idx)
+        masks := CHUNK_BITMASK_COUNT(data.first_chunk_size, idx)
+        size_t := manager.type_sizes[variant_idx]
+        
         e_buf, _ := runtime.make_aligned([]Entity, cap, alignment=4096, allocator=manager.allocator)
-        v_buf, _ := runtime.make_aligned([]byte, cap * data.elem_size, alignment=4096, allocator=manager.allocator)
-        o_buf, _ := runtime.make_aligned([]u64, masks, alignment=4096, allocator=manager.allocator)
+        v_buf, _ := runtime.make_aligned([]byte, cap * size_t, alignment=4096, allocator=manager.allocator)
+        o_buf, _ := runtime.make_aligned([]Bit_Mask64, masks, alignment=4096, allocator=manager.allocator)
         assert(e_buf != nil && v_buf != nil && o_buf != nil, "_data_append_chunk: allocation failed")
 
         intrinsics.mem_zero(raw_data(e_buf), cap * size_of(Entity))
-        intrinsics.mem_zero(raw_data(v_buf), cap * data.elem_size)
-        intrinsics.mem_zero(raw_data(o_buf), masks * size_of(u64))
+        intrinsics.mem_zero(raw_data(v_buf), cap * size_t)
+        intrinsics.mem_zero(raw_data(o_buf), masks * size_of(Bit_Mask64))
 
         append(&data.chunks, Entity_Chunk {
             entities  = raw_data(e_buf),
@@ -298,49 +288,49 @@ entity_add :: proc (
     ci := data.partial
     c  := &data.chunks[ci]
     
-    index_within_chunk := -1
-    for c.free_hint < CHUNK_BITMASK_COUNT(data.chunk_size, ci) {
+    index_within_chunk := 0
+    found_slot := false
+    for c.free_hint < CHUNK_BITMASK_COUNT(data.first_chunk_size, ci) {
         w := c.free_hint
-        word := c.occupied[w]
-        if word == ~u64(0) { // Skip full mask
+        bit, ok := mask64_first_zero(c.occupied[w])
+        if !ok { // Skip full word
             c.free_hint += 1
             continue
         }
-        bit := int(intrinsics.count_trailing_zeros(~word))
-        c.occupied[w] |= u64(1) << uint(bit)
+        mask64_set_one(&c.occupied[w], bit)
         c.live += 1
-        if c.occupied[w] == ~u64(0) {
-            c.free_hint += 1
-        }
         index_within_chunk = w * 64 + bit
+        found_slot = true
         break
     }
 
-    assert(index_within_chunk >= 0, "entity_add: partial chunk had no free slot")
-    index := CHUNK_START(data.chunk_size, ci) + index_within_chunk
+    assert(found_slot, "entity_add: partial chunk had no free slot")
+    index := CHUNK_START(data.first_chunk_size, ci) + index_within_chunk
 
-    if c.live == data.chunk_size << uint(ci) {
+    if c.live == CHUNK_CAP(data.first_chunk_size, ci) {
         // Chunk is full; advance to the next chunk that still has holes.
-        data.partial = -1
+        // reset partial incase all currently allocated chunks are full
+        data.partial = NO_PARTIAL
         for j := ci + 1; j < len(data.chunks); j += 1 {
-            if data.chunks[j].live < data.chunk_size << uint(j) {
+            if data.chunks[j].live < CHUNK_CAP(data.first_chunk_size, j) {
                 data.partial = j
                 break
             }
         }
     }
 
-    if index == data.len {
-        data.len += 1
+    if index == data.top {
+        data.top += 1
     }
 
     entity_ptr  := &c.entities[index_within_chunk]
-    variant_ptr := rawptr(uintptr(c.variants) + uintptr(index_within_chunk * data.elem_size))
+    size_t := manager.type_sizes[variant_idx]
+    variant_ptr := rawptr(uintptr(c.variants) + uintptr(index_within_chunk * size_t))
 
     prev_gen := entity_ptr.handle.gen
 
     intrinsics.mem_zero(rawptr(entity_ptr), size_of(Entity))
-    intrinsics.mem_zero(variant_ptr, data.elem_size)
+    intrinsics.mem_zero(variant_ptr, size_t)
 
     entity_ptr.handle = {
         index       = ENTITY_INDEX(index),
@@ -391,7 +381,8 @@ entity_get_typed :: proc "contextless" (
     if !ok { return nil, false }
 
     c := &data.chunks[ci]
-    return (^T)(rawptr(uintptr(c.variants) + uintptr(off * data.elem_size))), true
+    size_t := manager.type_sizes[handle.variant]
+    return (^T)(rawptr(uintptr(c.variants) + uintptr(off * size_t))), true
 }
 
 entity_remove :: proc "contextless" (
@@ -412,23 +403,19 @@ entity_remove :: proc "contextless" (
         _unlink_from_circle(manager, handle)
     }
 
-    was_full := c.live == data.chunk_size << uint(ci)
+    was_full := c.live == CHUNK_CAP(data.first_chunk_size, ci)
     _chunk_free_slot(c, off)
 
     slot.handle.gen += 1
     slot.handle.index = 0
 
     // Prefer reusing the earliest chunk that has holes.
-    if was_full && (data.partial == -1 || ci < data.partial) {
+    if was_full && (data.partial == NO_PARTIAL || ci < data.partial) {
         data.partial = ci
     }
 
     return true
 }
-
-// ============================================================================
-// Iterators
-// ============================================================================
 
 Entity_Iterator :: struct {
     manager:     ^Entity_Manager,
@@ -442,7 +429,7 @@ entity_iterator_init :: proc(
     $T: typeid,
 ) -> Entity_Iterator {
     assert_contextless(manager.is_init)
-    variant_idx, found := _linear_search_variant(manager, T)
+    variant_idx, found := slice.linear_search(manager.types[:], T)
     assert_contextless(found, "entity_iterator_init: type not registered")
     return Entity_Iterator {
         manager     = manager,
@@ -451,23 +438,24 @@ entity_iterator_init :: proc(
 }
 
 // Walks chunks linearly and returns both slot views for the current position.
-@(private="file")
 _iter_next_slot :: proc "contextless" (iter: ^Entity_Iterator) -> (entity: ^Entity, variant: rawptr, ok: bool) #no_bounds_check {
     data := &iter.manager.variants[iter.variant_idx]
 
     for iter.chunk_idx < len(data.chunks) {
-        c     := &data.chunks[iter.chunk_idx]
-        count := CHUNK_CAP(data.chunk_size, iter.chunk_idx)
-        start := CHUNK_START(data.chunk_size, iter.chunk_idx)
+        count := CHUNK_CAP(data.first_chunk_size, int(iter.chunk_idx))
+        start := CHUNK_START(data.first_chunk_size, int(iter.chunk_idx))
         for iter.offset < count {
             index := start + iter.offset
             off   := iter.offset
             iter.offset += 1
 
-            if index >= data.len {
+            if index >= data.top {
                 return nil, nil, false
             }
-            return &c.entities[off], rawptr(uintptr(c.variants) + uintptr(off * data.elem_size)), true
+            size_t := iter.manager.type_sizes[iter.variant_idx]
+
+            c := &data.chunks[iter.chunk_idx]
+            return &c.entities[off], rawptr(uintptr(c.variants) + uintptr(off * size_t)), true
         }
         iter.chunk_idx += 1
         iter.offset = 0
@@ -493,11 +481,6 @@ entity_iterator_next :: proc "contextless" (iter: ^Entity_Iterator) -> (^Entity,
     }
 }
 
-// ============================================================================
-// Scene node hierarchy
-// ============================================================================
-
-@(private="file")
 _unlink_from_circle :: proc "contextless" (
     manager: ^Entity_Manager,
     node: Entity_Handle,
@@ -528,7 +511,6 @@ _unlink_from_circle :: proc "contextless" (
     return true
 }
 
-@(private="file")
 _link_after :: proc "contextless" (
     manager: ^Entity_Manager,
     prev, new: Entity_Handle,
@@ -623,24 +605,22 @@ entity_root :: proc(manager: ^Entity_Manager) -> ^Entity {
     return &manager.root_data
 }
 
-// ============================================================================
-// Interpolation
-// ============================================================================
-
 entity_interpolation_snapshot :: proc(manager: ^Entity_Manager) {
     assert_contextless(manager.is_init)
 
     for variant_idx in 0..<len(manager.variants) {
         data := &manager.variants[variant_idx]
-        if .Interpolate not_in data.flags { continue }
+        flags := manager.flags[variant_idx]
+        if .Interpolate not_in flags { continue }
 
-        for slot_idx in 1 ..< data.len {
-            slot := entity_data_entity(data, slot_idx)
-            if slot.handle.index == 0 { continue }
+        for slot_idx in 1 ..< data.top {
+            ci, off := _data_chunk_for(data, slot_idx)
+            slot_ptr := &data.chunks[ci].entities[off]
+            if slot_ptr.handle.index == 0 { continue }
 
-            slot.prev_position = slot.position
-            slot.prev_rotation = slot.rotation
-            slot.prev_scale    = slot.scale
+            slot_ptr.prev_position = slot_ptr.position
+            slot_ptr.prev_rotation = slot_ptr.rotation
+            slot_ptr.prev_scale    = slot_ptr.scale
         }
     }
 }
