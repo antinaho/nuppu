@@ -93,9 +93,10 @@ State :: struct #align(64) {
         render: proc(curr: rawptr, alpha: f32),
     },
 
-    vertex: gpu.Arena,
-    index: gpu.Arena,
+    g_vertex: gpu.Arena,
+    g_index: gpu.Arena,
     frame_uniform: gpu.ptr,
+    frame_uniform_staging: [FRAMES_IN_FLIGHT]gpu.ptr,
 
     draw_batcher: Draw_Batcher,
 
@@ -146,6 +147,12 @@ update_camera :: proc(
     cam.near  = near
     cam.far   = far
     cam.fovy  = fovy
+}
+
+// Registers an entity variant with the global entity manager. Must be called
+// before register_drawable for that type.
+register_entity :: proc($T: typeid, $SHIFT: uint, flags: Entity_Flags = {}) {
+    entity_manager_add_variant(_state.entity_manager, T, SHIFT, flags=flags)
 }
 
 _state: ^State
@@ -279,28 +286,17 @@ update_constants :: proc() {
     cam, ok := entity_get_typed(_state.entity_manager, _state.main_camera, Camera)
     if !ok { return }
 
-    staging, ok2 := gpu.malloc(
-        size_of(Engine_Uniform), align_of(Engine_Uniform),
-        .Staging, "Frame Uniform Staging",
-    )
-    if !ok2 {
-        log.error("update_constants: failed to allocate staging buffer")
-        return
-    }
-    defer gpu.release_ptr(&staging)
-
+    staging := &_state.frame_uniform_staging[_state.frame_n % FRAMES_IN_FLIGHT]
     uniforms := (^Engine_Uniform)(staging.cpu)
     uniforms.cam_perspective_transform = glm.mat4Perspective(
         glm.radians_f32(cam.fovy), cam.aspect_ratio, cam.near, cam.far,
     )
     uniforms.cam_ortho_transform = 1
     uniforms.cam_world_transform  = glm.mat4Translate(-cam.position)  // identity entity-world; just the camera shift
-    uniforms.cam_view_transform   = glm.mat4Translate(-cam.position)
     uniforms.cam_position        = cam.position
-    uniforms._pad                = 0
 
-    gpu.unmap(&staging)
-    gpu.copy(_state.frame_uniform, staging)
+    gpu.unmap(staging)
+    gpu.copy(_state.frame_uniform, staging^)
     gpu.barrier(.Transfer, .All)
 }
 
@@ -507,10 +503,13 @@ _ready_up :: proc() {
     VERTEX_BLOB_SIZE :: 16 * mem.Megabyte
     GLOBAL_INDEX_COUNT_MAX :: 1 << 16
 
-    _state.vertex, _ = gpu.arena_init(VERTEX_BLOB_SIZE, flags = .Default)
-    _state.index, _ = gpu.arena_init(size_of(Vertex_Index) * GLOBAL_INDEX_COUNT_MAX, flags = .Index)
+    _state.g_vertex, _ = gpu.arena_init(VERTEX_BLOB_SIZE, flags = .Default)
+    _state.g_index, _ = gpu.arena_init(size_of(Vertex_Index) * GLOBAL_INDEX_COUNT_MAX, flags = .Index)
 
     _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), align_of(Engine_Uniform), .Constant, "Frame Uniform")
+    for i in 0 ..< FRAMES_IN_FLIGHT {
+        _state.frame_uniform_staging[i], _ = gpu.malloc(size_of(Engine_Uniform), align_of(Engine_Uniform), .Staging, "Frame Uniform Staging")
+    }
 
     _state.sampler = gpu.sampler_init({
         mag_filter = .Nearest,
@@ -557,17 +556,10 @@ _ready_up :: proc() {
 
     init_draw_batcher(&_state.draw_batcher)
     
-    draw_batcher_add_variant(&_state.draw_batcher, Sprite_Instance)
-    draw_batcher_add_mesh(&_state.draw_batcher, _state.built_in_meshes[.Quad])
-    draw_batcher_add_variant(&_state.draw_batcher, Mesh_Instance)
-    draw_batcher_add_mesh(&_state.draw_batcher, _state.built_in_meshes[.Cube])
-    
-    init_draw_batcher_buffers(&_state.draw_batcher)
-
     _state.built_in_block = gpu.Parameter_Block {
         constants = { 0 = _state.frame_uniform },
         read_resources = {
-            0 = _state.vertex.ptr,
+            0 = _state.g_vertex.ptr,
             1 = _state.draw_batcher.instance_base_buffer,
             2 = _state.draw_batcher.instance_data_buffer,
             3 = texture_array^,
@@ -577,14 +569,6 @@ _ready_up :: proc() {
     }
 
     _state.initialized = true
-}
-
-global_frame_uniform :: proc() -> gpu.ptr {
-    return _state.frame_uniform
-}
-
-global_index_buffer :: proc() -> gpu.ptr {
-    return _state.index.ptr
 }
 
 ///////////////////////////////////////////////////////////////

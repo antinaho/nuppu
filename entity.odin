@@ -32,7 +32,6 @@ Entity :: struct {
     prev_sibling: Entity_Handle,
 
     mesh:         Mesh_Handle,
-    material_idx: u16,
 
     position:     [3]f32,
     prev_position:[3]f32,
@@ -447,16 +446,18 @@ _iter_next_slot :: proc "contextless" (iter: ^Entity_Iterator) -> (entity: ^Enti
         start := CHUNK_START(data.first_chunk_size, int(iter.chunk_idx))
         for iter.offset < count {
             index := start + iter.offset
-            off   := iter.offset
-            iter.offset += 1
+            defer iter.offset += 1
 
             if index >= data.top {
                 return nil, nil, false
             }
-            size_t := iter.manager.type_sizes[iter.variant_idx]
-
+            
             c := &data.chunks[iter.chunk_idx]
-            return &c.entities[off], rawptr(uintptr(c.variants) + uintptr(off * size_t)), true
+            ent := &c.entities[iter.offset]
+            if ent.handle.index == 0 { continue }
+            
+            size_t := iter.manager.type_sizes[iter.variant_idx]
+            return ent, rawptr(uintptr(c.variants) + uintptr(iter.offset * size_t)), true
         }
         iter.chunk_idx += 1
         iter.offset = 0
@@ -480,6 +481,15 @@ entity_iterator_next :: proc "contextless" (iter: ^Entity_Iterator) -> (^Entity,
         if entity.handle.index == 0 { continue }
         return entity, entity.handle, true
     }
+}
+
+// Global-manager convenience wrappers.
+entities_of :: proc($T: typeid) -> Entity_Iterator {
+    return entity_iterator_init(_state.entity_manager, T)
+}
+
+advance_entities_of :: proc(iter: ^Entity_Iterator) -> (^Entity, Entity_Handle, bool) {
+    return entity_iterator_next(iter)
 }
 
 _unlink_from_circle :: proc "contextless" (
