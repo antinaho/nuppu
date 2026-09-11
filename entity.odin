@@ -7,10 +7,11 @@ import "core:log"
 import "core:slice"
 
 ENTITY_INDEX      :: u32
-ENTITY_INDEX_BITS :: 8*size_of(ENTITY_INDEX)
 ENTITY_GENERATION :: u16
 ENTITY_VARIANT    :: u16
+
 ROOT_VARIANT_IDX  :: max(ENTITY_VARIANT)
+ENTITY_INDEX_BITS :: 8*size_of(ENTITY_INDEX)
 
 PLATFORM_BITS :: 8*size_of(uint)
 MAX_SHIFT :: (PLATFORM_BITS>>1) - 1 // 31; max_chunks must stay >= 1
