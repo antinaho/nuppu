@@ -1,25 +1,28 @@
+#+vet unused shadowing using-param style semicolon cast explicit-allocators
+
 /*
 TODO:
+
 Guard material_to_handle with debug flag
+
 */
 
 package nuppu
 
+#assert(CONFIG.max_materials <= MATERIAL_INDEX_MASK, "CONFIG.max_materials must be <= MATERIAL_INDEX_MASK")
+
 import "base:intrinsics"
 import "base:runtime"
-import "core:mem"
 import "core:log"
 import "gpu"
 
+_ :: log
+
 Material_Handle           :: distinct u16
 
-MATERIAL_INDEX_MASK       :: (1 << 14) - 1
-MATERIAL_EMBED_BIT        ::  1 << 14
-MATERIAL_BASE_BIT         ::  1 << 15
-
-MAX_MATERIALS             :: 512 // Bump if need more
-#assert(MAX_MATERIALS <= MATERIAL_INDEX_MASK)
-MATERIAL_PARAM_BYTES      :: 1 * mem.Megabyte
+MATERIAL_NIL              :: Material_Handle(0)
+MATERIAL_INDEX_MASK       :: (1 << 15) - 1
+MATERIAL_EMBED_BIT        ::  1 << 15
 
 MATERIAL_EMBED_DATA_BYTES :: 6
 
@@ -36,61 +39,73 @@ Material_Library :: struct {
     parameter_buffer    : gpu.Arena, // [MATERIAL_PARAM_BYTES]u8 variable-size params
     
     material_to_pipeline: map[Material_Handle]typeid,
+    material_types      : [dynamic]typeid, // indexed by material handle (validation)
     count               : int,
-    material_to_handle  : map[typeid][dynamic]Material_Handle, // Only for validation, on keep in debug
 
     allocator           : runtime.Allocator,
     is_init             : bool,
 }
 
-register_material :: proc(data: $M, is_embed: bool = false) -> (Material_Handle, bool) {
-    data := data
-    return _register_material(_state.material_library, &data, is_embed, false)
+
+@(require_results)
+material_register :: proc(data: ^$M, is_embed: bool = false, loc := #caller_location) -> (Material_Handle, bool) #optional_ok {
+    return _material_register(&_state.material_library, data, is_embed, loc)
 }
 
-_init_material_library :: proc(lib: ^Material_Library, allocator := context.allocator) {
+material_update :: proc(handle: Material_Handle, values: ^$M, loc := #caller_location) {
+    _material_update(&_state.material_library, handle, values, loc)
+}
+
+
+_material_lib_init :: proc(lib: ^Material_Library, allocator := context.allocator) {
     if lib.is_init { return }
     lib.is_init = true
     lib.allocator = allocator
 
     lib.material_buffer, _ = gpu.malloc(
-        u32(MAX_MATERIALS * size_of(GPU_Material)),
+        u32(CONFIG.max_materials * size_of(GPU_Material)),
         u32(align_of(GPU_Material)), .Staging, "Material Buffer",
     )
     assert(lib.material_buffer.cpu != nil, "init_material_library: failed to alloc material buffer")
 
-    lib.parameter_buffer, _ = gpu.arena_init(MATERIAL_PARAM_BYTES, 16, flags=.Staging)
+    lib.parameter_buffer, _ = gpu.arena_init(CONFIG.material_param_bytes, 16, flags=.Staging)
     assert(lib.parameter_buffer.cpu != nil, "init_material_library: failed to alloc parameter buffer")
 
     lib.material_to_pipeline = make(map[Material_Handle]typeid, 64, allocator = allocator)
-    lib.material_to_handle   = make(map[typeid][dynamic]Material_Handle, 64, allocator = allocator)
+    lib.material_types       = make([dynamic]typeid, 0, 64, allocator)
     lib.count = 1
 }
 
-_register_material :: proc(lib: ^Material_Library, data: ^$M, is_embed, is_base: bool) -> (Material_Handle, bool) {
+_material_lib_deinit :: proc(lib: ^Material_Library) {
+    gpu.release_ptr(&lib.material_buffer)
+    gpu.release_ptr(&lib.parameter_buffer.ptr)
+    delete(lib.material_to_pipeline)
+    delete(lib.material_types)
+    lib^ = {}
+}
+
+_material_register :: proc(lib: ^Material_Library, data: ^$M, is_embed: bool, loc := #caller_location) -> (Material_Handle, bool) {
     assert(lib.is_init)
 
-    if lib.count >= MAX_MATERIALS {
-        log.error("add_material: material library is full")
+    if lib.count >= CONFIG.max_materials {
+        log.error("add_material: material library is full", location = loc)
         return 0, false
-    }
-
-    if M not_in lib.material_to_handle {
-        lib.material_to_handle[M] = make([dynamic]Material_Handle, allocator = lib.allocator)
     }
 
     handle := Material_Handle(lib.count)
     
     if is_embed {
-        assert(size_of(M) <= MATERIAL_EMBED_DATA_BYTES, "register_material: embed data size is too large")
+        if size_of(M) > MATERIAL_EMBED_DATA_BYTES {
+            log.error("register_material: embed data size is too large", location = loc)
+            return MATERIAL_NIL, false
+        }
         handle |= MATERIAL_EMBED_BIT
-    }
-    if is_base {
-        handle |= MATERIAL_BASE_BIT
     }
     
     mat := &([^]GPU_Material)(rawptr(lib.material_buffer.cpu))[lib.count]
     mat.handle = handle
+    mat.user_data_1 = 0
+    mat.user_data_2 = 0
 
     size_t := size_of(M)
     if size_t <= MATERIAL_EMBED_DATA_BYTES && is_embed {
@@ -104,32 +119,23 @@ _register_material :: proc(lib: ^Material_Library, data: ^$M, is_embed, is_base:
 
     lib.count += 1
     lib.material_to_pipeline[handle] = {}
-    
-    list := &lib.material_to_handle[M]
-    append(list, handle)
+    append(&lib.material_types, M)
 
     return handle, true
 }
 
-// Rewrites an existing material instance's params in place.
-_update_material :: proc(lib: ^Material_Library, handle: Material_Handle, values: ^$M) {
-    assert(lib.is_init)
-    assert(handle != 0, "update_material: invalid material handle")
-    assert(_unpack_handle(handle) < Material_Handle(lib.count), "update_material: invalid material handle")
-    assert(M in lib.material_to_handle)
-    
-    found: bool
-    for h in lib.material_to_handle[M] {
-        if h == handle {
-            found = true
-            break
-        }
-    }
-    assert(found, "update_material: material isnt registered with this handle")
+_material_update :: proc(lib: ^Material_Library, handle: Material_Handle, values: ^$M, loc := #caller_location) {
+    assert(lib.is_init, loc = loc)
+    assert(handle != MATERIAL_NIL, "update_material: invalid material handle", loc = loc)
+    assert(_material_handle_unpack(handle) < Material_Handle(lib.count), "update_material: invalid material handle", loc = loc)
+    assert(lib.material_types[_material_handle_unpack(handle)] == M, "update_material: params do not match material type", loc = loc)
 
-    mat := &([^]GPU_Material)(rawptr(lib.material_buffer.cpu))[_unpack_handle(handle)]
+    mat := &([^]GPU_Material)(rawptr(lib.material_buffer.cpu))[_material_handle_unpack(handle)]
     if (mat.handle & MATERIAL_EMBED_BIT) != 0 {
-        assert(size_of(M) <= MATERIAL_EMBED_DATA_BYTES, "update_material: embed data size is too large")
+        if size_of(M) > MATERIAL_EMBED_DATA_BYTES {
+            log.error("update_material: embed data size is too large", loc = loc)
+            return
+        }
         intrinsics.mem_copy(&mat.user_data_1, values, size_of(M))
     } else {
         params_ptr := rawptr(uintptr(lib.parameter_buffer.cpu) + uintptr(mat.user_data_2))
@@ -137,6 +143,6 @@ _update_material :: proc(lib: ^Material_Library, handle: Material_Handle, values
     }
 }
 
-_unpack_handle :: proc(handle: Material_Handle) -> Material_Handle {
+_material_handle_unpack :: proc(handle: Material_Handle) -> Material_Handle {
     return handle & MATERIAL_INDEX_MASK
 }
