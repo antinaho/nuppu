@@ -32,6 +32,8 @@ Entity :: struct {
     prev_sibling: Entity_Handle,
 
     mesh:         Mesh_Handle,
+    materials:    [CONFIG.entity_max_materials]Material_Handle,
+    entity_id:    u32, // What 'kind' of entity this is
 
     position:     [3]f32,
     prev_position:[3]f32,
@@ -202,7 +204,7 @@ entity_manager_add_variant :: proc(manager: ^Entity_Manager, $T: typeid, $SHIFT:
     })
 
     // Reserve slot 0 as the nil sentinel.
-    nil_entity_handle := entity_add(manager, T)
+    nil_entity_handle := _entity_add(manager, T)
     assert(nil_entity_handle.index == 0)
     assert(nil_entity_handle.gen == 1)
 }
@@ -239,7 +241,16 @@ entity_manager_destroy :: proc(
 }
 
 @(require_results)
-entity_add :: proc (
+entity_add :: proc($T: typeid) -> ^T {
+    handle, ok := _entity_add(_state.entity_manager, T)
+    if !ok { return nil }
+    entity, _ := entity_get_typed(_state.entity_manager, handle, T)
+    return entity
+}
+
+
+@(require_results)
+_entity_add :: proc (
     manager: ^Entity_Manager,
     $T: typeid
 ) -> (Entity_Handle, bool) #optional_ok #no_bounds_check

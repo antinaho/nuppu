@@ -26,31 +26,32 @@ FRAMES_IN_FLIGHT :: 2
 MAX_FRAME_DT_NS :: u64(f64(time.Second) * 0.1)
 MAX_SIM_TICKS :: 5
 
-MAX_MESHES :: 256
 MAX_TEXTURES :: 256
 
 Texture :: gpu.Texture
 Texture_Descriptor :: gpu.Texture_Descriptor
 
-// Handles carry metadata on debug builds
+Handle :: struct($Raw: typeid) {
+    handle:   Raw,
+    metadata: Metadata,
+}
+
+// Debug-only metadata attached to a handle.
 when ODIN_DEBUG {
     Metadata :: struct {
-        created_at: runtime.Source_Code_Location,
+        created_at:       runtime.Source_Code_Location,
         created_on_frame: u64,
+        name:             string,
     }
+} else {
+    Metadata :: struct{}
+}
 
-    Mesh_Handle :: struct {
-        handle: bit_array.Handle,
-        metadata: Metadata,
-    }
-    Mesh_Handle_Nil :: Mesh_Handle{}
+Texture_Handle :: Handle(bit_array.Handle)
+Texture_Handle_Nil :: Texture_Handle{}
 
-    Texture_Handle :: struct {
-        handle: bit_array.Handle,
-        metadata: Metadata,
-    }
-    Texture_Handle_Nil :: Texture_Handle{}
-
+// Handles carry metadata on debug builds
+when ODIN_DEBUG {
     _debug_warned_call_sites: map[u64]bool
 
     debug_warn_hash :: proc(loc: runtime.Source_Code_Location) -> u64 {
@@ -63,12 +64,6 @@ when ODIN_DEBUG {
         return h
     }
 
-} else {
-    Texture_Handle :: struct { handle: bit_array.Handle, }
-    Texture_Handle_Nil :: Texture_Handle{}
-    
-    Mesh_Handle :: struct { handle: bit_array.Handle, }
-    Mesh_Handle_Nil :: Mesh_Handle{}
 }
 
 State :: struct #align(64) {
@@ -93,12 +88,12 @@ State :: struct #align(64) {
         render: proc(curr: rawptr, alpha: f32),
     },
 
-    g_vertex: gpu.Arena,
-    g_index: gpu.Arena,
+    mesh_library: Mesh_Library,
     frame_uniform: gpu.ptr,
     frame_uniform_staging: [FRAMES_IN_FLIGHT]gpu.ptr,
 
     draw_batcher: Draw_Batcher,
+    material_library: Material_Library,
 
     sampler: gpu.Sampler,
 
@@ -110,8 +105,8 @@ State :: struct #align(64) {
     built_in_block: gpu.Parameter_Block,
 
     //
-    meshes: bit_array.Bit_Array(Resource(Mesh), MAX_MESHES, Mesh_Handle),
-    built_in_meshes: [Built_in_mesh]Mesh_Handle,
+    
+
 
     textures: bit_array.Bit_Array(Resource(Texture), MAX_TEXTURES, Texture_Handle),
     built_in_textures: [Built_in_texture]Texture_Handle,
@@ -487,7 +482,7 @@ _ready_up :: proc() {
     // Camera
     {
         entity_manager_add_variant(_state.entity_manager, Camera, 6, flags = {.Interpolate})
-        camera_handle := entity_add(_state.entity_manager, Camera) 
+        camera_handle := _entity_add(_state.entity_manager, Camera) 
         camera := entity_get_typed(_state.entity_manager, camera_handle, Camera)
 
         camera.scale = {1, 1, 1}
@@ -499,12 +494,7 @@ _ready_up :: proc() {
         _state.main_camera = camera.handle
     }
 
-    // Global buffers wrapped in arena
-    VERTEX_BLOB_SIZE :: 16 * mem.Megabyte
-    GLOBAL_INDEX_COUNT_MAX :: 1 << 16
-
-    _state.g_vertex, _ = gpu.arena_init(VERTEX_BLOB_SIZE, flags = .Default)
-    _state.g_index, _ = gpu.arena_init(size_of(Vertex_Index) * GLOBAL_INDEX_COUNT_MAX, flags = .Index)
+    mesh_library_init(&_state.mesh_library)
 
     _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), align_of(Engine_Uniform), .Constant, "Frame Uniform")
     for i in 0 ..< FRAMES_IN_FLIGHT {
@@ -551,18 +541,18 @@ _ready_up :: proc() {
         image.destroy(img, context.temp_allocator)
     }
 
-    bit_array.init(&_state.meshes)
-    create_built_in_meshes()
 
     init_draw_batcher(&_state.draw_batcher)
+    _material_lib_init(&_state.material_library)
     
     _state.built_in_block = gpu.Parameter_Block {
         constants = { 0 = _state.frame_uniform },
         read_resources = {
-            0 = _state.g_vertex.ptr,
+            0 = _state.mesh_library.vertex_arena.ptr,
             1 = _state.draw_batcher.instance_base_buffer,
-            2 = _state.draw_batcher.instance_data_buffer,
-            3 = texture_array^,
+            2 = _state.material_library.material_buffer,
+            3 = _state.material_library.parameter_buffer.ptr,
+            4 = texture_array^,
         },
         read_write_resources = {},
         samplers = { 0 = _state.sampler },

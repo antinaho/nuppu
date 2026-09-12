@@ -30,8 +30,8 @@ when !ODIN_DEBUG {
     #assert(size_of(Material_Handle) == size_of(u16))
 }
 
-#assert(size_of(GPU_Material) == 8)
-GPU_Material :: struct #align(8) {
+#assert(size_of(GPU_Material_Instance) == 8)
+GPU_Material_Instance :: struct #align(8) {
     handle     : u16, // raw index | embed flag
     user_data_1: u16,
     user_data_2: u32, // inline user data, or byte offset into the parameter buffer
@@ -66,8 +66,8 @@ _material_lib_init :: proc(lib: ^Material_Library, allocator := context.allocato
     lib.allocator = allocator
 
     lib.material_buffer, _ = gpu.malloc(
-        u32(CONFIG.max_materials * size_of(GPU_Material)),
-        u32(align_of(GPU_Material)), .Staging, "Material Buffer",
+        u32(CONFIG.max_materials * size_of(GPU_Material_Instance)),
+        u32(align_of(GPU_Material_Instance)), .Staging, "Material Buffer",
     )
     assert(lib.material_buffer.cpu != nil, "material_lib_init: failed to alloc material buffer")
 
@@ -109,7 +109,7 @@ _material_register :: proc(lib: ^Material_Library, data: ^$M, name: string, is_e
         raw |= MATERIAL_EMBED_BIT
     }
 
-    mat := &([^]GPU_Material)(rawptr(lib.material_buffer.cpu))[lib.top]
+    mat := &([^]GPU_Material_Instance)(rawptr(lib.material_buffer.cpu))[lib.top]
     mat.handle = raw
     mat.user_data_1 = 0
     mat.user_data_2 = 0
@@ -146,7 +146,7 @@ _material_update :: proc(lib: ^Material_Library, handle: Material_Handle, values
     assert(_material_handle_unpack(handle) < u16(lib.top), "material_update: invalid material handle", loc = loc)
     assert(lib.material_types[_material_handle_unpack(handle)] == M, "material_update: params do not match material type", loc = loc)
 
-    mat := &([^]GPU_Material)(rawptr(lib.material_buffer.cpu))[_material_handle_unpack(handle)]
+    mat := &([^]GPU_Material_Instance)(rawptr(lib.material_buffer.cpu))[_material_handle_unpack(handle)]
     if (mat.handle & MATERIAL_EMBED_BIT) != 0 {
         if size_of(M) > MATERIAL_EMBED_DATA_BYTES {
             log.error("material_update: embed data size is too large", loc = loc)
