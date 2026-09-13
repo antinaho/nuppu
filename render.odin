@@ -5,6 +5,7 @@ import "gpu"
 import "bit_array"
 import "base:intrinsics"
 import "base:runtime"
+import "core:mem"
 import "core:slice"
 import glm "core:math/linalg/glsl"
 import "core:log"
@@ -39,11 +40,21 @@ get_mesh :: proc(handle: Mesh_Handle) -> (^Mesh, bool) #optional_ok {
 Instance :: struct #all_or_none #align(16) {
     position_pack: [4]f32, // xyz = position
     scale_pack:    [4]f32, // xyz = scale
-    rotation_pack: [4]f32, // xyz = rotation
+    rotation_pack: [3]f32, // xyz = rotation
+    data_offset:   u32,    // byte offset into instance_data_buffer; 0 = none
     materials:     [3]u32, // 6 x u16 Material_Handle
     entity_id:     u32,    // user tag the shader switches on
 }
 MAX_INSTANCES_PER_FRAME :: 1 << 16
+
+#assert(CONFIG.max_instance_data_bytes > 0, "CONFIG.max_instance_data_bytes must be > 0")
+#assert(CONFIG.max_instance_data_bytes % 16 == 0, "CONFIG.max_instance_data_bytes must be a multiple of 16")
+#assert(offset_of(Instance, data_offset) == 44, "data_offset must stay at byte 44 to match the shader layout")
+
+// One frame region holds MAX_INSTANCES_PER_FRAME entries plus 16 reserved bytes
+// so byte offset 0 can mean "no instance data".
+INSTANCE_DATA_REGION_SIZE :: MAX_INSTANCES_PER_FRAME * CONFIG.max_instance_data_bytes + 16
+#assert(FRAMES_IN_FLIGHT * INSTANCE_DATA_REGION_SIZE <= int(max(u32)), "instance data buffer exceeds u32 address space")
 
 // ============================================================================
 // Draw batcher
@@ -74,6 +85,12 @@ Draw_Batcher :: struct {
 
     instance_base_buffer: gpu.ptr,
 
+    // Per-frame arena for arbitrary per-entity shader data. `Instance.data_offset`
+    // points into this buffer. Offset 0 is reserved as the nil sentinel.
+    instance_data_buffer:     gpu.ptr,
+    instance_data_cursor:     uint,
+    instance_data_region_end: uint,
+
     allocator: runtime.Allocator,
     is_init:   bool,
 }
@@ -92,9 +109,25 @@ init_draw_batcher :: proc(batcher: ^Draw_Batcher, allocator := context.allocator
     base_ptr, base_ok := gpu.malloc(base_bytes, u32(align_of(Instance)), .Staging, "Instance Base Staging")
     assert(base_ok, "draw_batcher: failed to alloc instance base buffer")
     batcher.instance_base_buffer = base_ptr
+
+    data_bytes := u32(FRAMES_IN_FLIGHT * INSTANCE_DATA_REGION_SIZE)
+    data_ptr, data_ok := gpu.malloc(data_bytes, 16, .Staging, "Instance Data Staging")
+    assert(data_ok, "draw_batcher: failed to alloc instance data buffer")
+    batcher.instance_data_buffer = data_ptr
 }
 
-// Explicit submission path. Uses the global batcher.
+destroy_draw_batcher :: proc(batcher: ^Draw_Batcher) {
+    if !batcher.is_init { return }
+    gpu.release_ptr(&batcher.instance_base_buffer)
+    gpu.release_ptr(&batcher.instance_data_buffer)
+    delete(batcher.submissions)
+    delete(batcher.sorted)
+    delete(batcher.draw_commands)
+    batcher^ = {}
+}
+
+// Explicit submission path. Uses the global batcher. Instances submitted here
+// carry no per-entity data (data_offset stays 0, shaders use their defaults).
 submit_instance :: proc(
     mesh: Mesh_Handle,
     position, scale, rotation: [3]f32,
@@ -114,6 +147,28 @@ submit_instance :: proc(
 batcher_reset :: proc(frame: Frame, batcher: ^Draw_Batcher) {
     clear(&batcher.submissions)
     clear(&batcher.draw_commands)
+
+    // Each frame owns a region of the data arena; the first 16 bytes of every
+    // region are reserved so offset 0 always means "no instance data".
+    f := uint(frame.n % FRAMES_IN_FLIGHT)
+    region_size := uint(INSTANCE_DATA_REGION_SIZE)
+    batcher.instance_data_cursor     = f * region_size + 16
+    batcher.instance_data_region_end = (f + 1) * region_size
+}
+
+// Copies `size` bytes of per-entity data into the current frame's arena region
+// and returns the 16-byte-aligned byte offset. Offset 0 is never returned.
+_push_instance_data :: proc(batcher: ^Draw_Batcher, src: rawptr, size: int) -> u32 {
+    if size <= 0 { return 0 }
+
+    offset := mem.align_forward_uint(batcher.instance_data_cursor, 16)
+    if offset + uint(size) > batcher.instance_data_region_end {
+        panic("draw_batcher: instance data arena overflow")
+    }
+
+    intrinsics.mem_copy(rawptr(uintptr(batcher.instance_data_buffer.cpu) + uintptr(offset)), src, size)
+    batcher.instance_data_cursor = offset + mem.align_forward_uint(uint(size), 16)
+    return u32(offset)
 }
 
 // ----------------------------------------------------------------------------
@@ -129,21 +184,30 @@ _gather_entity_submissions :: proc(batcher: ^Draw_Batcher, em: ^Entity_Manager) 
             variant_idx = ENTITY_VARIANT(v),
         }
 
-        for entity, _ in _iter_next_slot(&iter) {
+        data_offset := em.instance_data_offsets[v]
+        data_size   := em.instance_data_sizes[v]
+
+        for entity, variant in _iter_next_slot(&iter) {
             if entity.mesh.handle == bit_array.NIL_HANDLE { continue }
             if entity.materials[0] == MATERIAL_NIL { 
-                log.warnf("draw_batcher: entity %v has no material in slot 0", entity.entity_id)
+                log.warnf("draw_batcher: entity %v has no material in slot 0", u32(entity.handle.variant))
             }
 
             if len(batcher.submissions) >= MAX_INSTANCES_PER_FRAME {
                 panic("draw_batcher: max instances per frame exceeded")
             }
+            
+            base := make_instance(
+                entity.position, entity.scale, entity.rotation,
+                entity.materials, u32(entity.handle.variant),
+            )
+            if data_size > 0 {
+                src := rawptr(uintptr(variant) + uintptr(data_offset))
+                base.data_offset = _push_instance_data(batcher, src, data_size)
+            }
 
             append(&batcher.submissions, Submission {
-                base = make_instance(
-                    entity.position, entity.scale, entity.rotation,
-                    entity.materials, entity.entity_id,
-                ),
+                base = base,
                 mesh = entity.mesh,
             })
         }
@@ -313,7 +377,8 @@ make_instance :: proc(
     inst := Instance {
         position_pack = {position.x, position.y, position.z, 0},
         scale_pack    = {scale.x,    scale.y,    scale.z,    0},
-        rotation_pack = {rotation.x, rotation.y, rotation.z, 0},
+        rotation_pack = {rotation.x, rotation.y, rotation.z},
+        data_offset   = 0,
         materials     = {},
         entity_id     = entity_id,
     }
