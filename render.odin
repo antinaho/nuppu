@@ -54,7 +54,7 @@ MAX_INSTANCES_PER_FRAME :: 1 << 16
 // One frame region holds MAX_INSTANCES_PER_FRAME entries plus 16 reserved bytes
 // so byte offset 0 can mean "no instance data".
 INSTANCE_DATA_REGION_SIZE :: MAX_INSTANCES_PER_FRAME * CONFIG.max_instance_data_bytes + 16
-#assert(FRAMES_IN_FLIGHT * INSTANCE_DATA_REGION_SIZE <= int(max(u32)), "instance data buffer exceeds u32 address space")
+#assert(u64(FRAMES_IN_FLIGHT * INSTANCE_DATA_REGION_SIZE) <= u64(max(u32)), "instance data buffer exceeds u32 address space")
 
 // ============================================================================
 // Draw batcher
@@ -68,12 +68,16 @@ INSTANCE_DATA_REGION_SIZE :: MAX_INSTANCES_PER_FRAME * CONFIG.max_instance_data_
 // ============================================================================
 
 Submission :: struct {
-    base: Instance,
-    mesh: Mesh_Handle,
+    base:       Instance,
+    mesh:       Mesh_Handle,
+    shader:     Shader_Handle,
+    draw_state: Draw_State,
 }
 
 Draw_Command :: struct {
     mesh:           Mesh_Handle,
+    shader:         Shader_Handle,
+    draw_state:     Draw_State,
     base_instance:  u32, // index into instance_base_buffer
     instance_count: u32,
 }
@@ -138,9 +142,12 @@ submit_instance :: proc(
     if len(batcher.submissions) >= MAX_INSTANCES_PER_FRAME {
         panic("draw_batcher: max instances per frame exceeded")
     }
+    shader, state := material_shader_of(materials[0])
     append(&batcher.submissions, Submission {
-        base = make_instance(position, scale, rotation, materials, entity_id),
-        mesh = mesh,
+        base       = make_instance(position, scale, rotation, materials, entity_id),
+        mesh       = mesh,
+        shader     = shader,
+        draw_state = state,
     })
 }
 
@@ -190,7 +197,7 @@ _gather_entity_submissions :: proc(batcher: ^Draw_Batcher, em: ^Entity_Manager) 
         for entity, variant in _iter_next_slot(&iter) {
             if entity.mesh.handle == bit_array.NIL_HANDLE { continue }
             if entity.materials[0] == MATERIAL_NIL { 
-                log.warnf("draw_batcher: entity %v has no material in slot 0", u32(entity.handle.variant))
+                log.warnf("draw_batcher: entity %v has no material in slot 0", u32(entity.handle.handle.variant))
             }
 
             if len(batcher.submissions) >= MAX_INSTANCES_PER_FRAME {
@@ -199,16 +206,19 @@ _gather_entity_submissions :: proc(batcher: ^Draw_Batcher, em: ^Entity_Manager) 
             
             base := make_instance(
                 entity.position, entity.scale, entity.rotation,
-                entity.materials, u32(entity.handle.variant),
+                entity.materials, u32(entity.handle.handle.variant),
             )
             if data_size > 0 {
                 src := rawptr(uintptr(variant) + uintptr(data_offset))
                 base.data_offset = _push_instance_data(batcher, src, data_size)
             }
 
+            shader, draw_state := material_shader_of(entity.materials[0])
             append(&batcher.submissions, Submission {
-                base = base,
-                mesh = entity.mesh,
+                base       = base,
+                mesh       = entity.mesh,
+                shader     = shader,
+                draw_state = draw_state,
             })
         }
     }
@@ -302,9 +312,24 @@ cull :: proc(frame: Frame) {
 // ----------------------------------------------------------------------------
 
 
+// Sort so draws sharing a shader + dynamic state + mesh are contiguous. This
+// is what makes a material switch a single shader bind.
 _submission_index_less :: proc(a, b: int, user: rawptr) -> bool {
     s := (^Draw_Batcher)(user)
-    return s.submissions[a].mesh.handle < s.submissions[b].mesh.handle
+    sa := s.submissions[a]
+    sb := s.submissions[b]
+
+    if sa.shader.handle != sb.shader.handle {
+        return sa.shader.handle < sb.shader.handle
+    }
+
+    ka := gpu.draw_state_key(sa.draw_state)
+    kb := gpu.draw_state_key(sb.draw_state)
+    if ka != kb {
+        return ka < kb
+    }
+
+    return sa.mesh.handle < sb.mesh.handle
 }
 
 finish_instance_upload :: proc(frame: Frame) {
@@ -328,11 +353,18 @@ finish_instance_upload :: proc(frame: Frame) {
         ([^]Instance)(rawptr(base_region))[i] = s.base
 
         is_last := i == n - 1
-        next_same_mesh := !is_last &&
-            batcher.submissions[batcher.sorted[i+1]].mesh.handle == s.mesh.handle
-        if is_last || !next_same_mesh {
+        same_run := false
+        if !is_last {
+            next := batcher.submissions[batcher.sorted[i+1]]
+            same_run = next.mesh.handle == s.mesh.handle &&
+                next.shader.handle == s.shader.handle &&
+                gpu.draw_state_key(next.draw_state) == gpu.draw_state_key(s.draw_state)
+        }
+        if is_last || !same_run {
             append(&batcher.draw_commands, Draw_Command {
                 mesh           = s.mesh,
+                shader         = s.shader,
+                draw_state     = s.draw_state,
                 base_instance  = u32(f * MAX_INSTANCES_PER_FRAME + run_start),
                 instance_count = u32(i - run_start + 1),
             })
@@ -351,8 +383,15 @@ draw_all_instances :: proc(frame: Frame) {
         if !ok { continue }
         if cmd.instance_count == 0 { continue }
 
-        gpu.draw_indiced_primitives(
-            &_state.built_in_block,
+        shader, shader_ok := get_shader(cmd.shader)
+        if !shader_ok { continue }
+
+        // Both no-op when already bound, so a material switch costs at most a
+        // shader bind + a dynamic-state change.
+        gpu.set_shader(shader)
+        gpu.set_draw_state(cmd.draw_state)
+
+        gpu.draw_indexed(
             _state.mesh_library.index_arena.ptr,
             mesh.index_count,
             mesh.index_base,
