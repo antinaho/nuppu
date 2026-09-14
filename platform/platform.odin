@@ -157,6 +157,10 @@ is_init :: proc() -> bool {
     return _state.is_init
 }
 
+should_close :: proc() -> bool {
+    return _should_close()
+}
+
 native_window :: proc() -> rawptr {
 	return _native_window()
 }
