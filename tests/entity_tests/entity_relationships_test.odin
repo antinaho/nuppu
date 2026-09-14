@@ -5,7 +5,7 @@ import "base:intrinsics"
 import nuppu "../../"
 
 Node :: struct {
-    using e: nuppu.Entity,
+    using e: ^nuppu.Entity,
 }
 
 Test_Node_Union :: union {
@@ -13,17 +13,18 @@ Test_Node_Union :: union {
 }
 
 @(private="file")
-make_node_manager :: proc(capacity: int = 16) -> ^nuppu.Entity_Manager {
+make_node_manager :: proc() -> ^nuppu.Entity_Manager {
     manager, _ := new(nuppu.Entity_Manager)
     nuppu.entity_manager_init(manager)
-    nuppu.entity_manager_add_variant(manager, Node, capacity)
+    nuppu.entity_manager_add_variant(manager, Node, 6)
     return manager
 }
 
 @(private="file")
 make_node :: proc(manager: ^nuppu.Entity_Manager) -> ^Node {
-    node, ok := nuppu.entity_add(manager, Node)
+    handle, ok := nuppu._entity_add(manager, Node)
     if !ok { return nil }
+    node, _ := nuppu.entity_get_typed(manager, handle, Node)
     return node
 }
 
@@ -45,7 +46,7 @@ test_fresh_node_has_no_relations :: proc(t: ^testing.T) {
 }
 
 // ============================================================================
-// parent_add / child_add
+// parent_add / unparent / child_add
 // ============================================================================
 
 @(test)
@@ -148,21 +149,21 @@ test_multiple_children_wrap_at_tail :: proc(t: ^testing.T) {
 }
 
 // ============================================================================
-// parent_remove / child_remove
+// unparent / child_remove
 // ============================================================================
 
 @(test)
-test_remove_parent_root_fails :: proc(t: ^testing.T) {
+test_unparent_at_root_fails :: proc(t: ^testing.T) {
     manager := make_node_manager()
     defer nuppu.entity_manager_destroy(manager)
     node := make_node(manager)
     if node == nil { return }
 
-    testing.expect_value(t, nuppu.parent_remove(manager, node.handle), false)
+    testing.expect_value(t, nuppu.unparent(manager, node.handle), false)
 }
 
 @(test)
-test_remove_parent_clears_handles :: proc(t: ^testing.T) {
+test_unparent_moves_to_root :: proc(t: ^testing.T) {
     manager := make_node_manager()
     defer nuppu.entity_manager_destroy(manager)
     parent := make_node(manager)
@@ -171,15 +172,13 @@ test_remove_parent_clears_handles :: proc(t: ^testing.T) {
 
     nuppu.parent_add(manager, child.handle, parent.handle)
 
-    testing.expect_value(t, nuppu.parent_remove(manager, child.handle), true)
+    testing.expect_value(t, nuppu.unparent(manager, child.handle), true)
 
     p, _ := nuppu.entity_get(manager, parent.handle)
     c, _ := nuppu.entity_get(manager, child.handle)
 
     testing.expect(t, p.first_child == nuppu.NIL_ENTITY_HANDLE, "parent.first_child cleared")
-    testing.expect(t, c.parent == nuppu.NIL_ENTITY_HANDLE, "child.parent cleared")
-    testing.expect(t, c.next_sibling == nuppu.NIL_ENTITY_HANDLE, "child.next_sibling cleared")
-    testing.expect(t, c.prev_sibling == nuppu.NIL_ENTITY_HANDLE, "child.prev_sibling cleared")
+    testing.expect(t, c.parent == nuppu.entity_root(manager).handle, "child re-parented to root")
 }
 
 @(test)
@@ -230,13 +229,11 @@ test_remove_child_head_promotes_next :: proc(t: ^testing.T) {
     testing.expect(t, tail_node.next_sibling == middle, "tail.next wraps to new head")
     testing.expect(t, tail_node.prev_sibling == middle, "tail.prev == middle")
 
-    // Removed head is fully cleared.
+    // Removed head is re-parented to the root.
     removed, ok := nuppu.entity_get(manager, head)
     testing.expect_value(t, ok, true)
     if ok {
-        testing.expect(t, removed.parent == nuppu.NIL_ENTITY_HANDLE, "removed.parent cleared")
-        testing.expect(t, removed.next_sibling == nuppu.NIL_ENTITY_HANDLE, "removed.next cleared")
-        testing.expect(t, removed.prev_sibling == nuppu.NIL_ENTITY_HANDLE, "removed.prev cleared")
+        testing.expect(t, removed.parent == nuppu.entity_root(manager).handle, "removed.parent is root")
     }
 }
 
@@ -492,7 +489,7 @@ test_explicit_unlink_then_remove :: proc(t: ^testing.T) {
 
     child_h := child.handle
     // Pre-unlink is no longer required, but still permitted and harmless.
-    testing.expect_value(t, nuppu.parent_remove(manager, child_h), true)
+    testing.expect_value(t, nuppu.unparent(manager, child_h), true)
     testing.expect_value(t, nuppu.entity_remove(manager, child_h), true)
 
     p, _ := nuppu.entity_get(manager, parent.handle)
