@@ -5,11 +5,14 @@
 !comm.odin
 !nuppu.odin
 !render.odin
+!config.odin
 
 !bit_array/
 !bit_array/bit_array.odin
 
 !material.odin
+!shader.odin
+!mesh.odin
 
 !gpu/
 !gpu/**
