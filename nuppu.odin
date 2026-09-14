@@ -6,9 +6,7 @@ import "core:mem"
 import "core:time"
 import "core:fmt"
 import "core:log"
-import "core:image"
 import glm "core:math/linalg/glsl"
-
 import "./platform"
 import "./gpu"
 import "bit_array"
@@ -50,9 +48,18 @@ when ODIN_DEBUG {
 Texture_Handle :: Handle(bit_array.Handle)
 Texture_Handle_Nil :: Texture_Handle{}
 
+@(require_results)
+get_texture :: proc(handle: Texture_Handle) -> (^gpu.Texture, bool) #optional_ok {
+    return get_resource(&_state.textures, handle)
+}
+
 // Handles carry metadata on debug builds
 when ODIN_DEBUG {
     _debug_warned_call_sites: map[u64]bool
+
+    // Tracks every allocation made through `context.allocator` while the engine
+    // runs. Lives outside `State` because it must exist before `new(State)`.
+    _tracking_allocator: mem.Tracking_Allocator
 
     debug_warn_hash :: proc(loc: runtime.Source_Code_Location) -> u64 {
         h: u64 = 0xcbf29ce484222325 // FNV-1a 64-bit offset basis
@@ -79,6 +86,7 @@ State :: struct #align(64) {
     gpu_state: gpu.State,
 
     update_state_size: int,
+    states: rawptr, // double-buffer backing for current/previous app state
     current_state: rawptr,
     previous_state: rawptr,
     desc: struct {
@@ -94,21 +102,19 @@ State :: struct #align(64) {
 
     draw_batcher: Draw_Batcher,
     material_library: Material_Library,
+    shader_library: Shader_Library,
 
     sampler: gpu.Sampler,
 
     frame_semaphore: gpu.Timeline_Semaphore,
-    frame_arenas: [dynamic; FRAMES_IN_FLIGHT]^gpu.Arena,
+    frame_arenas: [FRAMES_IN_FLIGHT]gpu.Arena,
     frame_n: u64,
-
-    // Built-in resources, currently representing quad sprite
-    built_in_block: gpu.Parameter_Block,
 
     //
     
 
 
-    textures: bit_array.Bit_Array(Resource(Texture), MAX_TEXTURES, Texture_Handle),
+    textures: bit_array.Bit_Array(Resource(Texture, Texture_Handle), MAX_TEXTURES, Texture_Handle),
     built_in_textures: [Built_in_texture]Texture_Handle,
 
     entity_manager: ^Entity_Manager,
@@ -145,9 +151,17 @@ update_camera :: proc(
 }
 
 // Registers an entity variant with the global entity manager. Must be called
-// before register_drawable for that type.
-register_entity :: proc($T: typeid, $SHIFT: uint, flags: Entity_Flags = {}) {
-    entity_manager_add_variant(_state.entity_manager, T, SHIFT, flags=flags)
+// before register_drawable for that type. Pass a data type as the fourth
+// argument to upload the variant's field named `gpu_instance` (which must have
+// that exact type) into the per-frame instance-data buffer.
+register_entity :: proc{_register_entity, _register_entity_data}
+
+_register_entity :: proc($T: typeid, $SHIFT: uint, flags: Entity_Flags = {}) {
+    entity_manager_add_variant(_state.entity_manager, T, SHIFT, flags)
+}
+
+_register_entity_data :: proc($T: typeid, $SHIFT: uint, flags: Entity_Flags, $D: typeid) {
+    entity_manager_add_variant_data(_state.entity_manager, T, SHIFT, flags, D)
 }
 
 _state: ^State
@@ -175,12 +189,23 @@ App_Optional :: struct {
     deinit: proc(),
 }
 
-Resource :: struct($T: typeid) {
-    handle: bit_array.Handle,
-    data: T,
+// The slot's `handle` is the full wrapper `H` (not the raw bit_array handle),
+// so the debug metadata (name + creation site) travels with the resource and
+// the owning library can report leaks on shutdown.
+Resource :: struct($T: typeid, $H: typeid) {
+    handle: H,
+    data:   T,
 }
 
 run :: proc(desc: App_Desc($T)) {
+
+    when ODIN_DEBUG {
+        // Track every allocation from here on, using the base allocator as the
+        // backing store so the tracker's own bookkeeping is not self-tracked.
+        mem.tracking_allocator_init(&_tracking_allocator, context.allocator)
+        _tracking_allocator.bad_free_callback = mem.tracking_allocator_bad_free_callback_add_to_array
+        context.allocator = mem.tracking_allocator(&_tracking_allocator)
+    }
 
     logger := log.create_console_logger()
     
@@ -199,18 +224,22 @@ run :: proc(desc: App_Desc($T)) {
         _debug_warned_call_sites = make(map[u64]bool)
     }
 
-    states, states_err := mem.alloc(size_of(T) * 2, alignment = 64)
+    // Two interpolation states, each padded up to `update_state_size` so the
+    // snapshot copy below stays inside the allocation.
+    _state.update_state_size = mem.align_forward_int(size_of(T), 64)
+
+    states, states_err := mem.alloc(_state.update_state_size * 2, alignment = 64)
     if states_err != nil {
         panic("Failed to allocate states")
     }
 
     current_state := &([^]T)(states)[0]
-    previous_state := &([^]T)(states)[1]
+    previous_state := (^T)(rawptr(uintptr(states) + uintptr(_state.update_state_size)))
     desc.state^ = current_state
 
+    _state.states = states
     _state.current_state = current_state
     _state.previous_state = previous_state
-    _state.update_state_size = mem.align_forward_int(size_of(T), 64)
 
     _state.desc = {
         init = desc.init,
@@ -239,7 +268,7 @@ when ODIN_OS != .JS { // JS runtime drives the loop via the exported step() on e
             if desc.deinit != nil {
                 desc.deinit()
             }
-            entity_manager_destroy(_state.entity_manager)
+            deinit()
             return
         case .Skip_Render:
             continue
@@ -253,10 +282,183 @@ when ODIN_OS != .JS { // JS runtime drives the loop via the exported step() on e
 }
 }
 
+deinit :: proc() {
+    entity_manager_clear(_state.entity_manager)
+    entity_manager_destroy(_state.entity_manager)
+    when ODIN_DEBUG {
+        _report_unfreed_resources()
+    }
+    // Drain all submitted GPU work before releasing resources. The Metal
+    // presented-handler blocks run on a driver thread and write present timing
+    // into the GPU state, so tearing that state down while work is in flight is
+    // a use-after-free.
+    if _state.frame_semaphore != nil {
+        // `end_frame` signals the semaphore with the frame's `n`; the last
+        // submitted frame is `frame_n - 1`.
+        gpu.semaphore_wait(_state.frame_semaphore, _state.frame_n - 1)
+    }
+        
+    destroy_draw_batcher(&_state.draw_batcher)
+    _shader_lib_deinit(&_state.shader_library)
+    _material_lib_deinit(&_state.material_library)
+
+    // Engine-lifetime GPU buffers. Their debug names live in gpu's name arena
+    // and are freed with it in gpu.deinit.
+    for i in 0 ..< FRAMES_IN_FLIGHT {
+        gpu.release_ptr(&_state.frame_arenas[i].ptr)
+        gpu.release_ptr(&_state.frame_uniform_staging[i])
+    }
+    gpu.release_ptr(&_state.frame_uniform)
+    gpu.release_ptr(&_state.mesh_library.vertex_arena.ptr)
+    gpu.release_ptr(&_state.mesh_library.index_arena.ptr)
+
+    if depth_handle := _state.built_in_textures[.Depth]; depth_handle.handle != bit_array.NIL_HANDLE {
+        if depth_texture, ok := get_resource(&_state.textures, depth_handle); ok {
+            gpu.release_texture(depth_texture)
+        }
+    }
+
+    gpu.deinit()
+
+    when ODIN_DEBUG {
+        delete(_debug_warned_call_sites)
+    }
+    log.destroy_console_logger(_state.ctx.logger)
+
+    // Engine-lifetime Odin allocations.
+    free(_state.states)
+    free(_state)
+    _state = nil
+
+    when ODIN_DEBUG {
+        _report_allocator()
+    }
+}
+
+// Debug-only: dump every allocation still live at shutdown and any bad frees,
+// then tear the tracking allocator down.
+when ODIN_DEBUG {
+    _report_allocator :: proc() {
+        if len(_tracking_allocator.allocation_map) > 0 {
+            fmt.eprintf("=== %v allocations not freed: ===\n", len(_tracking_allocator.allocation_map))
+            for _, leak in _tracking_allocator.allocation_map {
+                fmt.eprintf("- %v bytes @ %v\n", leak.size, leak.location)
+            }
+        }
+
+        if len(_tracking_allocator.bad_free_array) > 0 {
+            fmt.eprintf("=== %v incorrect frees: ===\n", len(_tracking_allocator.bad_free_array))
+            for bad in _tracking_allocator.bad_free_array {
+                fmt.eprintf("- %p @ %v\n", bad.memory, bad.location)
+            }
+        }
+
+        context.allocator = _tracking_allocator.backing
+        mem.tracking_allocator_destroy(&_tracking_allocator)
+    }
+}
+
+// Debug-only: walk every resource library and report anything that was not
+// released, using the name + creation site carried on the handle. Engine
+// built-ins (depth / swapchain) are skipped.
+when ODIN_DEBUG {
+    _report_unfreed_resources :: proc() {
+        total := 0
+        total += _report_unfreed_library("mesh", &_state.mesh_library.meshes, []Mesh_Handle{
+            _state.mesh_library.built_in_lookup[.Quad],
+            _state.mesh_library.built_in_lookup[.Cube],
+        })
+        total += _report_unfreed_library("texture", &_state.textures, []Texture_Handle{
+            _state.built_in_textures[.Depth],
+            _state.built_in_textures[.Swapchain],
+        })
+        total += _report_unfreed_library("shader", &_state.shader_library.shaders)
+        total += _report_unfreed_materials()
+        total += _report_live_entities()
+
+        if total > 0 {
+            log.warnf("[nuppu] %d resource(s) were not freed before shutdown", total)
+        }
+    }
+
+    // Entities are not GPU resources, but a non-empty manager at shutdown is
+    // usually a leak. Print every live entity's handle metadata (name + site).
+    _report_live_entities :: proc() -> int {
+        em := _state.entity_manager
+        if em == nil { return 0 }
+
+        count := 0
+        for variant_idx in 0 ..< len(em.variants) {
+            data := &em.variants[variant_idx]
+            for chunk_idx in 0 ..< len(data.chunks) {
+                chunk := &data.chunks[chunk_idx]
+                it := bit_mask_array_iterator_init(&chunk.occupied)
+                for {
+                    off, ok := bit_mask_array_iterator_next(&it)
+                    if !ok { break }
+
+                    entity := &chunk.entities[off]
+                    if entity.handle.handle.index == 0 { continue } // sentinel
+
+                    _report_unfreed("entity", entity.handle.metadata)
+                    count += 1
+                }
+            }
+        }
+        return count
+    }
+
+    _report_unfreed_library :: proc(
+        kind:    string,
+        array:   ^bit_array.Bit_Array(Resource($Res, $RHandle), $N, $H),
+        exclude: []RHandle = nil,
+    ) -> int {
+        count := 0
+        it := bit_array.iterator_init(array)
+        for {
+            item, ok := bit_array.iterator_next(&it)
+            if !ok { break }
+
+            skip := false
+            for e in exclude {
+                if item.handle == e {
+                    skip = true
+                    break
+                }
+            }
+            if skip { continue }
+
+            _report_unfreed(kind, item.handle.metadata)
+            count += 1
+        }
+        return count
+    }
+
+    _report_unfreed_materials :: proc() -> int {
+        lib := &_state.material_library
+        count := 0
+        for i in 1 ..< len(lib.material_handles) {
+            _report_unfreed("material", lib.material_handles[i].metadata)
+            count += 1
+        }
+        return count
+    }
+
+    _report_unfreed :: proc(kind: string, meta: Metadata) {
+        log.warnf(
+            "[nuppu] unfreed %s '%s' created at %s:%d",
+            kind,
+            meta.name,
+            meta.created_at.file_path,
+            meta.created_at.line,
+        )
+    }
+}
+
 begin_frame :: proc() -> Frame {
     gpu.begin_frame()
     n := _state.frame_n
-    arena := _state.frame_arenas[n % FRAMES_IN_FLIGHT]
+    arena := &_state.frame_arenas[n % FRAMES_IN_FLIGHT]
     arena.offset = 0
 
     frame := Frame {
@@ -393,7 +595,7 @@ step :: proc(dt: f32) -> bool {
         if _state.desc.deinit != nil {
             _state.desc.deinit()
         }
-        entity_manager_destroy(_state.entity_manager)
+        deinit()
         return false
     case .Skip_Render:
         return true
@@ -411,6 +613,10 @@ _frame :: proc() -> Frame_Result {
 
     platform.platform_reset_frame_input()
     platform.poll_events()
+
+    if platform.should_close() {
+        return .Exit
+    }
 
     if platform.input_key_pressed(.KEY_ESCAPE) {
         return .Exit
@@ -464,10 +670,8 @@ _ready_up :: proc() {
     _state.frame_n = 1
     _state.frame_semaphore = gpu.semaphore(0)
 
-    for _ in 0 ..< FRAMES_IN_FLIGHT {
-        frame_arena := new(gpu.Arena, context.allocator)
-        frame_arena^, _ = gpu.arena_init(4 * 1024 * 1024)
-        append(&_state.frame_arenas, frame_arena)
+    for i in 0 ..< FRAMES_IN_FLIGHT {
+        _state.frame_arenas[i], _ = gpu.arena_init(4 * 1024 * 1024)
     }
 
     _state.window_size = platform.window_size_pixel()
@@ -482,7 +686,7 @@ _ready_up :: proc() {
     // Camera
     {
         entity_manager_add_variant(_state.entity_manager, Camera, 6, flags = {.Interpolate})
-        camera_handle := _entity_add(_state.entity_manager, Camera) 
+        camera_handle := _entity_add(_state.entity_manager, Camera, "camera") 
         camera := entity_get_typed(_state.entity_manager, camera_handle, Camera)
 
         camera.scale = {1, 1, 1}
@@ -510,53 +714,9 @@ _ready_up :: proc() {
         wrap_t = .ClampToEdge,
     })
 
-    PNG_DIM :: [2]u32{63, 63}
-
-    
-    textures_handle := texture_init_ex(Texture_Descriptor {
-        dimensions = PNG_DIM,
-        format = .RGBA8Unorm,
-        storage = .Shared,
-        usage = {.Sampled},
-        layer_count = 2,
-        type = ._2D_Array,
-    })
-    texture_array, _ := get_resource(&_state.textures, textures_handle)
-
-    {
-        img, img_err := image.load_from_bytes(#load("./examples/AppleLearnCPP/3-Instancing_camera/bowser.png", []u8), {.alpha_add_if_missing}, context.temp_allocator)
-        if img_err != nil {
-            panic(fmt.tprintf("nuppu: failed to decode bowser.png: %v", img_err))
-        }
-        gpu.copy_to_texture(texture_array^, {0, 0, 0}, {PNG_DIM.x, PNG_DIM.y, 1}, 0, raw_data(img.pixels.buf[:]), PNG_DIM.x * 4)
-        image.destroy(img, context.temp_allocator)
-    }
-
-    {
-        img, img_err := image.load_from_bytes(#load("./examples/AppleLearnCPP/3-Instancing_camera/peach.png", []u8), {.alpha_add_if_missing}, context.temp_allocator)
-        if img_err != nil {
-            panic(fmt.tprintf("nuppu: failed to decode peach.png: %v", img_err))
-        }
-        gpu.copy_to_texture(texture_array^, {0, 0, 1}, {PNG_DIM.x, PNG_DIM.y, 1}, 0, raw_data(img.pixels.buf[:]), PNG_DIM.x * 4)
-        image.destroy(img, context.temp_allocator)
-    }
-
-
     init_draw_batcher(&_state.draw_batcher)
     _material_lib_init(&_state.material_library)
-    
-    _state.built_in_block = gpu.Parameter_Block {
-        constants = { 0 = _state.frame_uniform },
-        read_resources = {
-            0 = _state.mesh_library.vertex_arena.ptr,
-            1 = _state.draw_batcher.instance_base_buffer,
-            2 = _state.material_library.material_buffer,
-            3 = _state.material_library.parameter_buffer.ptr,
-            4 = texture_array^,
-        },
-        read_write_resources = {},
-        samplers = { 0 = _state.sampler },
-    }
+    _shader_lib_init(&_state.shader_library)
 
     _state.initialized = true
 }
@@ -645,20 +805,31 @@ compute_screen_layout :: proc(window_w, window_h: i32, internal_w, internal_h: i
     }
 }
 
-add_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), res: Res, loc := #caller_location) -> H {
-    handle, _ := bit_array.add(array, Resource(Res) {
+add_resource :: proc(
+    array: ^bit_array.Bit_Array(Resource($Res, $RHandle), $N, $H),
+    res:   Res,
+    name:  string = "",
+    loc:          = #caller_location,
+) -> H {
+    handle, _ := bit_array.add(array, Resource(Res, RHandle) {
         data = res,
     })
     when ODIN_DEBUG {
         handle.metadata = Metadata {
-            created_at = loc,
+            created_at       = loc,
             created_on_frame = _state.frame_n,
+            name             = name,
+        }
+        // Stash the full handle (with metadata) back in the slot so the leak
+        // report can find it without a separate registry.
+        if slot, ok := bit_array.get(array, handle); ok {
+            slot.handle = handle
         }
     }
     return handle
 }
 
-get_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), handle: H, loc := #caller_location) -> (^Res, bool) {
+get_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res, $RHandle), $N, $H), handle: H, loc := #caller_location) -> (^Res, bool) {
     resource_ptr, ok := bit_array.get(array, handle)
     when ODIN_DEBUG {
         if !ok && handle.handle != bit_array.NIL_HANDLE {
@@ -685,6 +856,8 @@ get_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res), $N, $H), handle
 texture_2D_init :: proc(
     dimensions: [2]u32,
     data: rawptr = nil,
+    name: string = "",
+    loc: = #caller_location,
 ) -> Texture_Handle {
     desc := gpu.Texture_Descriptor {
         dimensions = dimensions,
@@ -695,17 +868,19 @@ texture_2D_init :: proc(
         type = ._2D,
     }
 
-    return texture_init_ex(desc, data)
+    return texture_init_ex(desc, data, name, loc)
 }
 
 texture_init_ex :: proc(
     descriptor: Texture_Descriptor,
     data: rawptr = nil,
+    name: string = "",
+    loc: = #caller_location,
 ) -> Texture_Handle {
 
     texture := gpu.texture_init(descriptor)
 
-    handle := add_resource(&_state.textures, texture)
+    handle := add_resource(&_state.textures, texture, name, loc)
 
     if data != nil {
         gpu.copy_to_texture(texture, {0, 0, 0}, {descriptor.dimensions.x, descriptor.dimensions.y, 1}, 0, data, descriptor.dimensions.x * 4)
