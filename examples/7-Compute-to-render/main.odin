@@ -1,7 +1,7 @@
 package main
 
-import nuppu "../../.."
-import gpu "../../../gpu"
+import nuppu "../../"
+import gpu "../../gpu"
 import "core:math"
 
 state: ^State

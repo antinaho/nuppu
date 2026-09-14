@@ -1,6 +1,6 @@
 package main
 
-import nuppu "../../.."
+import nuppu "../.."
 
 state: ^State
 

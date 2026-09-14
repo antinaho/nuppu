@@ -1,7 +1,7 @@
 package main
 
-import nuppu "../../.."
-import gpu "../../../gpu"
+import nuppu "../.."
+import gpu "../../gpu"
 import "../../../platform"
 import "core:fmt"
 import "core:image"
