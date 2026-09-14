@@ -7,7 +7,7 @@ entity_set_transform :: proc "contextless" (
     handle                   : Entity_Handle,
     position, rotation, scale: [3]f32,
 ) {
-    e, ok := entity_get(manager, handle)
+    e, ok := _entity_get(manager, handle)
     if !ok { return }
     e.position = position
     e.rotation = rotation
@@ -19,7 +19,7 @@ entity_move :: proc "contextless" (
     handle : Entity_Handle,
     delta  : [3]f32
 ) {
-    e, ok := entity_get(manager, handle)
+    e, ok := _entity_get(manager, handle)
     if !ok { return }
     e.position += delta
 }
