@@ -19,8 +19,17 @@ _ptr :: struct {
     buffer: ^MTL.Buffer,
 }
 
-_Shader :: struct {
+_Shader_Module :: struct {
     library: ^MTL.Library,
+}
+
+_Shader :: struct {
+    vertex_library:   ^MTL.Library,
+    fragment_library: ^MTL.Library,
+    pipeline:         ^MTL.RenderPipelineState,
+
+    resource_table: [MAX_LAYOUT_BINDINGS]uintptr,
+    resource_count: u32,
 }
 
 _Sampler :: ^MTL.SamplerState
@@ -35,7 +44,13 @@ _Depth_Stencil_State :: ^MTL.DepthStencilState
 
 _Compute_Pipeline :: ^MTL.ComputePipelineState
 
-_Pipeline :: ^MTL.RenderPipelineState
+MAX_DEPTH_STATES :: 16
+
+Depth_State_Cache :: struct {
+    compare: Compare_Function,
+    write:   bool,
+    state:   ^MTL.DepthStencilState,
+}
 
     _State :: struct {
     device: ^MTL.Device,
@@ -50,26 +65,37 @@ _Pipeline :: ^MTL.RenderPipelineState
     blit_command_encoder: ^MTL.BlitCommandEncoder,
     compute_command_encoder: ^MTL.ComputeCommandEncoder,
 
-    curr_pipeline: Pipeline,
+    curr_shader:       rawptr,
+    curr_shader_valid: bool,
+
+    curr_draw_state:  Draw_State,
+    draw_state_valid: bool,
+
     curr_compute_pipeline: Compute_Pipeline,
 
+    depth_states:      [MAX_DEPTH_STATES]Depth_State_Cache,
+    depth_state_count: u32,
+
     present_min_duration: MTL.CFTimeInterval,
-    
-    prev_presented_time: MTL.CFTimeInterval, // in seconds
-    present_duration: MTL.CFTimeInterval, // in seconds
 
     presentation_handler: ^NS.Block,
 }
 
+// Present timing is written from a QuartzCore dispatch queue (the drawable's
+// presented handler), which can outlive the GPU state during teardown. It must
+// therefore live in process-lifetime storage, never inside `_State`.
+_Present_Timing :: struct {
+    prev_presented_time: MTL.CFTimeInterval, // in seconds
+    present_duration:    MTL.CFTimeInterval, // in seconds
+}
+_present_timing: _Present_Timing
+
 _present_handler :: proc "c" (user_data: rawptr, drawable: ^CA.MetalDrawable) {
-    context = _state.ctx
-    state := cast(^_State)(user_data)
+    _ = user_data
     src := drawable->presentedTime()
 
-    presentation_duration := src - state.prev_presented_time
-
-    state.present_duration = presentation_duration
-    state.prev_presented_time = src
+    _present_timing.present_duration    = src - _present_timing.prev_presented_time
+    _present_timing.prev_presented_time = src
 }
 
 _init :: proc(
@@ -82,6 +108,7 @@ _init :: proc(
     _state.device = MTL.CreateSystemDefaultDevice()
 
     metal_layer := CA.MetalLayer.layer()
+    metal_layer->retain()
     metal_layer->setDevice(_state.device)
     metal_layer->setPixelFormat(_pixel_format_interop(swapchain_format))
     metal_layer->setFramebufferOnly(false)
@@ -96,17 +123,15 @@ _init :: proc(
     _state.queue = _state.device->newCommandQueue()
 
     _state.present_min_duration = 0
-    _state.present_duration = 0
-    _state.prev_presented_time = 0
-    block, _ := NS.Block.createGlobalWithParam(
-        user_data = rawptr(_state),
+    _present_timing = {}
+
+    _state.presentation_handler = NS.Block.createLocalWithParam(
+        user_data = nil,
         user_proc = _present_handler,
-        allocator = context.allocator,
     )
-    if block == nil {
+    if _state.presentation_handler == nil {
         log.panic("gpu_metal_darwin: _init: failed to create presented handler block")
     }
-    _state.presentation_handler = block
 
     _state.is_init = true
 
@@ -114,12 +139,17 @@ _init :: proc(
 }
 
 _deinit :: proc() {
-    _state.presentation_handler = nil
+    _state.presentation_handler->release()
 
-    if _state.curr_drawable != nil {
-        _state.curr_drawable->release()
-        _state.curr_drawable = nil
+    for i in 0 ..< _state.depth_state_count {
+        _state.depth_states[i].state->release()
     }
+    _state.depth_state_count = 0
+
+    // `nextDrawable` returns an autoreleased (+0) drawable owned by the frame
+    // pool; do not release it here.
+    _state.curr_drawable = nil
+
     _state.metal_layer->release()
     _state.queue->release()
     _state.device->release()
@@ -171,25 +201,7 @@ _copy_to_texture :: proc(texture: Texture, origin, size: [3]u32, level: u32, dat
     }
 }
 
-_depth_stencil_state_init :: proc(depth_descriptor: Depth_Stencil_State_Descriptor) -> _Depth_Stencil_State { 
-    
-    ds_desc := MTL.DepthStencilDescriptor.alloc()->init()
-    defer ds_desc->release()
-    ds_desc->setDepthCompareFunction(_compare_function_interop(depth_descriptor.compare))
-    ds_desc->setDepthWriteEnabled(depth_descriptor.write_enabled)
-
-    depth_state := _state.device->newDepthStencilState(ds_desc)
-    if depth_state == nil {
-        log.panic("_depth_stencil_state_init: failed to create depth stencil state")
-    }
-
-    return _Depth_Stencil_State(depth_state)
-}
-
-_shader_init :: proc(name: string, code: []u8) -> _Shader {
-    library: ^MTL.Library
-    err: ^NS.Error
-
+_shader_module_init :: proc(name: string, code: []u8) -> _Shader_Module {
     code_ns := NS.String.alloc()->initWithBytesNoCopy(raw_data(code), NS.UInteger(len(code)), .UTF8, false)
     defer code_ns->release()
 
@@ -197,53 +209,85 @@ _shader_init :: proc(name: string, code: []u8) -> _Shader {
     defer compile_options->release()
     compile_options->setLanguageVersion(.Version3_0)
 
-    // Could cache library
-    library, err = _state.device->newLibraryWithSource(code_ns, compile_options)
+    library, err := _state.device->newLibraryWithSource(code_ns, compile_options)
     if err != nil {
-        log.panicf("Failed to create shader library: %v", err->localizedDescription()->odinString())
+        log.panicf("Failed to create shader library '%s': %v", name, err->localizedDescription()->odinString())
     }
 
-    result := _Shader {
+    return _Shader_Module {
         library = library,
     }
-
-    return result
 }
 
-_pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> _Pipeline {
-    desc := MTL.RenderPipelineDescriptor.alloc()->init()
-    defer desc->release()
+// Compiles both stages, bakes the immutable pipeline (formats + blend), and
+// precomputes the parameter-block resource table.
+_shader_init :: proc(desc: Shader_Desc) -> _Shader {
+    vmod := _shader_module_init("vs", transmute([]u8)desc.vertex_code)
+    fmod := _shader_module_init("fs", transmute([]u8)desc.fragment_code)
 
-    vertex_entry := NS.String.alloc()->initWithOdinString(vertex.entry_point)
+    pso_desc := MTL.RenderPipelineDescriptor.alloc()->init()
+    defer pso_desc->release()
+
+    vertex_entry := NS.String.alloc()->initWithOdinString(desc.vertex_entry)
     defer vertex_entry->release()
-    vertex_function := vertex.shader.library->newFunctionWithName(vertex_entry)
+    vertex_function := vmod.library->newFunctionWithName(vertex_entry)
     defer vertex_function->release()
 
-    fragment_entry := NS.String.alloc()->initWithOdinString(fragment.entry_point)
+    fragment_entry := NS.String.alloc()->initWithOdinString(desc.fragment_entry)
     defer fragment_entry->release()
-    fragment_function := fragment.shader.library->newFunctionWithName(fragment_entry)
+    fragment_function := fmod.library->newFunctionWithName(fragment_entry)
     defer fragment_function->release()
 
-    desc->setVertexFunction(vertex_function)
-    desc->setFragmentFunction(fragment_function)
-    desc->setDepthAttachmentPixelFormat(_pixel_format_interop(pipeline_descriptor.depth_format))
+    assert(vertex_function != nil, "shader_init: vertex entry point not found")
+    assert(fragment_function != nil, "shader_init: fragment entry point not found")
 
-    color_attachment := desc->colorAttachments()->object(0)
-    color_attachment->setPixelFormat(_pixel_format_interop(pipeline_descriptor.color_format))
-    
-    pso, err := _state.device->newRenderPipelineStateWithDescriptor(desc)
+    pso_desc->setVertexFunction(vertex_function)
+    pso_desc->setFragmentFunction(fragment_function)
+    pso_desc->setDepthAttachmentPixelFormat(_pixel_format_interop(desc.depth_format))
+
+    color_attachment := pso_desc->colorAttachments()->object(0)
+    color_attachment->setPixelFormat(_pixel_format_interop(desc.color_format))
+    _set_blend(color_attachment, desc.blend)
+
+    if desc.multisample.count > 1 {
+        pso_desc->setRasterSampleCount(NS.UInteger(desc.multisample.count))
+    }
+
+    pso, err := _state.device->newRenderPipelineStateWithDescriptor(pso_desc)
     if err != nil {
         log.panicf("Failed to create pipeline state: %v", err->localizedDescription()->odinString())
     }
 
-    return pso
+    result := _Shader {
+        vertex_library   = vmod.library,
+        fragment_library = fmod.library,
+        pipeline         = pso,
+    }
+    result.resource_table, result.resource_count = _resource_table(desc.block)
+
+    return result
 }
 
-_compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> _Compute_Pipeline {
+_shader_deinit :: proc(shader: ^Shader) {
+    if shader.pipeline != nil {
+        shader.pipeline->release()
+        shader.pipeline = nil
+    }
+    if shader.vertex_library != nil {
+        shader.vertex_library->release()
+        shader.vertex_library = nil
+    }
+    if shader.fragment_library != nil {
+        shader.fragment_library->release()
+        shader.fragment_library = nil
+    }
+}
+
+_compute_pipeline_init :: proc(module: Shader_Module, entry_point: string) -> _Compute_Pipeline {
     entry_ns_str := NS.String.alloc()->initWithOdinString(entry_point)
     defer entry_ns_str->release()
 
-    function := shader.library->newFunctionWithName(entry_ns_str)
+    function := module.library->newFunctionWithName(entry_ns_str)
     defer function->release()
 
     kernel, k_err := _state.device->newComputePipelineStateWithFunction(function)
@@ -319,7 +363,7 @@ _acquire_next_swapchain :: proc() -> Texture {
 }
 
 _frame_interval_ns :: proc() -> u64 {
-    return u64(time.Duration(_state.present_duration * MTL.CFTimeInterval(time.Second)))
+    return u64(time.Duration(_present_timing.present_duration * MTL.CFTimeInterval(time.Second)))
 }
 
 _set_hz :: proc(hz: u32) {
@@ -341,8 +385,71 @@ _set_compute_pipeline :: proc(compute_pipeline: Compute_Pipeline) {
     _state.curr_compute_pipeline = compute_pipeline
 }
 
-_set_pipeline :: proc(pipeline: Pipeline) {
-    _state.curr_pipeline = pipeline
+_set_shader :: proc(shader: ^Shader) {
+    assert(_state.render_command_encoder != nil, "_set_shader: no render pass is active")
+
+    if _state.curr_shader_valid && _state.curr_shader == rawptr(shader) {
+        return
+    }
+    _state.curr_shader = rawptr(shader)
+    _state.curr_shader_valid = true
+
+    _state.render_command_encoder->setRenderPipelineState(shader.pipeline)
+    _bind_parameter_block(&shader.desc.block, shader.resource_table[:], shader.resource_count)
+}
+
+_get_depth_stencil_state :: proc(compare: Compare_Function, write: bool) -> ^MTL.DepthStencilState {
+    for i in 0 ..< _state.depth_state_count {
+        e := &_state.depth_states[i]
+        if e.compare == compare && e.write == write {
+            return e.state
+        }
+    }
+
+    assert(_state.depth_state_count < MAX_DEPTH_STATES, "_get_depth_stencil_state: cache full")
+    ds_desc := MTL.DepthStencilDescriptor.alloc()->init()
+    defer ds_desc->release()
+    ds_desc->setDepthCompareFunction(_compare_function_interop(compare))
+    ds_desc->setDepthWriteEnabled(write)
+
+    state := _state.device->newDepthStencilState(ds_desc)
+    assert(state != nil, "_get_depth_stencil_state: failed to create depth stencil state")
+
+    i := _state.depth_state_count
+    _state.depth_states[i] = Depth_State_Cache {
+        compare = compare,
+        write   = write,
+        state   = state,
+    }
+    _state.depth_state_count += 1
+    return state
+}
+
+_set_draw_state :: proc(state: Draw_State) {
+    assert(_state.render_command_encoder != nil, "_set_draw_state: no render pass is active")
+
+    if _state.draw_state_valid && _state.curr_draw_state == state {
+        return
+    }
+    _state.curr_draw_state = state
+    _state.draw_state_valid = true
+
+    encoder := _state.render_command_encoder
+    encoder->setCullMode(_cull_mode_interop(state.cull_mode))
+    encoder->setFrontFacingWinding(_front_face_winding_interop(state.front_face))
+    encoder->setDepthStencilState(_get_depth_stencil_state(state.depth_compare, state.depth_write))
+}
+
+_set_parameter_block :: proc(shader: ^Shader, block: ^Parameter_Block) {
+    shader.desc.block = block^
+    shader.resource_table, shader.resource_count = _resource_table(block^)
+
+    // If this shader is currently bound, rebind immediately so the next draw
+    // sees the new resources.
+    if _state.curr_shader_valid && _state.curr_shader == rawptr(shader) {
+        assert(_state.render_command_encoder != nil, "_set_parameter_block: no render pass is active")
+        _bind_parameter_block(block, shader.resource_table[:], shader.resource_count)
+    }
 }
 
 _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
@@ -388,10 +495,6 @@ _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
     }
 }
 
-_set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
-    _state.render_command_encoder->setDepthStencilState(depth_stencil_state)
-}
-
 _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_Attachment) {
     pass_descriptor := MTL.RenderPassDescriptor.renderPassDescriptor()
 
@@ -409,6 +512,10 @@ _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_A
     }
 
     _state.render_command_encoder = _state.command_buffer->renderCommandEncoderWithDescriptor(pass_descriptor)
+
+    // A new encoder starts with default pipeline + dynamic state.
+    _state.curr_shader_valid = false
+    _state.draw_state_valid  = false
 }
 
 _end_render_pass :: proc() {
@@ -420,49 +527,32 @@ _end_render_pass :: proc() {
     _state.render_command_encoder = nil
 }
 
-_set_cull_mode :: proc(cull_mode: Cull_Mode) {
-    _state.render_command_encoder->setCullMode(_cull_mode_interop(cull_mode))
-}
-
-_set_front_face_winding :: proc(winding: Front_Face) {
-    _state.render_command_encoder->setFrontFacingWinding(_front_face_winding_interop(winding))
-}
-
-_draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32, t: Index_Buffer_Type) {
-    _state.render_command_encoder->setRenderPipelineState(_state.curr_pipeline)
-
-    _use_parameter_block(parameter_block, .Graphics)
-
+_draw_indexed :: proc(index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
     if instance_count == 0 {
         return
     }
 
-    index_format: MTL.IndexType
-    index_bytes: NS.UInteger
-    switch t {
-    case .Uint16:
-        index_format = MTL.IndexType.UInt16
-        index_bytes = 2
-    case .Uint32:
-        index_format = MTL.IndexType.UInt32
-        index_bytes = 4
-    case: panic("Index buffer format not supported")
-    }
+    assert(_state.curr_shader_valid, "_draw_indexed: no shader bound; call set_shader first")
+    shader := (^Shader)(_state.curr_shader)
+
+    // The engine only emits u16 indices (Vertex_Index).
+    index_format := MTL.IndexType.UInt16
+    index_bytes: NS.UInteger = 2
 
     _state.render_command_encoder->drawIndexPrimitivesWithBaseVertex(
-        _primitive_type_interop(primitive), NS.UInteger(index_count), index_format,
+        _primitive_type_interop(shader.desc.topology), NS.UInteger(index_count), index_format,
         index_buffer.native.buffer, NS.UInteger(index_offset * u32(index_bytes)), NS.UInteger(instance_count), NS.Integer(base_vertex), NS.UInteger(base_instance)
     )
 }
 
 _malloc :: proc(
-    bytes: u32,
+    #any_int bytes: uint,
     alignment: u32,
     flags: Buffer_Flag,
     name: string,
     loc := #caller_location,
 ) -> _ptr {
-    capacity := runtime.align_forward(uint(bytes), uint(alignment))
+    capacity := runtime.align_forward(bytes, uint(alignment))
 
     options: MTL.ResourceOptions
     switch flags {
@@ -520,56 +610,32 @@ _mapped :: proc(ptr: ptr) -> bool {
     return ptr.cpu != nil
 }
 
-// _bucket_arena_kick_remap :: proc(arena: ^Bucket_Arena($T)) {
-//     for &bucket in arena.buckets {
-//         if bucket.state != .Locked { continue }
-//         bucket.cursor = 0
-//         bucket.state = .Mapped
-//     }
-//     /* no op in Metal; staging buffers stay mapped for life */
-// }
-
 _min_alignment :: proc(flags: Buffer_Flag) -> u32 {
     return 4
 }
 
-_use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {
-    data := make([dynamic]uintptr, context.temp_allocator)
-    
+// Pure: builds the flat GPU-address table in binding order (constants, read,
+// read/write, samplers). No encoder required, so it can run at shader_init.
+_resource_table :: proc(block: Parameter_Block) -> ([MAX_LAYOUT_BINDINGS]uintptr, u32) {
+    table: [MAX_LAYOUT_BINDINGS]uintptr
+    n: u32
+
     for C in block.constants {
         if C.native.buffer == nil { continue }
-
-        if destination == .Graphics {
-            _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex, .Fragment})
-        } else {
-            _compute_command_encoder()->useResource(C.native.buffer, {.Read})
-        }
-
-        append(&data, uintptr(C.gpu))
+        table[n] = uintptr(C.gpu)
+        n += 1
     }
 
     for R in block.read_resources {
         switch res in R {
         case ptr:
             if res.native.buffer == nil { continue }
-
-            if destination == .Graphics {
-                _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex, .Fragment})
-            } else {
-                _compute_command_encoder()->useResource(res.native.buffer, {.Read})
-            }
-            
-            append(&data, uintptr(res.gpu))
+            table[n] = uintptr(res.gpu)
+            n += 1
         case Texture:
             if res.native.texture == nil { continue }
-
-            if destination == .Graphics {
-                _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
-            } else {
-                _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
-            }
-
-            append(&data, uintptr(res.native.texture->gpuResourceID()))
+            table[n] = uintptr(res.native.texture->gpuResourceID())
+            n += 1
         }
     }
 
@@ -577,40 +643,102 @@ _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Blo
         switch res in RW {
         case ptr:
             if res.native.buffer == nil { continue }
-
-            if destination == .Graphics {
-                _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read, .Write}, {.Vertex, .Fragment})
-            } else {
-                _compute_command_encoder()->useResource(res.native.buffer, {.Read, .Write})
-            }
-
-            append(&data, uintptr(res.gpu))
+            table[n] = uintptr(res.gpu)
+            n += 1
         case Texture:
             if res.native.texture == nil { continue }
-
-            if destination == .Graphics {
-                _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
-            } else {
-                _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
-            }
-
-            append(&data, uintptr(res.native.texture->gpuResourceID()))
+            table[n] = uintptr(res.native.texture->gpuResourceID())
+            n += 1
         }
     }
 
     for S in block.samplers {
         if S.native == nil { continue }
-        append(&data, uintptr(S.native->gpuResourceID()))
+        table[n] = uintptr(S.native->gpuResourceID())
+        n += 1
     }
 
-    assert(len(data) <= 64)
+    assert(n <= MAX_LAYOUT_BINDINGS, "_resource_table: too many bindings")
+    return table, n
+}
+
+// Marks every resource resident for the current render encoder and pushes the
+// precomputed address table with one call per stage.
+_bind_parameter_block :: proc(block: ^Parameter_Block, table: []uintptr, count: u32) {
+    assert(_state.render_command_encoder != nil, "_bind_parameter_block: no render pass is active")
+
+    for C in block.constants {
+        if C.native.buffer == nil { continue }
+        _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex, .Fragment})
+    }
+
+    for R in block.read_resources {
+        switch res in R {
+        case ptr:
+            if res.native.buffer == nil { continue }
+            _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex, .Fragment})
+        case Texture:
+            if res.native.texture == nil { continue }
+            _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
+        }
+    }
+
+    for RW in block.read_write_resources {
+        switch res in RW {
+        case ptr:
+            if res.native.buffer == nil { continue }
+            _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read, .Write}, {.Vertex, .Fragment})
+        case Texture:
+            if res.native.texture == nil { continue }
+            _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
+        }
+    }
+
+    assert(len(table) >= int(count), "_bind_parameter_block: table smaller than count")
+    bytes := slice.bytes_from_ptr(raw_data(table), int(count) * size_of(uintptr))
+    _temp_malloc(bytes, 0, .Vertex)
+    _temp_malloc(bytes, 0, .Fragment)
+}
+
+// Low-level block bind used by the compute path. Graphics go through
+// _set_shader / _bind_parameter_block.
+_use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {
+    table, count := _resource_table(block^)
 
     if destination == .Graphics {
-        _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Vertex)
-        _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Fragment)
-    } else {
-        _temp_malloc(slice.bytes_from_ptr(raw_data(data), len(data) * size_of(uintptr)), 0, .Compute)
+        _bind_parameter_block(block, table[:], count)
+        return
     }
+
+    for C in block.constants {
+        if C.native.buffer == nil { continue }
+        _compute_command_encoder()->useResource(C.native.buffer, {.Read})
+    }
+
+    for R in block.read_resources {
+        switch res in R {
+        case ptr:
+            if res.native.buffer == nil { continue }
+            _compute_command_encoder()->useResource(res.native.buffer, {.Read})
+        case Texture:
+            if res.native.texture == nil { continue }
+            _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
+        }
+    }
+
+    for RW in block.read_write_resources {
+        switch res in RW {
+        case ptr:
+            if res.native.buffer == nil { continue }
+            _compute_command_encoder()->useResource(res.native.buffer, {.Read, .Write})
+        case Texture:
+            if res.native.texture == nil { continue }
+            _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
+        }
+    }
+
+    bytes := slice.bytes_from_ptr(raw_data(table[:]), int(count) * size_of(uintptr))
+    _temp_malloc(bytes, 0, .Compute)
 }
 
 _barrier :: proc(before: Stage, after: Stage) {
@@ -693,18 +821,53 @@ _to_clear_color :: proc(color: Clear_Color) -> MTL.ClearColor {
     }
 }
 
-_set_blend :: proc() {
-    // color_attachment->setBlendingEnabled(true)
-    // color_attachment->setRgbBlendOperation(_blend_operation_interop(desc.blend.color.operation))
-    // color_attachment->setSourceRGBBlendFactor(_blend_factor_interop(desc.blend.color.srcFactor))
-    // color_attachment->setDestinationRGBBlendFactor(_blend_factor_interop(desc.blend.color.dstFactor))
-    // color_attachment->setAlphaBlendOperation(_blend_operation_interop(desc.blend.alpha.operation))
-    // color_attachment->setSourceAlphaBlendFactor(_blend_factor_interop(desc.blend.alpha.srcFactor))
-    // color_attachment->setDestinationAlphaBlendFactor(_blend_factor_interop(desc.blend.alpha.dstFactor))
+_set_blend :: proc(color_attachment: ^MTL.RenderPipelineColorAttachmentDescriptor, blend: Blend_State) {
+    color_attachment->setBlendingEnabled(true)
+    color_attachment->setRgbBlendOperation(_blend_operation_interop(blend.color.op))
+    color_attachment->setSourceRGBBlendFactor(_blend_factor_interop(blend.color.src))
+    color_attachment->setDestinationRGBBlendFactor(_blend_factor_interop(blend.color.dst))
+    color_attachment->setAlphaBlendOperation(_blend_operation_interop(blend.alpha.op))
+    color_attachment->setSourceAlphaBlendFactor(_blend_factor_interop(blend.alpha.src))
+    color_attachment->setDestinationAlphaBlendFactor(_blend_factor_interop(blend.alpha.dst))
 }
 
 //////////////////////////////////////////////////////////////
 // Interop
+
+_blend_operation_interop :: proc(op: Blend_Operation) -> MTL.BlendOperation {
+    switch op {
+    case .Add:             return .Add
+    case .Subtract:        return .Subtract
+    case .ReverseSubtract: return .ReverseSubtract
+    case .Min:             return .Min
+    case .Max:             return .Max
+    }
+    unreachable()
+}
+
+_blend_factor_interop :: proc(f: Blend_Factor) -> MTL.BlendFactor {
+    switch f {
+    case .Undefined:         return .One
+    case .Zero:              return .Zero
+    case .One:               return .One
+    case .Src:               return .SourceColor
+    case .OneMinusSrc:       return .OneMinusSourceColor
+    case .SrcAlpha:          return .SourceAlpha
+    case .OneMinusSrcAlpha:  return .OneMinusSourceAlpha
+    case .Dst:               return .DestinationColor
+    case .OneMinusDst:       return .OneMinusDestinationColor
+    case .DstAlpha:          return .DestinationAlpha
+    case .OneMinusDstAlpha:  return .OneMinusDestinationAlpha
+    case .SrcAlphaSaturated: return .SourceAlphaSaturated
+    case .Constant:          return .BlendColor
+    case .OneMinusConstant:  return .OneMinusBlendColor
+    case .Src1:              return .Source1Color
+    case .OneMinusSrc1:      return .OneMinusSource1Color
+    case .Src1Alpha:         return .Source1Alpha
+    case .OneMinusSrc1Alpha: return .OneMinusSource1Alpha
+    }
+    unreachable()
+}
 
 _sampler_filter_min_mag_interop :: proc(filter: Sampler_Min_Mag_Filter) -> MTL.SamplerMinMagFilter {
     switch filter {
@@ -861,7 +1024,7 @@ _pixel_format_interop :: proc(format: Pixel_Format) -> MTL.PixelFormat {
     unreachable()
 }
 
-_primitive_type_interop :: proc(primitive: Primitive_Type) -> MTL.PrimitiveType {
+_primitive_type_interop :: proc(primitive: Primitive) -> MTL.PrimitiveType {
     switch primitive {
     case .Triangle:
         return .Triangle

@@ -12,10 +12,10 @@ Arena :: struct {
 
 // Linear bump arena that allocates staging buffer. Helps if multiple types of staging data is needed to be copied simultaneously.
 arena_init :: proc(
-    bytes: u32,
+    #any_int bytes: u32,
     #any_int alignment: u32 = 16,
-    loc:                     = #caller_location,
     flags: Buffer_Flag      = .Staging,
+    loc:                    = #caller_location,
 ) -> (Arena, bool) {
     arena: Arena
 

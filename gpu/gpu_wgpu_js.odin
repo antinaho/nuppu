@@ -9,40 +9,46 @@ import "core:log"
 import "core:strings"
 import "base:runtime"
 
-when GPU_BACKEND == GPU_BACKEND_WGPU {
 
-    DEFAULT_PIPELINE_SETTINGS :: _Pipeline_Settings {
-        multisample = {
-            count = 1,
-            mask = 0xFFFFFFFF,
-        },
-        blend = {
-            alpha = {
-                srcFactor = .SrcAlpha,
-                dstFactor = .OneMinusSrcAlpha,
-                operation = .Add,
-            },
-            color = {
-                srcFactor = .SrcAlpha,
-                dstFactor = .OneMinusSrcAlpha,
-                operation = .Add,
-            },
-        },
-        primitive = {
-            topology = .TriangleList,
-            cullMode = .None,
-            frontFace = .CCW,
-        }
-    }
 
     _ptr :: struct {
-        buffer: wgpu.Buffer,
-        is_mapped: bool,
-        binding_type: wgpu.BufferBindingType,
+        buffer:        wgpu.Buffer,
+        capacity:      uint,
+        is_mapped:     bool,
+        binding_type:  wgpu.BufferBindingType,
+        index_bytes:   u8,
+        min_alignment: u32,
+    }
+
+    _Shader_Module :: struct {
+        module: wgpu.ShaderModule,
+    }
+
+    MAX_SHADER_VARIANTS :: 8
+
+    // A pipeline variant for a distinct dynamic Draw_State. WGPU bakes cull,
+    // front-face and depth into the pipeline, so changing them means selecting a
+    // (cached) variant rather than an encoder call
+    _Shader_Variant :: struct {
+        state:    Draw_State,
+        pipeline: wgpu.RenderPipeline,
     }
 
     _Shader :: struct {
-        module: wgpu.ShaderModule,
+        vertex:   _Shader_Module,
+        fragment: _Shader_Module,
+        entry_v:  string,
+        entry_f:  string,
+
+        bg_layout:       wgpu.BindGroupLayout,
+        pipeline_layout: wgpu.PipelineLayout,
+        bind_group:      wgpu.BindGroup,
+
+        layout_count: u32,
+        layout_sig:   [MAX_LAYOUT_BINDINGS]wgpu.BindGroupLayoutEntry,
+
+        variants:      [MAX_SHADER_VARIANTS]_Shader_Variant,
+        variant_count: u32,
     }
 
     _Sampler :: struct {
@@ -59,27 +65,9 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         type:   Texture_Type,
     }
 
-    _Depth_Stencil_State :: wgpu.DepthStencilState
-
     _Compute_Pipeline :: struct {
-        shader: Shader,
-        entry: string,
-    }
-
-    _Pipeline :: struct {
-        vertex_shader: Shader,
-        vertex_function: string,
-        fragment_shader: Shader,
-        fragment_function: string,
-        
-        color_format: Pixel_Format,
-        depth_format: Pixel_Format,
-    }
-
-    _Pipeline_Settings :: struct {
-        multisample: wgpu.MultisampleState,
-        blend: wgpu.BlendState,
-        primitive: wgpu.PrimitiveState,
+        shader: _Shader_Module,
+        entry:  string,
     }
 
     MAX_BG_LAYOUT_CACHE_ENTRIES :: 64
@@ -97,19 +85,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         sig:             _BG_Layout_Signature,
         layout:          wgpu.BindGroupLayout,
         pipeline_layout: wgpu.PipelineLayout,
-    }
-
-    // Render pipeline cache key includes everything that affects the
-    // generated wgpu.RenderPipeline: the bind group layout, the pipeline
-    // descriptor (shaders, entry points, target formats), the depth stencil
-    // state, the pipeline settings, and the color write mask.
-    _Render_Pipeline_Cache_Entry :: struct {
-        bg_layout:     wgpu.BindGroupLayout,
-        meta:          Pipeline,
-        depth_stencil: wgpu.DepthStencilState,
-        settings:      _Pipeline_Settings,
-        write_mask:    wgpu.ColorWriteMaskFlags,
-        pipeline:      wgpu.RenderPipeline,
     }
 
     _Compute_Pipeline_Cache_Entry :: struct {
@@ -139,21 +114,18 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         render_pass_encoder: wgpu.RenderPassEncoder,
         compute_pass_encoder: wgpu.ComputePassEncoder,
 
-        curr_pipeline: Pipeline,
         curr_compute_pipeline: Compute_Pipeline,
-        curr_depth_stencil_state: Depth_Stencil_State,
 
-
-        settings: _Pipeline_Settings,
+        curr_shader:       rawptr,
+        curr_shader_valid: bool,
+        curr_draw_state:   Draw_State,
+        draw_state_valid:  bool,
+        pipeline_dirty:    bool,
 
         // Fixed-capacity caches with circular overwrite on full. Empty
-        // slots are detected by nil resource handles, so we don't need a
-        // count field.
+        // slots are detected by nil resource handles
         bg_layout_cache:        [MAX_BG_LAYOUT_CACHE_ENTRIES]_BG_Layout_Cache_Entry,
         bg_layout_cache_next:   u32,
-
-        render_pipeline_cache:      [MAX_PIPELINE_CACHE_ENTRIES]_Render_Pipeline_Cache_Entry,
-        render_pipeline_cache_next: u32,
 
         compute_pipeline_cache:      [MAX_PIPELINE_CACHE_ENTRIES]_Compute_Pipeline_Cache_Entry,
         compute_pipeline_cache_next: u32,
@@ -175,7 +147,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         return true
 
         _handle_request_adapter :: proc "c" (status: wgpu.RequestAdapterStatus, adapter: wgpu.Adapter, message: string, userdata1, userdata2: rawptr) {
-            context = _state.ctx
+            context = _state.init_context
 
             if status != .Success || adapter == nil {
                 fmt.panicf("request adapter failure: [%v] %s", status, message)
@@ -186,7 +158,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
 
         _handle_request_device :: proc "c" (status: wgpu.RequestDeviceStatus, device: wgpu.Device, message: string, userdata1, userdata2: rawptr) {
-            context = _state.ctx
+            context = _state.init_context
             
             if status != .Success || device == nil {
                 fmt.panicf("request device failure: [%v] %s", status, message)
@@ -205,7 +177,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             _state.uniform_offset_align = limits.minUniformBufferOffsetAlignment
             _state.storage_offset_align = limits.minStorageBufferOffsetAlignment
             _state.index_offset_align = 4
-            _state.settings = DEFAULT_PIPELINE_SETTINGS
 
             _state.is_init = true
         }
@@ -222,13 +193,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
     }
 
-    _release_render_pipeline :: proc(e: ^_Render_Pipeline_Cache_Entry) {
-        if e.pipeline != nil {
-            wgpu.RenderPipelineRelease(e.pipeline)
-            e.pipeline = nil
-        }
-    }
-
     _release_compute_pipeline :: proc(e: ^_Compute_Pipeline_Cache_Entry) {
         if e.pipeline != nil {
             wgpu.ComputePipelineRelease(e.pipeline)
@@ -238,10 +202,8 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     _deinit :: proc() {
         for i in 0..<MAX_BG_LAYOUT_CACHE_ENTRIES  do _release_bg_layout(&_state.bg_layout_cache[i])
-        for i in 0..<MAX_PIPELINE_CACHE_ENTRIES   do _release_render_pipeline(&_state.render_pipeline_cache[i])
         for i in 0..<MAX_PIPELINE_CACHE_ENTRIES   do _release_compute_pipeline(&_state.compute_pipeline_cache[i])
         _state.bg_layout_cache_next      = 0
-        _state.render_pipeline_cache_next = 0
         _state.compute_pipeline_cache_next = 0
 
         wgpu.QueueRelease(_state.queue)
@@ -288,21 +250,21 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
     }
 
-    _copy_to_texture :: proc(texture: Texture, origin, size: [3]int, level: u32, data: rawptr, bytes_per_row: u32) {
+    _copy_to_texture :: proc(texture: Texture, origin, size: [3]u32, level: u32, data: rawptr, bytes_per_row: u32) {
         destination := wgpu.TexelCopyTextureInfo {
             texture  = texture.native.texture,
             mipLevel = level,
-            origin   = wgpu.Origin3D { u32(origin.x), u32(origin.y), u32(origin.z) },
+            origin   = wgpu.Origin3D { origin.x, origin.y, origin.z },
             aspect   = .All,
         }
         layout := wgpu.TexelCopyBufferLayout {
             offset       = 0,
             bytesPerRow  = bytes_per_row,
-            rowsPerImage = u32(size.y),
+            rowsPerImage = size.y,
         }
         write_size := wgpu.Extent3D {
-            width              = u32(size.x),
-            height             = u32(size.y),
+            width              = size.x,
+            height             = size.y,
             depthOrArrayLayers = 1,
         }
         data_size := uint(bytes_per_row) * uint(size.y)
@@ -310,53 +272,182 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         wgpu.QueueWriteTexture(_state.queue, &destination, data, data_size, &layout, &write_size)
     }
 
-    _depth_stencil_state_init :: proc(depth_descriptor: Depth_Stencil_State_Descriptor) -> _Depth_Stencil_State {
-        optional_bool: wgpu.OptionalBool
-        switch depth_descriptor.write_enabled {
-        case true:
-            optional_bool = .True
-        case false:
-            optional_bool = .False
-        }
-
-        dpso: wgpu.DepthStencilState
-        dpso.depthWriteEnabled = optional_bool
-        dpso.depthCompare = _compare_function_interop(depth_descriptor.compare)
-
-        return dpso
-    }
-
-    _shader_init :: proc(name: string, code: []u8) -> _Shader {
+    _shader_module_init :: proc(name: string, code: []u8) -> _Shader_Module {
         module := wgpu.DeviceCreateShaderModule(_state.device, &{
             nextInChain = &wgpu.ShaderSourceWGSL {
                 sType = .ShaderSourceWGSL,
                 code = string(code),
             }
         })
+        assert(module != nil, "_shader_module_init: failed to create shader module")
 
-        result := _Shader {
+        return _Shader_Module {
             module = module,
         }
-
-        return result
     }
 
-    _pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> _Pipeline {
-        result := _Pipeline {
-            vertex_shader = vertex.shader,
-            vertex_function = strings.clone(vertex.entry_point, context.allocator),
-            fragment_shader = fragment.shader,
-            fragment_function = strings.clone(fragment.entry_point, context.allocator),
-            color_format = pipeline_descriptor.color_format,
-            depth_format = pipeline_descriptor.depth_format,
+    // Builds/rebuilds the bind group layout, pipeline layout and bind group from
+    // the block. Called at shader_init and again on set_parameter_block.
+    _shader_build_bindings :: proc(shader: ^_Shader, block: Parameter_Block) {
+        b := block
+        _use_parameter_block(&b, .Graphics)
+        count := _state.parameter_count
+
+        shader.layout_count = count
+        for i in 0 ..< int(count) {
+            shader.layout_sig[i] = _state.bg_layout_entries[i]
         }
 
-        return result
+        shader.bg_layout = wgpu.DeviceCreateBindGroupLayout(_state.device, &{
+            entryCount = uint(count),
+            entries    = raw_data(_state.bg_layout_entries[:count]),
+        })
+        assert(shader.bg_layout != nil, "_shader_build_bindings: failed to create bind group layout")
+
+        shader.pipeline_layout = wgpu.DeviceCreatePipelineLayout(_state.device, &{
+            bindGroupLayoutCount = 1,
+            bindGroupLayouts     = &shader.bg_layout,
+        })
+        assert(shader.pipeline_layout != nil, "_shader_build_bindings: failed to create pipeline layout")
+
+        shader.bind_group = _create_bind_group(shader.bg_layout, count)
     }
 
-    _compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> _Compute_Pipeline {
+    _create_bind_group :: proc(layout: wgpu.BindGroupLayout, count: u32) -> wgpu.BindGroup {
+        bg := wgpu.DeviceCreateBindGroup(_state.device, &wgpu.BindGroupDescriptor{
+            layout     = layout,
+            entryCount = uint(count),
+            entries    = raw_data(_state.bg_entries[:count]),
+        })
+        assert(bg != nil, "_create_bind_group: failed to create bind group")
+        return bg
+    }
+
+    _shader_create_pipeline :: proc(shader: ^_Shader, desc: ^Shader_Desc, state: Draw_State) -> wgpu.RenderPipeline {
+        primitive := wgpu.PrimitiveState {
+            topology  = _primitive_type_interop(desc.topology),
+            cullMode  = _cull_mode_interop(state.cull_mode),
+            frontFace = _front_face_winding_interop(state.front_face),
+        }
+        multisample := wgpu.MultisampleState {
+            count = desc.multisample.count,
+            mask  = desc.multisample.mask,
+        }
+        blend := wgpu.BlendState {
+            color = wgpu.BlendComponent {
+                operation = _blend_operation_interop(desc.blend.color.op),
+                srcFactor = _blend_factor_interop(desc.blend.color.src),
+                dstFactor = _blend_factor_interop(desc.blend.color.dst),
+            },
+            alpha = wgpu.BlendComponent {
+                operation = _blend_operation_interop(desc.blend.alpha.op),
+                srcFactor = _blend_factor_interop(desc.blend.alpha.src),
+                dstFactor = _blend_factor_interop(desc.blend.alpha.dst),
+            },
+        }
+        target := wgpu.ColorTargetState {
+            format    = _pixel_format_interop(desc.color_format),
+            blend     = &blend,
+            writeMask = wgpu.ColorWriteMaskFlags_All,
+        }
+        v_state := wgpu.VertexState {
+            module      = shader.vertex.module,
+            entryPoint  = shader.entry_v,
+            bufferCount = 0,
+            buffers     = nil,
+        }
+        f_state := wgpu.FragmentState {
+            module      = shader.fragment.module,
+            entryPoint  = shader.entry_f,
+            targetCount = 1,
+            targets     = &target,
+        }
+
+        depth_format := _pixel_format_interop(desc.depth_format)
+        dpso: wgpu.DepthStencilState
+        if depth_format != .Undefined {
+            dpso.format = depth_format
+            dpso.depthWriteEnabled = .True if state.depth_write else .False
+            dpso.depthCompare = _compare_function_interop(state.depth_compare)
+        }
+
+        pso := wgpu.DeviceCreateRenderPipeline(_state.device, &wgpu.RenderPipelineDescriptor{
+            layout       = shader.pipeline_layout,
+            vertex       = v_state,
+            primitive    = primitive,
+            multisample  = multisample,
+            fragment     = &f_state,
+            depthStencil = nil if depth_format == .Undefined else &dpso,
+        })
+        assert(pso != nil, "_shader_create_pipeline: failed to create render pipeline")
+        return pso
+    }
+
+    // Returns the cached pipeline variant for `state`, creating it on first use.
+    // This is the WGPU "immediate mode": a cull/depth change only picks another
+    // variant that shares the module + bind group, it never recompiles.
+    _shader_variant :: proc(shader: ^_Shader, desc: ^Shader_Desc, state: Draw_State) -> wgpu.RenderPipeline {
+        for i in 0 ..< shader.variant_count {
+            if shader.variants[i].state == state {
+                return shader.variants[i].pipeline
+            }
+        }
+        assert(shader.variant_count < MAX_SHADER_VARIANTS, "_shader_variant: variant cache full")
+
+        pso := _shader_create_pipeline(shader, desc, state)
+        shader.variants[shader.variant_count] = _Shader_Variant { state = state, pipeline = pso }
+        shader.variant_count += 1
+        return pso
+    }
+
+    _shader_init :: proc(desc: Shader_Desc) -> _Shader {
+        d := desc
+        shader := _Shader {
+            vertex   = _shader_module_init("vs", transmute([]u8)d.vertex_code),
+            fragment = _shader_module_init("fs", transmute([]u8)d.fragment_code),
+            entry_v  = strings.clone(d.vertex_entry, context.allocator),
+            entry_f  = strings.clone(d.fragment_entry, context.allocator),
+        }
+
+        _shader_build_bindings(&shader, d.block)
+        pso := _shader_create_pipeline(&shader, &d, DEFAULT_DRAW_STATE)
+        shader.variants[0] = _Shader_Variant { state = DEFAULT_DRAW_STATE, pipeline = pso }
+        shader.variant_count = 1
+
+        return shader
+    }
+
+    _shader_deinit :: proc(shader: ^Shader) {
+        for i in 0 ..< shader.variant_count {
+            wgpu.RenderPipelineRelease(shader.variants[i].pipeline)
+        }
+        shader.variant_count = 0
+
+        if shader.bind_group != nil {
+            wgpu.BindGroupRelease(shader.bind_group)
+            shader.bind_group = nil
+        }
+        if shader.pipeline_layout != nil {
+            wgpu.PipelineLayoutRelease(shader.pipeline_layout)
+            shader.pipeline_layout = nil
+        }
+        if shader.bg_layout != nil {
+            wgpu.BindGroupLayoutRelease(shader.bg_layout)
+            shader.bg_layout = nil
+        }
+        if shader.vertex.module != nil {
+            wgpu.ShaderModuleRelease(shader.vertex.module)
+            shader.vertex.module = nil
+        }
+        if shader.fragment.module != nil {
+            wgpu.ShaderModuleRelease(shader.fragment.module)
+            shader.fragment.module = nil
+        }
+    }
+
+    _compute_pipeline_init :: proc(module: Shader_Module, entry_point: string) -> _Compute_Pipeline {
         return _Compute_Pipeline {
-            shader = shader,
+            shader = module,
             entry  = strings.clone(entry_point, context.allocator),
         }
     }
@@ -390,7 +481,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         wgpu.SurfacePresent(_state.surface)
     }
 
-    _acquire_next_swapchain :: proc() -> _Texture {
+    _acquire_next_swapchain :: proc() -> Texture {
         surface_texture := wgpu.SurfaceGetCurrentTexture(_state.surface)
         switch surface_texture.status {
         case .SuccessOptimal, .SuccessSuboptimal:
@@ -410,13 +501,16 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
         view := wgpu.TextureCreateView(surface_texture.texture, nil)
 
-        result := _Texture {
+        native := _Texture {
             surface_texture = surface_texture,
             view = view,
             type = ._2D,
         }
 
-        return result
+        return Texture {
+            dimensions = { _state.config.width, _state.config.height, 1 },
+            native = native,
+        }
     }
 
     _compute_dispatch :: proc(num_groups: [3]u32, num_threads_per_group: [3]u32) {
@@ -446,8 +540,82 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         _state.curr_compute_pipeline = pipeline
     }
 
-    _set_pipeline :: proc(pipeline: Pipeline) {
-        _state.curr_pipeline = pipeline
+    _set_shader :: proc(shader: ^Shader) {
+        assert(_state.render_pass_encoder != nil, "_set_shader: no render pass is active")
+
+        if _state.curr_shader_valid && _state.curr_shader == rawptr(shader) {
+            return
+        }
+        _state.curr_shader = rawptr(shader)
+        _state.curr_shader_valid = true
+        _state.pipeline_dirty = true
+
+        wgpu.RenderPassEncoderSetBindGroup(_state.render_pass_encoder, 0, shader.bind_group, nil)
+    }
+
+    _set_draw_state :: proc(state: Draw_State) {
+        if _state.draw_state_valid && _state.curr_draw_state == state {
+            return
+        }
+        _state.curr_draw_state = state
+        _state.draw_state_valid = true
+        _state.pipeline_dirty = true
+    }
+
+    _set_parameter_block :: proc(shader: ^Shader, block: ^Parameter_Block) {
+        shader.desc.block = block^
+
+        b := block^
+        _use_parameter_block(&b, .Graphics)
+        new_count := _state.parameter_count
+
+        same_layout := new_count == shader.native.layout_count
+        if same_layout {
+            for i in 0 ..< int(new_count) {
+                if shader.native.layout_sig[i] != _state.bg_layout_entries[i] {
+                    same_layout = false
+                    break
+                }
+            }
+        }
+
+        if same_layout {
+            // Fast path: only the resource references changed, so destroy and
+            // recreate the bind group against the existing layout. Pipelines
+            // stay valid because the layout is identical.
+            if shader.bind_group != nil {
+                wgpu.BindGroupRelease(shader.bind_group)
+            }
+            shader.bind_group = _create_bind_group(shader.bg_layout, new_count)
+        } else {
+            // Layout changed: rebuild layout, pipelines and bind group.
+            for i in 0 ..< shader.variant_count {
+                wgpu.RenderPipelineRelease(shader.variants[i].pipeline)
+            }
+            shader.variant_count = 0
+            if shader.bind_group != nil {
+                wgpu.BindGroupRelease(shader.bind_group)
+                shader.bind_group = nil
+            }
+            if shader.pipeline_layout != nil {
+                wgpu.PipelineLayoutRelease(shader.pipeline_layout)
+                shader.pipeline_layout = nil
+            }
+            if shader.bg_layout != nil {
+                wgpu.BindGroupLayoutRelease(shader.bg_layout)
+                shader.bg_layout = nil
+            }
+
+            _shader_build_bindings(&shader.native, b)
+            pso := _shader_create_pipeline(&shader.native, &shader.desc, _state.curr_draw_state)
+            shader.variant_count = 1
+            shader.variants[0] = _Shader_Variant { state = _state.curr_draw_state, pipeline = pso }
+        }
+
+        if _state.curr_shader_valid && _state.curr_shader == rawptr(shader) {
+            _state.pipeline_dirty = true
+            wgpu.RenderPassEncoderSetBindGroup(_state.render_pass_encoder, 0, shader.bind_group, nil)
+        }
     }
 
     _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
@@ -535,10 +703,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         unreachable()
     }
 
-    _set_depth_stencil_state :: proc(depth_stencil_state: Depth_Stencil_State) {
-        _state.curr_depth_stencil_state = depth_stencil_state
-    }
-
     _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_Attachment) {
 
         res: wgpu.RenderPassColorAttachment
@@ -563,6 +727,11 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         }
 
         _state.render_pass_encoder = wgpu.CommandEncoderBeginRenderPass(_state.command_encoder, &desc)
+
+        // A new encoder starts with no pipeline bound.
+        _state.curr_shader_valid = false
+        _state.draw_state_valid  = false
+        _state.pipeline_dirty    = true
     }
 
     _end_render_pass :: proc() {
@@ -570,31 +739,21 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         wgpu.RenderPassEncoderRelease(_state.render_pass_encoder)
     }
 
-    _set_cull_mode :: proc(cull_mode: Cull_Mode) {
-    }
+    _draw_indexed :: proc(index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
+        if instance_count == 0 {
+            return
+        }
 
-    _set_front_face_winding :: proc(winding: Front_Face) {   
-    }
+        assert(_state.curr_shader_valid, "_draw_indexed: no shader bound; call set_shader first")
+        shader := (^Shader)(_state.curr_shader)
 
-    _draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, primitive: Primitive_Type, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
-        pipeline := _state.curr_pipeline
-
-        _use_parameter_block(parameter_block, .Graphics)
-
-        bg_layout, pso_layout := _get_or_create_bg_layout()
-        pso := _get_or_create_render_pipeline(
-            bg_layout, pso_layout, pipeline,
-            _state.curr_depth_stencil_state.native, _state.settings,
-        )
-
-        frame_bg := wgpu.DeviceCreateBindGroup(_state.device, &wgpu.BindGroupDescriptor{
-            layout     = bg_layout,
-            entryCount = uint(_state.parameter_count),
-            entries    = raw_data(_state.bg_entries[:_state.parameter_count]),
-        })
-
-        wgpu.RenderPassEncoderSetPipeline(_state.render_pass_encoder, pso)
-        wgpu.RenderPassEncoderSetBindGroup(_state.render_pass_encoder, /* bind group index */ 0, frame_bg, nil)
+        // Deferred variant bind: both set_shader and set_draw_state only mark the
+        // pipeline dirty, so a shader+state change costs exactly one SetPipeline.
+        if _state.pipeline_dirty {
+            pso := _shader_variant(&shader.native, &shader.desc, _state.curr_draw_state)
+            wgpu.RenderPassEncoderSetPipeline(_state.render_pass_encoder, pso)
+            _state.pipeline_dirty = false
+        }
 
         index_format: wgpu.IndexFormat
         switch index_buffer.native.index_bytes {
@@ -621,63 +780,55 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             baseVertex    = i32(base_vertex),
             firstInstance = base_instance,
         )
-
-        wgpu.BindGroupRelease(frame_bg)
     }
 
     _malloc :: proc(
-        type: Buffer_Type,
-        #any_int el_count: uint,
-        #any_int el_size: uint,
-        #any_int alignment: uint,
-        name: string
+        #any_int bytes: uint,
+        alignment: u32,
+        flags: Buffer_Flag,
+        name: string,
+        loc := #caller_location,
     ) -> _ptr {
-        bytes := runtime.align_forward_uint(el_count * el_size, alignment)
-
         usage: wgpu.BufferUsageFlags
         binding_type: wgpu.BufferBindingType
         min_alignment: u32
+        aligned_bytes := uint(bytes)
 
-        switch type {
+        switch flags {
         case .Staging:
-            usage  = {.CopySrc, .MapWrite}
-            binding_type = .ReadOnlyStorage
+            usage         = {.CopySrc, .MapWrite}
+            binding_type  = .ReadOnlyStorage
             min_alignment = 4
-        case .GPU_Storage:
-            usage  = {.CopyDst, .Storage}
-            binding_type = .ReadOnlyStorage
-            bytes = runtime.align_forward_uint(bytes, uint(_state.storage_offset_align))
+        case .Default:
+            usage         = {.CopyDst, .CopySrc, .Storage}
+            binding_type  = .ReadOnlyStorage
+            aligned_bytes = runtime.align_forward_uint(aligned_bytes, uint(_state.storage_offset_align))
             min_alignment = _state.storage_offset_align
-        case .GPU_Constant:
-            usage  = {.CopyDst, .Uniform}
-            binding_type = .Uniform
-            bytes = runtime.align_forward_uint(bytes, uint(_state.uniform_offset_align))
+        case .Constant:
+            usage         = {.CopyDst, .Uniform}
+            binding_type  = .Uniform
+            aligned_bytes = runtime.align_forward_uint(aligned_bytes, uint(_state.uniform_offset_align))
             min_alignment = _state.uniform_offset_align
-        case .GPU_Index:
-            usage  = {.CopyDst, .Index}
-            binding_type = .ReadOnlyStorage
-            bytes = runtime.align_forward_uint(bytes, uint(_state.index_offset_align))
+        case .Index:
+            usage         = {.CopyDst, .Index}
+            binding_type  = .ReadOnlyStorage
+            aligned_bytes = runtime.align_forward_uint(aligned_bytes, uint(_state.index_offset_align))
             min_alignment = _state.index_offset_align
-        case .Readback:
-            usage  = {.CopyDst, .MapRead}
-            binding_type = .ReadOnlyStorage
-            panic("not implemented")
         }
 
         buffer := wgpu.DeviceCreateBuffer(_state.device, &wgpu.BufferDescriptor {
             label = name,
             usage = usage,
-            size = u64(bytes),
-            mappedAtCreation = type == .Staging,
+            size = u64(aligned_bytes),
+            mappedAtCreation = flags == .Staging,
         })
 
         return _ptr {
-            buffer = buffer,
-            offset = 0,
-            is_mapped = bool(type == .Staging),
-            capacity = uint(bytes),
-            binding_type = binding_type,
-            index_bytes = u8(el_size) if type == .GPU_Index else 0,
+            buffer        = buffer,
+            is_mapped     = flags == .Staging,
+            capacity      = aligned_bytes,
+            binding_type  = binding_type,
+            index_bytes   = 2 if flags == .Index else 0,
             min_alignment = min_alignment,
         }
     }
@@ -686,11 +837,17 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         return ptr.capacity
     }
 
-    _min_alignment :: proc(ptr: _ptr) -> u32 {
-        return ptr.min_alignment
+    _min_alignment :: proc(flags: Buffer_Flag) -> u32 {
+        switch flags {
+        case .Staging:  return 4
+        case .Default:  return _state.storage_offset_align
+        case .Constant: return _state.uniform_offset_align
+        case .Index:    return _state.index_offset_align
+        }
+        unreachable()
     }
 
-    _unmap :: proc(ptr: ^ptr) {
+    _unmap :: proc(ptr: ^ptr, offset: i64 = 0, length: i64 = -1) {
         if !ptr.is_mapped {
             return
         }
@@ -723,77 +880,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         return ptr.is_mapped
     }
 
-    _frame_arena :: proc() -> ^Arena {
-        if len(_state.frame_arenas) == 0 {
-            new_arena := new(Arena, context.allocator)
-            new_arena^ = arena_init()
-            return new_arena
-        } else {
-            arena := pop(&_state.frame_arenas)
-            arena.ptr.is_mapped = true
-            arena.ptr.cpu = _cpu_address(arena.ptr.native)
-            arena.offset = 0
-            return arena
-        }
-    }
-
-
-
-    _recycle_frame_arena :: proc(arena: ^Arena) {
-
-        //BufferMapCallback :: #type proc "c" (status: MapAsyncStatus, message: StringView, userdata1: rawptr, userdata2: rawptr)
-        callback_ :: proc "c" (status: wgpu.MapAsyncStatus, message: wgpu.StringView, userdata1: rawptr, userdata2: rawptr) {
-            context = _state.ctx
-            if status != .Success {
-                log.errorf("gpu_frame_arena_deinit: failed to map arena %v", message)
-                return
-            }
-            arena := (^Arena)(userdata1)
-            append(&_state.frame_arenas, arena)
-        }
-
-        _unmap(&arena.ptr.native)
-
-        wgpu.BufferMapAsync(arena.ptr.buffer, {.Write}, 0, arena.ptr.capacity, wgpu.BufferMapCallbackInfo {
-            mode = .AllowProcessEvents,
-            callback = callback_,
-            userdata1 = arena,
-        })
-    }
-
-    _bucket_arena_kick_remap :: proc(bucket_arena: ^Bucket_Arena($N)) {
-
-        for &bucket in bucket_arena.buckets {
-            if bucket.state != .Locked { continue }
-            if !bucket.buffer.native.is_mapped {
-                wgpu.BufferMapAsync(
-                    bucket.buffer.native.buffer,
-                    {.Write},
-                    0,
-                    bucket.buffer.native.capacity,
-                    wgpu.BufferMapCallbackInfo{
-                        mode = .AllowProcessEvents,
-                        callback = bucket_remap_callback,
-                        userdata1 = bucket,
-                    },
-                )
-            }
-        }
-    }
-
-    bucket_remap_callback :: proc "c" (status: wgpu.MapAsyncStatus, message: wgpu.StringView, userdata1: rawptr, userdata2: rawptr) {
-        context = _state.ctx
-        if status != .Success {
-            log.errorf("bucket_arena: failed to remap chunk: %v", message)
-            return
-        }
-        chunk := (^Bucket)(userdata1)
-        chunk.buffer.native.is_mapped = true
-        chunk.buffer.cpu             = wgpu.RawBufferGetMappedRange(chunk.buffer.native.buffer, 0, chunk.buffer.native.capacity)
-        chunk.cursor                  = 0
-        chunk.state = .Mapped
-    }
-
     _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {
         bg_layout_entries := &_state.bg_layout_entries
         bg_entries := &_state.bg_entries
@@ -815,7 +901,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
             bg_entries[count] = wgpu.BindGroupEntry{
                 binding = u32(count),
                 buffer  = C.buffer,
-                offset  = u64(C.offset),
+                offset  = u64(C.byte_offset),
                 size    = max(u64(C.capacity), u64(_state.uniform_offset_align)),
             }
 
@@ -840,7 +926,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
                 bg_entries[count] = wgpu.BindGroupEntry{
                     binding = u32(count),
                     buffer  = res.buffer,
-                    offset  = u64(res.offset),
+                    offset  = u64(res.byte_offset),
                     size    = u64(res.capacity),
                 }
 
@@ -898,7 +984,7 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
                 bg_entries[count] = wgpu.BindGroupEntry{
                     binding = u32(count),
                     buffer  = res.buffer,
-                    offset  = u64(res.offset),
+                    offset  = u64(res.byte_offset),
                     size    = u64(res.capacity),
                 }
 
@@ -1040,90 +1126,6 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         return new_layout, new_pso_layout
     }
 
-    _render_pipeline_entry_equal :: proc(a, b: ^_Render_Pipeline_Cache_Entry) -> bool {
-        return a.bg_layout     == b.bg_layout     &&
-               a.meta          == b.meta          &&
-               a.depth_stencil == b.depth_stencil &&
-               a.settings      == b.settings      &&
-               a.write_mask    == b.write_mask
-    }
-
-    _get_or_create_render_pipeline :: proc(
-        bg_layout:     wgpu.BindGroupLayout,
-        pso_layout:    wgpu.PipelineLayout,
-        meta:          Pipeline,
-        depth_stencil: wgpu.DepthStencilState,
-        settings:      _Pipeline_Settings,
-    ) -> wgpu.RenderPipeline {
-        write_mask := wgpu.ColorWriteMaskFlags_All
-        key := _Render_Pipeline_Cache_Entry {
-            bg_layout     = bg_layout,
-            meta          = meta,
-            depth_stencil = depth_stencil,
-            settings      = settings,
-            write_mask    = write_mask,
-        }
-
-        for i in 0..<MAX_PIPELINE_CACHE_ENTRIES {
-            e := &_state.render_pipeline_cache[i]
-            if e.pipeline == nil { continue }
-            if _render_pipeline_entry_equal(e, &key) {
-                return e.pipeline
-            }
-        }
-
-        // Local copy of settings so we can take the address of fields for
-        // descriptor pointers; Odin does not let you take the address of a
-        // parameter's field directly.
-        settings_local := settings
-        target := wgpu.ColorTargetState{
-            format    = _pixel_format_interop(meta.color_format),
-            blend     = &settings_local.blend,
-            writeMask = write_mask,
-        }
-
-        v_state := wgpu.VertexState{
-            module      = meta.vertex_shader.module,
-            entryPoint  = meta.vertex_function,
-            bufferCount = 0,
-            buffers     = nil,
-        }
-        f_state := wgpu.FragmentState{
-            module      = meta.fragment_shader.module,
-            entryPoint  = meta.fragment_function,
-            targetCount = 1,
-            targets     = &target,
-        }
-
-        depth_format_wgpu := _pixel_format_interop(meta.depth_format)
-        dpso: wgpu.DepthStencilState
-        if depth_format_wgpu != .Undefined {
-            dpso = depth_stencil
-            dpso.format = depth_format_wgpu
-        }
-
-        pso := wgpu.DeviceCreateRenderPipeline(_state.device, &wgpu.RenderPipelineDescriptor{
-            layout       = pso_layout,
-            vertex       = v_state,
-            primitive    = settings_local.primitive,
-            multisample  = settings_local.multisample,
-            fragment     = &f_state,
-            depthStencil = nil if depth_format_wgpu == .Undefined else &dpso,
-        })
-        if pso == nil {
-            return nil
-        }
-        key.pipeline = pso
-
-        slot := int(_state.render_pipeline_cache_next)
-        old := &_state.render_pipeline_cache[slot]
-        _release_render_pipeline(old)
-        old^ = key
-        _state.render_pipeline_cache_next = u32((slot + 1) % MAX_PIPELINE_CACHE_ENTRIES)
-
-        return pso
-    }
-
     _compute_pipeline_entry_equal :: proc(a, b: ^_Compute_Pipeline_Cache_Entry) -> bool {
         return a.bg_layout == b.bg_layout &&
                a.meta      == b.meta
@@ -1166,6 +1168,65 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
 
     //////////////////////////////////////////////////////////////
     // Interop
+
+    _primitive_type_interop :: proc(primitive: Primitive) -> wgpu.PrimitiveTopology {
+        switch primitive {
+        case .Triangle: return .TriangleList
+        }
+        unreachable()
+    }
+
+    _cull_mode_interop :: proc(cull_mode: Cull_Mode) -> wgpu.CullMode {
+        switch cull_mode {
+        case .None:  return .None
+        case .Front: return .Front
+        case .Back:  return .Back
+        }
+        unreachable()
+    }
+
+    _front_face_winding_interop :: proc(winding: Front_Face) -> wgpu.FrontFace {
+        switch winding {
+        case .CCW: return .CCW
+        case .CW:  return .CW
+        }
+        unreachable()
+    }
+
+    _blend_operation_interop :: proc(op: Blend_Operation) -> wgpu.BlendOperation {
+        switch op {
+        case .Add:             return .Add
+        case .Subtract:        return .Subtract
+        case .ReverseSubtract: return .ReverseSubtract
+        case .Min:             return .Min
+        case .Max:             return .Max
+        }
+        unreachable()
+    }
+
+    _blend_factor_interop :: proc(f: Blend_Factor) -> wgpu.BlendFactor {
+        switch f {
+        case .Undefined:         return .Undefined
+        case .Zero:              return .Zero
+        case .One:               return .One
+        case .Src:               return .Src
+        case .OneMinusSrc:       return .OneMinusSrc
+        case .SrcAlpha:          return .SrcAlpha
+        case .OneMinusSrcAlpha:  return .OneMinusSrcAlpha
+        case .Dst:               return .Dst
+        case .OneMinusDst:       return .OneMinusDst
+        case .DstAlpha:          return .DstAlpha
+        case .OneMinusDstAlpha:  return .OneMinusDstAlpha
+        case .SrcAlphaSaturated: return .SrcAlphaSaturated
+        case .Constant:          return .Constant
+        case .OneMinusConstant:  return .OneMinusConstant
+        case .Src1:              return .Src1
+        case .OneMinusSrc1:      return .OneMinusSrc1
+        case .Src1Alpha:         return .Src1Alpha
+        case .OneMinusSrc1Alpha: return .OneMinusSrc1Alpha
+        }
+        unreachable()
+    }
 
     _compare_function_interop :: proc(compare: Compare_Function) -> wgpu.CompareFunction {
         switch compare {
@@ -1259,14 +1320,13 @@ when GPU_BACKEND == GPU_BACKEND_WGPU {
         unreachable()
     }
 
-    _frame_interval_ns :: proc() -> (u64, bool) {
-        // No presentedTime equivalent in WebGPU; engine falls back to
-        // its default frame budget when this returns false.
-        return 0, false
+    _frame_interval_ns :: proc() -> u64 {
+        // No presentedTime equivalent in WebGPU; the engine falls back to its
+        // default frame budget.
+        return 0
     }
 
     _set_hz :: proc(hz: u32) {
         // Browsers pace rAF to vsync; nothing to do here.
     }
 
-}

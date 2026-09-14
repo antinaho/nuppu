@@ -4,6 +4,7 @@ package nuppu_gpu
 import "base:runtime"
 import "core:log"
 import "core:strings"
+import "core:mem"
 import "core:fmt"
 
 _ :: fmt
@@ -36,9 +37,9 @@ __MAX_READ_WRITE_RESOURCES :: __MAX_BUFFERS + __MAX_READ_WRITE_TEXTURES
 
 __MAX_LAYOUT_BINDINGS      :: __MAX_CONSTANT_BUFFERS + __MAX_BUFFERS + __MAX_SAMPLED_TEXTURES + __MAX_READ_WRITE_TEXTURES + __MAX_SAMPLERS
 
-// Nuppu limits that make sense for the API. These can be changed if you need more
+// Bump these if you need more 
 MAX_CONSTANT_BUFFERS      :: 4
-MAX_BUFFERS               :: 4
+MAX_BUFFERS               :: 6
 MAX_SAMPLED_TEXTURES      :: 4
 MAX_READ_WRITE_TEXTURES   :: 4
 MAX_SAMPLERS              :: 4
@@ -46,7 +47,9 @@ MAX_SAMPLERS              :: 4
 MAX_READ_RESOURCE         :: MAX_BUFFERS + MAX_SAMPLED_TEXTURES
 MAX_READ_WRITE_RESOURCES  :: MAX_BUFFERS + MAX_READ_WRITE_TEXTURES
 
-MAX_LAYOUT_BINDINGS       :: MAX_CONSTANT_BUFFERS + MAX_BUFFERS + MAX_SAMPLED_TEXTURES + MAX_READ_WRITE_TEXTURES + MAX_SAMPLERS
+// Buffers may appear in both read and read_write, so account for the full
+// read + read_write capacity, not just the distinct resource counts.
+MAX_LAYOUT_BINDINGS       :: MAX_CONSTANT_BUFFERS + MAX_READ_RESOURCE + MAX_READ_WRITE_RESOURCES + MAX_SAMPLERS
 
 #assert(MAX_CONSTANT_BUFFERS <= __MAX_CONSTANT_BUFFERS)
 #assert(MAX_BUFFERS <= __MAX_BUFFERS)
@@ -67,12 +70,15 @@ _state: ^State
 
 State :: struct #align(64) {
     using impl: _State,
-    ctx: runtime.Context,
+
+    init_context: runtime.Context,
     is_init: bool,
+
+    // Backing store for buffer debug names, maybe slot arena type thing later?
+    name_arena: mem.Dynamic_Arena,
 }
 
-// Resources inside arrays need to be declared in the same order as they are in the shader
-// ConstantBuffer -> Texture/StructuredBuffer -> R/W/RWTexture -> Sampler
+// Mimics ParameterBlock from slang. 
 Parameter_Block :: struct {
     constants           : [MAX_CONSTANT_BUFFERS]ptr,
     read_resources      : [MAX_READ_RESOURCE]Parameter_Resource,
@@ -91,17 +97,17 @@ Parameter_Block_Destination :: enum {
 }
 
 ptr :: struct #all_or_none {
-    cpu: rawptr,
-    gpu: rawptr,
+    cpu                 : rawptr,
+    gpu                 : rawptr,
 
-    flags: Buffer_Flag,
-    alignment: u32,
+    flags               : Buffer_Flag,
+    alignment           : u32,
     total_capacity_bytes: u32,
-    byte_offset: u32,
+    byte_offset         : u32,
 
-    meta: Metadata,
+    meta                : Metadata,
 
-    using native: _ptr,
+    using native        : _ptr,
 }
 
 Buffer_Flag :: enum u32 {
@@ -123,13 +129,74 @@ Metadata :: struct
     created_at: runtime.Source_Code_Location,
 }
 
-Shader :: struct {
-    using native: _Shader,
+Shader_Module :: struct {
+    using native: _Shader_Module,
 }
 
-Shader_IR :: struct {
-    shader: Shader,
-    entry_point: string,
+Shader_Desc :: struct {
+    vertex_code:    string,
+    vertex_entry:   string,
+    fragment_code:  string,
+    fragment_entry: string,
+
+    color_format: Pixel_Format,
+    depth_format: Pixel_Format,
+
+    blend:       Blend_State,
+    multisample: Multisample_State,
+    topology:    Primitive,
+
+    block: Parameter_Block,
+}
+
+Shader :: struct {
+    using native: _Shader,
+    desc: Shader_Desc,
+}
+
+Draw_State :: struct #packed {
+    cull_mode:     Cull_Mode,
+    front_face:    Front_Face,
+    depth_compare: Compare_Function,
+    depth_write:   bool,
+}
+#assert(size_of(Draw_State) == 4)
+
+DEFAULT_DRAW_STATE :: Draw_State {
+    cull_mode     = .None,
+    front_face    = .CCW,
+    depth_compare = .Less,
+    depth_write   = true,
+}
+
+draw_state_key :: proc "contextless" (state: Draw_State) -> u32 {
+    return transmute(u32)state
+}
+
+BLEND_NONE :: Blend_State {
+    color = {
+        src = .One,
+        dst = .Zero,
+        op = .Add,
+    },
+    alpha = {
+        src = .One,
+        dst = .Zero,
+        op = .Add,
+    },
+}
+
+ALPHA_BLEND :: Blend_State {
+    alpha = {
+        src = .SrcAlpha,
+        dst = .OneMinusSrcAlpha,
+        op = .Add,
+    },
+    color = {
+        src = .SrcAlpha,
+        dst = .OneMinusSrcAlpha,
+        op = .Add,
+    }
 }
 
 Shader_Stage :: enum u8 {
@@ -192,7 +259,7 @@ StorageMode :: enum u8 {
 	Private    = 2,
 }
 
-Texture_Usage_Flag :: enum {
+Texture_Usage_Flag :: enum u8 {
     Sampled,
     Read,
     Write,
@@ -233,24 +300,15 @@ Depth_Attachment :: struct {
     texture: Texture,
 }
 
-Depth_Stencil_State :: struct {
-    using native: _Depth_Stencil_State,
-}   
-
-Depth_Stencil_State_Descriptor :: struct {
-	write_enabled: bool,
-	compare: Compare_Function,
-}
-
 Compare_Function :: enum u8 {
-    Never = 0x00000001,
-    Less = 0x00000002,
-    Equal = 0x00000003,
-    LessEqual = 0x00000004,
-    Greater = 0x00000005,
-    NotEqual = 0x00000006,
-    GreaterEqual = 0x00000007,
-    Always = 0x00000008,
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
 }
 
 Load_Action :: enum u8 {
@@ -264,28 +322,19 @@ Store_Action :: enum u8 {
     Store,
 }
 
-Pipeline :: struct {
-    using native: _Pipeline,
-}
-
 Compute_Pipeline :: struct {
     using native: _Compute_Pipeline,
 }
 
-Pipeline_Descriptor :: struct {
-    color_format: Pixel_Format,
-    depth_format: Pixel_Format,
+Front_Face :: enum u8 {
+    CCW,
+    CW,
 }
 
-Front_Face :: enum i32 {
-    CCW = 0x00000001,
-    CW = 0x00000002,
-}
-
-Cull_Mode :: enum i32 {
-    None = 0x00000001,
-	Front = 0x00000002,
-	Back = 0x00000003,
+Cull_Mode :: enum u8 {
+    None,
+	Front,
+	Back,
 }
 
 Multisample_State :: struct {
@@ -293,8 +342,8 @@ Multisample_State :: struct {
     mask: u32,
 }
 
-Primitive_Type :: enum u8 {
-    Triangle      = 3,
+Primitive :: enum u8 {
+    Triangle,
 }
 
 Blend_State :: struct {
@@ -303,38 +352,38 @@ Blend_State :: struct {
 }
 
 Blend_Component :: struct {
-	operation: Blend_Operation,
-	srcFactor: Blend_Factor,
-	dstFactor: Blend_Factor,
+	op: Blend_Operation,
+	src: Blend_Factor,
+	dst: Blend_Factor,
 }
 
 Blend_Operation :: enum i32 {
-	Add = 0x00000000,
-	Subtract = 0x00000001,
-	ReverseSubtract = 0x00000002,
-	Min = 0x00000003,
-	Max = 0x00000004,
+	Add,
+	Subtract,
+	ReverseSubtract,
+	Min,
+	Max,
 }
 
 Blend_Factor :: enum i32 {
-	Undefined = 0x00000000,
-	Zero = 0x00000001,
-	One = 0x00000002,
-	Src = 0x00000003,
-	OneMinusSrc = 0x00000004,
-	SrcAlpha = 0x00000005,
-	OneMinusSrcAlpha = 0x00000006,
-	Dst = 0x00000007,
-	OneMinusDst = 0x00000008,
-	DstAlpha = 0x00000009,
-	OneMinusDstAlpha = 0x0000000A,
-	SrcAlphaSaturated = 0x0000000B,
-	Constant = 0x0000000C,
-	OneMinusConstant = 0x0000000D,
-	Src1 = 0x0000000E,
-	OneMinusSrc1 = 0x0000000F,
-	Src1Alpha = 0x00000010,
-	OneMinusSrc1Alpha = 0x00000011,
+	Undefined,
+	Zero,
+	One,
+	Src,
+	OneMinusSrc,
+	SrcAlpha,
+	OneMinusSrcAlpha,
+	Dst,
+	OneMinusDst,
+	DstAlpha,
+	OneMinusDstAlpha,
+	SrcAlphaSaturated,
+	Constant,
+	OneMinusConstant,
+	Src1,
+	OneMinusSrc1,
+	Src1Alpha,
+	OneMinusSrc1Alpha,
 }
 
 init :: proc(
@@ -345,7 +394,8 @@ init :: proc(
     if _state != nil { return true }
 
     _state = state
-    _state.ctx = context
+    _state.init_context = context
+    mem.dynamic_arena_init(&_state.name_arena, context.allocator, context.allocator)
 
     return _init(native_window, swapchain_format)
 }
@@ -356,6 +406,8 @@ deinit :: proc() {
     if _state == nil { return }
     
     _deinit()
+
+    mem.dynamic_arena_destroy(&_state.name_arena)
 
     _state = nil
 }
@@ -368,36 +420,37 @@ release_ptr : proc(ptr: ^ptr) : _release_ptr
 // CPU side copy
 copy_to_texture : proc(texture: Texture, origin, size: [3]u32, level: u32, data: rawptr, bytes_per_row: u32) : _copy_to_texture
 
-depth_stencil_state_init :: proc(desc: Depth_Stencil_State_Descriptor) -> Depth_Stencil_State {
-    _depth_pso := _depth_stencil_state_init(desc)
+shader_module_init :: proc(identifier: string, code: []u8) -> Shader_Module {
+    native := _shader_module_init(identifier, code)
 
-    return Depth_Stencil_State {
-        native = _depth_pso,
+    return Shader_Module {
+        native = native,
     }
 }
 
-shader_init :: proc(identifier: string, code: []u8) -> Shader {
-    native := _shader_init(identifier, code)
+// Builds the immutable, bindable graphics object: modules + native pipeline +
+// baked resource set. This is the "prebuilt" shader state.
+shader_init :: proc(desc: Shader_Desc) -> Shader {
+    assert(desc.vertex_code != "", "shader_init: vertex_code is empty")
+    assert(desc.fragment_code != "", "shader_init: fragment_code is empty")
+    assert(desc.vertex_entry != "", "shader_init: vertex_entry is empty")
+    assert(desc.fragment_entry != "", "shader_init: fragment_entry is empty")
+    assert(desc.color_format != .None, "shader_init: color_format must be set")
+
+    native := _shader_init(desc)
 
     return Shader {
         native = native,
+        desc   = desc,
     }
 }
 
-pipeline_init :: proc(vertex, fragment: Shader_IR, pipeline_descriptor: Pipeline_Descriptor) -> Pipeline {
-    assert(vertex.entry_point != "")
-    assert(fragment.entry_point != "")
-    assert(pipeline_descriptor.color_format != .None)
-
-    native := _pipeline_init(vertex, fragment, pipeline_descriptor)
-
-    return Pipeline {
-        native = native,
-    }
+shader_deinit :: proc(shader: ^Shader) {
+    _shader_deinit(shader)
 }
 
-compute_pipeline_init :: proc(shader: Shader, entry_point: string) -> Compute_Pipeline {
-    native := _compute_pipeline_init(shader, entry_point)
+compute_pipeline_init :: proc(module: Shader_Module, entry_point: string) -> Compute_Pipeline {
+    native := _compute_pipeline_init(module, entry_point)
 
     result := Compute_Pipeline {
         native = native,
@@ -421,7 +474,17 @@ set_hz : proc(hz: u32) : _set_hz
 
 compute_dispatch : proc(num_groups: [3]u32, num_threads_per_group: [3]u32) : _compute_dispatch
 set_compute_pipeline : proc(compute_pipeline: Compute_Pipeline) : _set_compute_pipeline
-set_pipeline : proc(pipeline: Pipeline) : _set_pipeline
+
+// Binds the prebuilt shader (pipeline + baked block). One engine call; the
+// backend no-ops when the same shader is already bound.
+set_shader : proc(shader: ^Shader) : _set_shader
+
+// Applies the cheap dynamic state (cull/front/depth). Metal: encoder calls.
+// WGPU: selects a cached pipeline variant.
+set_draw_state : proc(state: Draw_State) : _set_draw_state
+
+// Runtime resource swap: replace the shader's block (e.g. bind a different texture)
+set_parameter_block : proc(shader: ^Shader, block: ^Parameter_Block) : _set_parameter_block
 
 sampler_init :: proc(desc: Sampler_Descriptor) -> Sampler {
     native := _sampler_init(desc)
@@ -431,7 +494,6 @@ sampler_init :: proc(desc: Sampler_Descriptor) -> Sampler {
     }
 }
 
-// TODO make _texture_init return Texture
 texture_init :: proc(desc: Texture_Descriptor) -> Texture {
     assert(desc.dimensions.x <= MAX_2D_TEXTURE_SIZE)
     assert(desc.dimensions.y <= MAX_2D_TEXTURE_SIZE)
@@ -458,35 +520,32 @@ texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture 
     return texture_init(desc)
 }
 
-set_depth_stencil_state : proc(depth_stencil_state: Depth_Stencil_State) : _set_depth_stencil_state
 begin_render_pass : proc(color_attachment: Color_Attachment, depth_attachment: Depth_Attachment = {}) : _begin_render_pass
 end_render_pass : proc() : _end_render_pass
-set_cull_mode : proc(cull_mode: Cull_Mode) : _set_cull_mode
-set_front_face_winding : proc(winding: Front_Face) : _set_front_face_winding
 
 when ODIN_OS != .JS {
 // Push struct to buffer
 temp_malloc : proc(bytes: []u8, buffer_index: u32, shader_stage: Shader_Stage) : _temp_malloc
 }
 
-draw_indiced_primitives :: proc(parameter_block: ^Parameter_Block, index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
-    _draw_indiced_primitives(parameter_block, .Triangle, index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance, .Uint16)
+draw_indexed :: proc(index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
+    _draw_indexed(index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance)
 }
 
 malloc :: proc(
-    bytes: u32,
+    #any_int bytes: uint,
     alignment:   u32,
     flag: Buffer_Flag,
     name:        string     = "",
     loc:                    = #caller_location,
-) -> (ptr, bool) {
+) -> (ptr, bool) #optional_ok {
 
     if min_alignment := _min_alignment(flag); alignment < min_alignment {
         log.errorf("In malloc() passed in alignment %i is less than the minimum required for flags %v. Bump to %i", alignment, flag, min_alignment)
         return {}, false
     }
     
-    capacity := runtime.align_forward(uint(bytes), uint(alignment))
+    capacity := runtime.align_forward(bytes, uint(alignment))
 
     _ptr := _malloc(bytes, alignment, flag, name, loc)
 
@@ -499,7 +558,7 @@ malloc :: proc(
         total_capacity_bytes = u32(capacity),
         byte_offset = 0,
         meta   = Metadata {
-            name = strings.clone(name, context.allocator),
+            name = strings.clone(name, mem.dynamic_arena_allocator(&_state.name_arena)),
             created_at = loc,
         },
     }, true
@@ -511,10 +570,11 @@ unmap : proc(ptr: ^ptr, offset: i64 = 0, length: i64 = -1) : _unmap
 // Copies src data into dst
 copy : proc(dst, src: ptr) : _copy
 
-// Sets shader's parameter block to be used for the next draw call/compute dispatch
+// Low-level resource bind. Graphics use `set_shader`/`set_parameter_block`;
+// this remains for the compute dispatch path.
 use_parameter_block : proc(block: ^Parameter_Block, destination: Parameter_Block_Destination = .Graphics) : _use_parameter_block
 
-// Ends before stage
+// Ends 'before' stage
 barrier : proc(before: Stage, after: Stage) : _barrier
 semaphore : proc(value: u64) -> Timeline_Semaphore : _semaphore
 semaphore_wait : proc(semaphore: Timeline_Semaphore, value: u64) -> bool : _semaphore_wait
