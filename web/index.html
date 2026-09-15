@@ -17,7 +17,41 @@
 
 			const wgpuInterface = new odin.WebGPUInterface(memInterface);
 
-			odin.runWasm("nuppu.wasm", null, { wgpu: wgpuInterface.getInterface() }, memInterface, /*intSize=8*/);
+			// Sync-XHR file loader for `io.read_entire_file`. Holds only the most
+			// recently fetched file so scene switches release prior data; the Odin
+			// side owns the actual copy.
+			let _filePath = null, _fileBytes = null;
+			function fetchFileSync(path) {
+				if (_filePath === path) { return _fileBytes; }
+				const xhr = new XMLHttpRequest();
+				xhr.open("GET", path, false);
+				xhr.overrideMimeType("text/plain; charset=x-user-defined");
+				xhr.send(null);
+				_fileBytes = null;
+				if (xhr.status === 200 || xhr.status === 0) {
+					const text = xhr.responseText;
+					_fileBytes = new Uint8Array(text.length);
+					for (let i = 0; i < text.length; i++) { _fileBytes[i] = text.charCodeAt(i) & 0xff; }
+				}
+				_filePath = path;
+				return _fileBytes;
+			}
+
+			const ioInterface = {
+				_file_size: (pathPtr, pathLen) => {
+					const b = fetchFileSync(memInterface.loadString(pathPtr, pathLen));
+					return b ? b.length : -1;
+				},
+				_file_read: (pathPtr, pathLen, dst, len) => {
+					const b = fetchFileSync(memInterface.loadString(pathPtr, pathLen));
+					if (!b) { return -1; }
+					const n = Math.min(len, b.length);
+					new Uint8Array(memInterface.memory.buffer, dst, n).set(b.subarray(0, n));
+					return n;
+				},
+			};
+
+			odin.runWasm("nuppu.wasm", null, { wgpu: wgpuInterface.getInterface(), io_env: ioInterface }, memInterface, /*intSize=8*/);
 		</script>
 	</body>
 </html>
