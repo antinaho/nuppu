@@ -27,6 +27,9 @@
 !platform/
 !platform/**
 
+!io/
+!io/**
+
 !tests/
 !tests/**
 
