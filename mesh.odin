@@ -54,7 +54,7 @@ Mesh_Library :: struct {
 mesh_library_init :: proc(lib: ^Mesh_Library) {
     bit_array.init(&lib.meshes)
 
-    lib.vertex_arena, _ = gpu.arena_init(VERTEX_BLOB_SIZE, flags = .Default)
+    lib.vertex_arena, _ = gpu.arena_init(VERTEX_BLOB_SIZE, 256, flags = .Default)
     lib.index_arena, _ = gpu.arena_init(size_of(Vertex_Index) * GLOBAL_INDEX_COUNT_MAX, flags = .Index)
 
     create_built_in_meshes()
@@ -102,12 +102,13 @@ mesh_upload :: proc(
     idx := gpu.arena_alloc_raw(&upload, size_of(Vertex_Index), uint(len(indices)), 4)
     intrinsics.mem_copy_non_overlapping(idx.cpu, raw_data(indices), size_of(Vertex_Index) * len(indices))
 
-    gpu.unmap(&upload.ptr)
     gpu.begin_commands()
     gpu.copy(mesh.verts, verts)
     gpu.copy(mesh.indices, idx)
     gpu.barrier(.Transfer, .All)
     gpu.commit_commands()
+
+    gpu.release_ptr(&upload.ptr)
 
     return handle
 }
@@ -154,12 +155,12 @@ create_built_in_meshes :: proc() {
         _state.mesh_library.built_in_lookup[.Quad] = quad_handle
         quad_mesh, _ := get_resource(&_state.mesh_library.meshes, quad_handle)
 
-        gpu.unmap(&upload.ptr)
         gpu.begin_commands()
         gpu.copy(quad_mesh.verts, verts)
         gpu.copy(quad_mesh.indices, indices)
         gpu.barrier(.Transfer, .All)
         gpu.commit_commands()
+        gpu.release_ptr(&upload.ptr)
     }
 
     // Cube
@@ -211,6 +212,7 @@ create_built_in_meshes :: proc() {
         upload, _ := gpu.arena_init(size_of(Vertex) * VERTEX_COUNT + size_of(Vertex_Index) * INDEX_COUNT)
         verts := gpu.arena_alloc(&upload, Vertex, VERTEX_COUNT)
         intrinsics.mem_copy_non_overlapping(verts.cpu, &v, size_of(v))
+        
         indices := gpu.arena_alloc(&upload, Vertex_Index, INDEX_COUNT)
         intrinsics.mem_copy_non_overlapping(indices.cpu, &i, size_of(i))
 
@@ -218,11 +220,11 @@ create_built_in_meshes :: proc() {
         _state.mesh_library.built_in_lookup[.Cube] = cube_handle
         cube_mesh, _ := get_resource(&_state.mesh_library.meshes, cube_handle)
 
-        gpu.unmap(&upload.ptr)
         gpu.begin_commands()
         gpu.copy(cube_mesh.verts, verts)
         gpu.copy(cube_mesh.indices, indices)
         gpu.barrier(.Transfer, .All)
         gpu.commit_commands()
+        gpu.release_ptr(&upload.ptr)
     }
 }

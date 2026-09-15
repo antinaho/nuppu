@@ -98,7 +98,6 @@ State :: struct #align(64) {
 
     mesh_library: Mesh_Library,
     frame_uniform: gpu.ptr,
-    frame_uniform_staging: [FRAMES_IN_FLIGHT]gpu.ptr,
 
     draw_batcher: Draw_Batcher,
     material_library: Material_Library,
@@ -288,25 +287,19 @@ deinit :: proc() {
     when ODIN_DEBUG {
         _report_unfreed_resources()
     }
-    // Drain all submitted GPU work before releasing resources. The Metal
-    // presented-handler blocks run on a driver thread and write present timing
-    // into the GPU state, so tearing that state down while work is in flight is
-    // a use-after-free.
+
     if _state.frame_semaphore != nil {
         // `end_frame` signals the semaphore with the frame's `n`; the last
         // submitted frame is `frame_n - 1`.
         gpu.semaphore_wait(_state.frame_semaphore, _state.frame_n - 1)
     }
-        
+
     destroy_draw_batcher(&_state.draw_batcher)
     _shader_lib_deinit(&_state.shader_library)
     _material_lib_deinit(&_state.material_library)
 
-    // Engine-lifetime GPU buffers. Their debug names live in gpu's name arena
-    // and are freed with it in gpu.deinit.
     for i in 0 ..< FRAMES_IN_FLIGHT {
         gpu.release_ptr(&_state.frame_arenas[i].ptr)
-        gpu.release_ptr(&_state.frame_uniform_staging[i])
     }
     gpu.release_ptr(&_state.frame_uniform)
     gpu.release_ptr(&_state.mesh_library.vertex_arena.ptr)
@@ -467,7 +460,7 @@ begin_frame :: proc() -> Frame {
         arena     = arena,
     }
 
-    batcher_reset(frame, &_state.draw_batcher)
+    batcher_reset(&_state.draw_batcher)
 
     return frame
 }
@@ -475,25 +468,22 @@ begin_frame :: proc() -> Frame {
 end_frame :: proc(frame: Frame) {
     gpu.end_frame(frame.semaphore, frame.n)
     _state.frame_n += 1
-
-    recycle_frame_arena(frame.arena)
 }
 
-update_constants :: proc() {
+update_constants :: proc(frame: Frame) {
     cam, ok := entity_get_typed(_state.entity_manager, _state.main_camera, Camera)
     if !ok { return }
 
-    staging := &_state.frame_uniform_staging[_state.frame_n % FRAMES_IN_FLIGHT]
-    uniforms := (^Engine_Uniform)(staging.cpu)
-    uniforms.cam_perspective_transform = glm.mat4Perspective(
+    uniform := gpu.arena_alloc(frame.arena, Engine_Uniform, 1)
+    u := (^Engine_Uniform)(uniform.cpu)
+    u.cam_perspective_transform = glm.mat4Perspective(
         glm.radians_f32(cam.fovy), cam.aspect_ratio, cam.near, cam.far,
     )
-    uniforms.cam_ortho_transform = 1
-    uniforms.cam_world_transform  = glm.mat4Translate(-cam.position)  // identity entity-world; just the camera shift
-    uniforms.cam_position        = cam.position
+    u.cam_ortho_transform = 1
+    u.cam_world_transform  = glm.mat4Translate(-cam.position)  // identity entity-world; just the camera shift
+    u.cam_position        = cam.position
 
-    gpu.unmap(staging)
-    gpu.copy(_state.frame_uniform, staging^)
+    gpu.copy(_state.frame_uniform, uniform)
     gpu.barrier(.Transfer, .All)
 }
 
@@ -568,12 +558,6 @@ end_render_pass :: proc() {
     gpu.end_render_pass()
 }
 
-recycle_frame_arena :: proc(arena: ^gpu.Arena) {
-    when ODIN_OS != .JS {
-        /* no op */
-    }
-}
-
 @(private="file", export)
 step :: proc(dt: f32) -> bool {
     assert(_state != nil)
@@ -590,7 +574,7 @@ step :: proc(dt: f32) -> bool {
         }
     }
 
-    switch _frame() {
+    switch _frame(u64(f64(dt) * f64(time.Second))) {
     case .Exit:
         if _state.desc.deinit != nil {
             _state.desc.deinit()
@@ -606,7 +590,7 @@ step :: proc(dt: f32) -> bool {
     return true
 }
 
-_frame :: proc() -> Frame_Result {
+_frame :: proc(external_ns : u64 = 0) -> Frame_Result {
 
     free_all(context.temp_allocator)
     //reset_batches(&_state.instance_batcher)
@@ -622,8 +606,7 @@ _frame :: proc() -> Frame_Result {
         return .Exit
     }
     
-    interval_ns := gpu.frame_interval_ns()
-
+    interval_ns := external_ns if external_ns > 0 else gpu.frame_interval_ns()
     if interval_ns > MAX_FRAME_DT_NS {
         interval_ns = MAX_FRAME_DT_NS
     }
@@ -671,7 +654,7 @@ _ready_up :: proc() {
     _state.frame_semaphore = gpu.semaphore(0)
 
     for i in 0 ..< FRAMES_IN_FLIGHT {
-        _state.frame_arenas[i], _ = gpu.arena_init(4 * 1024 * 1024)
+        _state.frame_arenas[i], _ = gpu.arena_init(CONFIG.frame_upload_bytes)
     }
 
     _state.window_size = platform.window_size_pixel()
@@ -700,10 +683,7 @@ _ready_up :: proc() {
 
     mesh_library_init(&_state.mesh_library)
 
-    _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), align_of(Engine_Uniform), .Constant, "Frame Uniform")
-    for i in 0 ..< FRAMES_IN_FLIGHT {
-        _state.frame_uniform_staging[i], _ = gpu.malloc(size_of(Engine_Uniform), align_of(Engine_Uniform), .Staging, "Frame Uniform Staging")
-    }
+    _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), 256, .Constant, "Frame Uniform")
 
     _state.sampler = gpu.sampler_init({
         mag_filter = .Nearest,

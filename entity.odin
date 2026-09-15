@@ -6,6 +6,8 @@ import "core:mem"
 import "core:log"
 import "core:slice"
 
+PTR_SIZE :: size_of(uintptr) * 8
+
 ENTITY_INDEX      :: u16
 ENTITY_GENERATION :: u8
 ENTITY_VARIANT    :: u8
@@ -484,7 +486,7 @@ _data_chunk_for :: proc "contextless" (
     index: int
 ) -> (ci: int, off: int) #no_bounds_check {
     j := index + data.first_chunk_size
-    e := 63 - intrinsics.count_leading_zeros(j)
+    e := PTR_SIZE - 1 - intrinsics.count_leading_zeros(j)
     p := 1 << uint(e)
     ci  = e - intrinsics.count_trailing_zeros(data.first_chunk_size)
     off = j - p

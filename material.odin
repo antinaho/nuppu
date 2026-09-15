@@ -131,8 +131,6 @@ material_upload :: proc(scope: ^Material_Upload_Scope, shader: Shader_Handle, st
 
 __material_upload_scope_end :: proc(scope: ^Material_Upload_Scope) {
     lib := &_state.material_library
-    gpu.unmap(&scope.staging_mat)
-    gpu.unmap(&scope.staging_params.ptr)
     gpu.begin_commands()
     gpu.copy(lib.private_material_buffer, scope.staging_mat)
     gpu.copy(lib.private_params_buffer, scope.staging_params.ptr)
@@ -162,11 +160,11 @@ _material_lib_init :: proc(lib: ^Material_Library, allocator := context.allocato
     ok: bool
     lib.private_material_buffer, ok = gpu.malloc(
         u32(CONFIG.max_materials * size_of(GPU_Material_Instance)),
-        u32(align_of(GPU_Material_Instance)), .Default, "Material Buffer",
+        256, .Default, "Material Buffer",
     )
     assert(ok, "material_lib_init: failed to alloc material buffer")
 
-    lib.private_params_buffer, ok = gpu.malloc(CONFIG.material_param_bytes, 16, .Default, "Material params") 
+    lib.private_params_buffer, ok = gpu.malloc(CONFIG.material_param_bytes, 256, .Default, "Material params") 
     assert(ok, "material_lib_init: failed to alloc material params buffer")
 
     lib.material_types       = make([dynamic]typeid, 0, 64, allocator)

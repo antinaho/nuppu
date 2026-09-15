@@ -19,6 +19,9 @@ CONFIG : struct {
     // Instance data
     max_instance_data_bytes: int, // per entity, per frame
 
+    // Frame upload arena (per frame in flight)
+    frame_upload_bytes: int,
+
 } : {
 
     // Material
@@ -36,4 +39,7 @@ CONFIG : struct {
 
     // Instance data
     max_instance_data_bytes = 64,
+
+    // Frame upload arena (per frame in flight)
+    frame_upload_bytes = 16 * mem.Megabyte,
 }

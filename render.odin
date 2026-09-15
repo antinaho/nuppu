@@ -5,7 +5,6 @@ import "gpu"
 import "bit_array"
 import "base:intrinsics"
 import "base:runtime"
-import "core:mem"
 import "core:slice"
 import glm "core:math/linalg/glsl"
 import "core:log"
@@ -13,10 +12,6 @@ import "core:log"
 Built_in_texture :: enum u32 {
     Depth,
     Swapchain,
-}
-
-get_built_in_mesh :: proc(built_in_mesh: Built_In_Mesh) -> (^Mesh, bool) #optional_ok {
-    return get_mesh(_state.mesh_library.built_in_lookup[built_in_mesh])
 }
 
 built_in_mesh_handle :: proc(built_in_mesh: Built_In_Mesh) -> Mesh_Handle {
@@ -55,6 +50,12 @@ MAX_INSTANCES_PER_FRAME :: 1 << 16
 // so byte offset 0 can mean "no instance data".
 INSTANCE_DATA_REGION_SIZE :: MAX_INSTANCES_PER_FRAME * CONFIG.max_instance_data_bytes + 16
 #assert(u64(FRAMES_IN_FLIGHT * INSTANCE_DATA_REGION_SIZE) <= u64(max(u32)), "instance data buffer exceeds u32 address space")
+#assert(
+    CONFIG.frame_upload_bytes >=
+        MAX_INSTANCES_PER_FRAME * (size_of(Instance) + CONFIG.max_instance_data_bytes) +
+        16 + size_of(Engine_Uniform) + 64,
+    "CONFIG.frame_upload_bytes must fit the worst-case culled instance + instance-data blob, the sentinel, the frame uniform and alignment padding",
+)
 
 // ============================================================================
 // Draw batcher
@@ -62,8 +63,9 @@ INSTANCE_DATA_REGION_SIZE :: MAX_INSTANCES_PER_FRAME * CONFIG.max_instance_data_
 // Pipeline:
 //   submit / gather -> flat Submission list (transform + material handles + mesh)
 //   cull(frame): frustum-test + compact
-//   finish_instance_upload(frame): sort by mesh, write the instance blob, emit
-//     Draw_Command runs
+//   finish_instance_upload(frame): sort by mesh, pack instances + their data into
+//     the frame upload arena, flush it once, copy into the device-local
+//     double-buffered instance buffers, emit Draw_Command runs
 //   draw_all_instances(frame): one draw per mesh run
 // ============================================================================
 
@@ -72,6 +74,11 @@ Submission :: struct {
     mesh:       Mesh_Handle,
     shader:     Shader_Handle,
     draw_state: Draw_State,
+
+    // Transient source of this entity's `gpu_instance` bytes. Copied into the
+    // frame upload arena during finish_instance_upload; never shader-visible.
+    data_src:  rawptr,
+    data_size: uint,
 }
 
 Draw_Command :: struct {
@@ -87,13 +94,10 @@ Draw_Batcher :: struct {
     sorted:        [dynamic]int,
     draw_commands: [dynamic]Draw_Command,
 
+    // Device-local, one region per frame-in-flight. Filled each frame from the
+    // frame upload arena by a staged copy.
     instance_base_buffer: gpu.ptr,
-
-    // Per-frame arena for arbitrary per-entity shader data. `Instance.data_offset`
-    // points into this buffer. Offset 0 is reserved as the nil sentinel.
-    instance_data_buffer:     gpu.ptr,
-    instance_data_cursor:     uint,
-    instance_data_region_end: uint,
+    instance_data_buffer: gpu.ptr,
 
     allocator: runtime.Allocator,
     is_init:   bool,
@@ -110,12 +114,12 @@ init_draw_batcher :: proc(batcher: ^Draw_Batcher, allocator := context.allocator
     batcher.draw_commands = make([dynamic]Draw_Command, 0, INITIAL_CAP, allocator)
 
     base_bytes := u32(MAX_INSTANCES_PER_FRAME * FRAMES_IN_FLIGHT * size_of(Instance))
-    base_ptr, base_ok := gpu.malloc(base_bytes, u32(align_of(Instance)), .Staging, "Instance Base Staging")
+    base_ptr, base_ok := gpu.malloc(base_bytes, 256, .Default, "Instance Base")
     assert(base_ok, "draw_batcher: failed to alloc instance base buffer")
     batcher.instance_base_buffer = base_ptr
 
     data_bytes := u32(FRAMES_IN_FLIGHT * INSTANCE_DATA_REGION_SIZE)
-    data_ptr, data_ok := gpu.malloc(data_bytes, 16, .Staging, "Instance Data Staging")
+    data_ptr, data_ok := gpu.malloc(data_bytes, 256, .Default, "Instance Data")
     assert(data_ok, "draw_batcher: failed to alloc instance data buffer")
     batcher.instance_data_buffer = data_ptr
 }
@@ -130,52 +134,9 @@ destroy_draw_batcher :: proc(batcher: ^Draw_Batcher) {
     batcher^ = {}
 }
 
-// Explicit submission path. Uses the global batcher. Instances submitted here
-// carry no per-entity data (data_offset stays 0, shaders use their defaults).
-submit_instance :: proc(
-    mesh: Mesh_Handle,
-    position, scale, rotation: [3]f32,
-    materials: [CONFIG.entity_max_materials]Material_Handle,
-    entity_id: u32 = 0,
-) {
-    batcher := &_state.draw_batcher
-    if len(batcher.submissions) >= MAX_INSTANCES_PER_FRAME {
-        panic("draw_batcher: max instances per frame exceeded")
-    }
-    shader, state := material_shader_of(materials[0])
-    append(&batcher.submissions, Submission {
-        base       = make_instance(position, scale, rotation, materials, entity_id),
-        mesh       = mesh,
-        shader     = shader,
-        draw_state = state,
-    })
-}
-
-batcher_reset :: proc(frame: Frame, batcher: ^Draw_Batcher) {
+batcher_reset :: proc(batcher: ^Draw_Batcher) {
     clear(&batcher.submissions)
     clear(&batcher.draw_commands)
-
-    // Each frame owns a region of the data arena; the first 16 bytes of every
-    // region are reserved so offset 0 always means "no instance data".
-    f := uint(frame.n % FRAMES_IN_FLIGHT)
-    region_size := uint(INSTANCE_DATA_REGION_SIZE)
-    batcher.instance_data_cursor     = f * region_size + 16
-    batcher.instance_data_region_end = (f + 1) * region_size
-}
-
-// Copies `size` bytes of per-entity data into the current frame's arena region
-// and returns the 16-byte-aligned byte offset. Offset 0 is never returned.
-_push_instance_data :: proc(batcher: ^Draw_Batcher, src: rawptr, size: int) -> u32 {
-    if size <= 0 { return 0 }
-
-    offset := mem.align_forward_uint(batcher.instance_data_cursor, 16)
-    if offset + uint(size) > batcher.instance_data_region_end {
-        panic("draw_batcher: instance data arena overflow")
-    }
-
-    intrinsics.mem_copy(rawptr(uintptr(batcher.instance_data_buffer.cpu) + uintptr(offset)), src, size)
-    batcher.instance_data_cursor = offset + mem.align_forward_uint(uint(size), 16)
-    return u32(offset)
 }
 
 // ----------------------------------------------------------------------------
@@ -183,6 +144,7 @@ _push_instance_data :: proc(batcher: ^Draw_Batcher, src: rawptr, size: int) -> u
 // ----------------------------------------------------------------------------
 
 _gather_entity_submissions :: proc(batcher: ^Draw_Batcher, em: ^Entity_Manager) {
+
     for v in 0 ..< len(em.variants) {
         if .Has_Mesh not_in em.flags[v] { continue }
 
@@ -203,23 +165,23 @@ _gather_entity_submissions :: proc(batcher: ^Draw_Batcher, em: ^Entity_Manager) 
             if len(batcher.submissions) >= MAX_INSTANCES_PER_FRAME {
                 panic("draw_batcher: max instances per frame exceeded")
             }
-            
-            base := make_instance(
-                entity.position, entity.scale, entity.rotation,
-                entity.materials, u32(entity.handle.handle.variant),
-            )
-            if data_size > 0 {
-                src := rawptr(uintptr(variant) + uintptr(data_offset))
-                base.data_offset = _push_instance_data(batcher, src, data_size)
-            }
 
             shader, draw_state := material_shader_of(entity.materials[0])
-            append(&batcher.submissions, Submission {
-                base       = base,
+            sub := Submission {
+                base       = make_instance(
+                    entity.position, entity.scale, entity.rotation,
+                    entity.materials, u32(entity.handle.handle.variant),
+                ),
                 mesh       = entity.mesh,
                 shader     = shader,
                 draw_state = draw_state,
-            })
+            }
+            if data_size > 0 {
+                sub.data_src  = rawptr(uintptr(variant) + uintptr(data_offset))
+                sub.data_size = uint(data_size)
+            }
+
+            append(&batcher.submissions, sub)
         }
     }
 }
@@ -337,20 +299,38 @@ finish_instance_upload :: proc(frame: Frame) {
     f := int(frame.n % FRAMES_IN_FLIGHT)
     n := len(batcher.submissions)
 
-    clear(&batcher.draw_commands)
     if n == 0 { return }
 
     resize(&batcher.sorted, n)
     for i in 0 ..< n { batcher.sorted[i] = i }
     slice.sort_by_with_data(batcher.sorted[:], _submission_index_less, rawptr(batcher))
 
-    base_region := uintptr(batcher.instance_base_buffer.cpu) +
-        uintptr(f) * uintptr(MAX_INSTANCES_PER_FRAME) * uintptr(size_of(Instance))
+    arena := frame.arena
+
+    // Culled base instances, contiguous in draw order.
+    base_view := gpu.arena_alloc(arena, Instance, uint(n))
+
+    // Per-entity data is packed after a 16-byte sentinel so a real offset can
+    // never collide with the "no data" sentinel 0.
+    data_sentinel: gpu.ptr
+    data_started := false
 
     run_start := 0
     for i in 0 ..< n {
         s := batcher.submissions[batcher.sorted[i]]
-        ([^]Instance)(rawptr(base_region))[i] = s.base
+
+        if s.data_size > 0 {
+            if !data_started {
+                data_sentinel = gpu.arena_alloc_raw(arena, 1, 16, 16)
+                data_started = true
+            }
+            view := gpu.arena_alloc_raw(arena, 1, s.data_size, 16)
+            intrinsics.mem_copy_non_overlapping(view.cpu, s.data_src, int(s.data_size))
+            s.base.data_offset = u32(f) * u32(INSTANCE_DATA_REGION_SIZE) +
+                u32(view.byte_offset - data_sentinel.byte_offset)
+        }
+
+        ([^]Instance)(base_view.cpu)[i] = s.base
 
         is_last := i == n - 1
         same_run := false
@@ -371,6 +351,31 @@ finish_instance_upload :: proc(frame: Frame) {
             run_start = i + 1
         }
     }
+
+    // Flush the used arena regions, then copy them into the device-local
+    // double buffers for the current frame region.
+    base_bytes := u32(n) * u32(size_of(Instance))
+    gpu.copy(
+        gpu.sub_alloc(
+            batcher.instance_base_buffer,
+            u32(f) * u32(MAX_INSTANCES_PER_FRAME) * u32(size_of(Instance)),
+            base_bytes,
+        ),
+        base_view,
+    )
+
+    if data_started {
+        data_bytes := u32(arena.offset - uint(data_sentinel.byte_offset))
+        data_view := gpu.sub_alloc(arena.ptr, data_sentinel.byte_offset, data_bytes)
+        gpu.copy(
+            gpu.sub_alloc(batcher.instance_data_buffer, u32(f) * u32(INSTANCE_DATA_REGION_SIZE), data_bytes),
+            data_view,
+        )
+    }
+
+    // Close any transfer encoder opened by the copies above so the caller can
+    // start a render/compute pass without an encoder conflict (Metal).
+    gpu.barrier(.Transfer, .All)
 }
 
 // ----------------------------------------------------------------------------
