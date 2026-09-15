@@ -13,14 +13,14 @@ Handle :: distinct u32
 NIL_HANDLE :: Handle {}
 //
 Bit_Array :: struct($T: typeid, $N: u64, $H: typeid)
-    where N > 0 &&
-          N < (1 << 23) &&
-          intrinsics.type_has_field (T, "handle") &&
+    where N > 0,
+          N < (1 << 23),
+          intrinsics.type_has_field (T, "handle"),
           (
               intrinsics.type_field_type(T, "handle") == Handle ||
               intrinsics.type_field_type(T, "handle") == H
-          ) &&
-          intrinsics.type_has_field (H, "handle") &&
+          ),
+          intrinsics.type_has_field (H, "handle"),
           intrinsics.type_field_type(H, "handle") == Handle
 {
     items:  [N]T,
@@ -194,7 +194,7 @@ iterator_next :: proc "contextless" (
 //
 
 Bit_Bucket :: struct($N: u64)
-    where N > 0 &&
+    where N > 0,
           N % 64 == 0
 {
     l0: [N / 64]u64,
