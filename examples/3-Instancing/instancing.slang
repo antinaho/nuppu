@@ -2,7 +2,7 @@ struct v2f {
     float4 position : SV_Position;
     float3 color    : COLOR0;
     float2 tex_coord : TEXCOORD0;
-    uint   material : MATERIAL;
+    nointerpolation uint  material : MATERIAL;
 };
 
 struct Vertex {

@@ -152,14 +152,13 @@ _update :: proc() {
 
 _render :: proc(current: ^State, alpha: f32) {
     frame := nuppu.begin_frame()
-    nuppu.update_constants()
+    nuppu.update_constants(frame)
     defer nuppu.end_frame(frame)
 
     // Animation uniform for the compute pass.
     arena := nuppu.frame_arena(frame)
     anim  := gpu.arena_alloc(arena, u32, 1)
     (^u32)(anim.cpu)^ = current.animation_index
-    gpu.unmap(&arena.ptr)
     gpu.copy(current.animation_uniform, anim)
     gpu.barrier(.Transfer, .All)
 
@@ -197,12 +196,17 @@ _render :: proc(current: ^State, alpha: f32) {
     nuppu.end_render_pass()
 }
 
+_deinit :: proc() {
+    gpu.release_ptr(&state.animation_uniform)
+}
+
 desc := nuppu.App_Desc(State) {
     state       = &state,
     window_size = {1000, 1000},
     init        = _init,
     update      = _update,
     render      = _render,
+    deinit      = _deinit,
 }
 
 main :: proc() {

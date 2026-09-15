@@ -51,7 +51,7 @@ struct v2f_0
     @builtin(position) position_0 : vec4<f32>,
     @location(0) color_0 : vec3<f32>,
     @location(1) tex_coord_0 : vec2<f32>,
-    @location(2) material_0 : u32,
+    @interpolate(flat) @location(2) material_0 : u32,
 };
 
 @vertex
@@ -135,7 +135,7 @@ struct pixelInput_0
 {
     @location(0) color_1 : vec3<f32>,
     @location(1) tex_coord_1 : vec2<f32>,
-    @location(2) material_1 : u32,
+    @interpolate(flat) @location(2) material_1 : u32,
 };
 
 @fragment

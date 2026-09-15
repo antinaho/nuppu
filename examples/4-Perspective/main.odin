@@ -110,7 +110,7 @@ _update :: proc() {
 
 _render :: proc(current: ^State, alpha: f32) {
     frame := nuppu.begin_frame()
-    nuppu.update_constants()
+    nuppu.update_constants(frame)
     defer nuppu.end_frame(frame)
 
     nuppu.cull(frame)
