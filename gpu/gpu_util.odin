@@ -20,7 +20,7 @@ arena_init :: proc(
     arena: Arena
 
     if min_alignment := _min_alignment(flags); alignment < min_alignment {
-        log.errorf("In malloc() passed in alignment %i is less than the minimum required for flags %v. Bump to %i", alignment, flags, min_alignment)
+        log.errorf("In malloc() passed in alignment %i is less than the minimum required for flags %v. Bump to %i", alignment, flags, min_alignment, location = loc)
         return {}, false
     }
 
@@ -49,14 +49,13 @@ arena_init :: proc(
 
 // Returns ptr with correct field values.
 arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, align: uint, loc := #caller_location) -> ptr {
-    // assert(_mapped(arena.ptr)) IF staging buffer
     alignment := max(u32(align), arena.ptr.alignment)
     if arena.ptr.cpu != nil && uintptr(arena.ptr.cpu) % uintptr(alignment) != uintptr(arena.ptr.gpu) % uintptr(alignment) {
         panic("Could not satisfy alignment requirements in GPU arena allocation.")
     }
 
     bytes := el_size * el_count
-    assert(bytes >= 0 && alignment > 0)
+    assert(alignment > 0)
     bytes_aligned := runtime.align_forward_uint(uint(bytes), uint(alignment))
 
     arena.offset = mem.align_forward_uint(arena.offset, uint(alignment))
@@ -87,8 +86,12 @@ sub_alloc :: proc(parent: ptr, offset, length: u32) -> ptr {
     assert(length <= parent.total_capacity_bytes - offset)
 
     result := parent
-    result.cpu                  = rawptr(uintptr(parent.cpu) + uintptr(offset))
-    result.gpu                  = rawptr(uintptr(parent.gpu) + uintptr(offset))
+    if parent.cpu != nil {
+        result.cpu = rawptr(uintptr(parent.cpu) + uintptr(offset))
+    }
+    if parent.gpu != nil {
+        result.gpu = rawptr(uintptr(parent.gpu) + uintptr(offset))
+    }
     result.byte_offset          = parent.byte_offset + offset
     result.total_capacity_bytes = length
 

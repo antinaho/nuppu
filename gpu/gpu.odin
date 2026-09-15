@@ -252,6 +252,7 @@ Texture_Descriptor :: struct {
     usage: Texture_Usage,
     type: Texture_Type,
     layer_count: u32, // 0 == 1
+    mip_levels: u32, // 0 == 1
 }
 
 StorageMode :: enum u8 {
@@ -541,7 +542,7 @@ malloc :: proc(
 ) -> (ptr, bool) #optional_ok {
 
     if min_alignment := _min_alignment(flag); alignment < min_alignment {
-        log.errorf("In malloc() passed in alignment %i is less than the minimum required for flags %v. Bump to %i", alignment, flag, min_alignment)
+        log.errorf("In malloc() passed in alignment %i is less than the minimum required for flags %v. Bump to %i", alignment, flag, min_alignment, location = loc)
         return {}, false
     }
     
@@ -563,9 +564,6 @@ malloc :: proc(
         },
     }, true
 }
-
-// Release the mapping on a Staging buffer. Must be called before doing any copy() operations on the buffer.
-unmap : proc(ptr: ^ptr, offset: i64 = 0, length: i64 = -1) : _unmap
 
 // Copies src data into dst
 copy : proc(dst, src: ptr) : _copy

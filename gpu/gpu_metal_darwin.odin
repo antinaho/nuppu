@@ -478,6 +478,9 @@ _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
     desc->setStorageMode(_storage_mode_interop(texture_descriptor.storage))
     desc->setTextureType(_texture_type_interop(texture_descriptor.type))
     
+    mip_levels := max(texture_descriptor.mip_levels, 1)
+    desc->setMipmapLevelCount(NS.UInteger(mip_levels))
+    
     layers := max(texture_descriptor.layer_count, 1)
     if texture_descriptor.type == ._2D_Array {
         desc->setArrayLength(NS.UInteger(layers))
@@ -496,6 +499,8 @@ _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
 }
 
 _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_Attachment) {
+    assert(_state.blit_command_encoder == nil, "_begin_render_pass: transfer encoder still open (missing gpu.barrier(.Transfer, .All) after uploads)")
+
     pass_descriptor := MTL.RenderPassDescriptor.renderPassDescriptor()
 
     color_attachment := pass_descriptor->colorAttachments()->object(0)
@@ -592,8 +597,6 @@ _gpu_address :: proc(p: _ptr) -> rawptr {
     return rawptr(uintptr(p.buffer->gpuAddress()))
 }
 
-_unmap :: proc(ptr: ^ptr, offset: i64 = 0, length: i64 = -1) { /* no op in Metal */ }
-
 _copy :: proc(dst, src: ptr) {
     if _state.blit_command_encoder == nil {
         _state.blit_command_encoder = _state.command_buffer->blitCommandEncoder()
@@ -604,10 +607,6 @@ _copy :: proc(dst, src: ptr) {
         dst.native.buffer, NS.UInteger(dst.byte_offset),
         NS.UInteger(src.total_capacity_bytes),
     )
-}
-
-_mapped :: proc(ptr: ptr) -> bool {
-    return ptr.cpu != nil
 }
 
 _min_alignment :: proc(flags: Buffer_Flag) -> u32 {
@@ -1031,4 +1030,3 @@ _primitive_type_interop :: proc(primitive: Primitive) -> MTL.PrimitiveType {
     }
     unreachable()
 }
-
