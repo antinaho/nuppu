@@ -1,42 +1,47 @@
 *
 !.gitignore
 
+!bits.odin
 !build_web.sh
 !comm.odin
+!config.odin
+!entity_common.odin
+!entity.odin
+!material.odin
+!mesh.odin
 !nuppu.odin
 !render.odin
-!config.odin
-
-!bit_array/
-!bit_array/bit_array.odin
-
-!material.odin
+!resource.odin
+!sampler.odin
 !shader.odin
-!mesh.odin
+!texture.odin
 
-!gpu/
-!gpu/**
-
-!entity.odin
-!entity_common.odin
-!bits.odin
+!data/
+!data/**
 
 !examples/
 !examples/**
 
-!platform/
-!platform/**
+!gpu/
+!gpu/**
 
 !io/
 !io/**
+
+!platform/
+!platform/**
 
 !tests/
 !tests/**
 
 !web/
-!web/index.html
+!web/**
 
+*.js
+*.wasm
 *.obj
 *.mtl
+*.metal
+*.wgsl
 *.dSYM
 *.dSYM/**
