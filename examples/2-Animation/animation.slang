@@ -8,17 +8,23 @@ struct Vertex {
     uint4  color_normal;
 };
 
-// Matches nuppu.Instance (64 bytes, 16-byte aligned).
+// Matches the engine's 64-byte instance slot (Mesh_Instance):
+//   position | color | matrix_x + data0 | matrix_y + data1 | matrix_z + material_and_flags
+// matrix_x/y/z are the rows of rotation * scale; position is the translation.
 struct Instance {
-    float4 position_pack;   // xyz = position
-    float4 scale_pack;      // xyz = scale
-    float4 rotation_pack;   // xyz = rotation, w = instance_data byte offset
-    uint4  materials;       // xyz = 6 x u16 Material_Handle, w = entity_id
+    float3 position;
+    uint   color;
+    float3 matrix_x;
+    uint   data0;
+    float3 matrix_y;
+    uint   data1;
+    float3 matrix_z;
+    uint   material_and_flags;
 };
 
 struct GPU_Material {
-    uint handle_user;
-    uint user_data_2;
+    float4 data0;
+    float4 data1;
 };
 
 struct Engine_Uniform {
@@ -34,8 +40,6 @@ struct FrameData {
     StructuredBuffer<Vertex>          verts;
     StructuredBuffer<Instance>        instances;
     StructuredBuffer<GPU_Material>    materials;
-    ByteAddressBuffer                 material_params;
-    ByteAddressBuffer                 instance_data;
 };
 
 ParameterBlock<FrameData> data;
@@ -57,22 +61,17 @@ v2f vertexMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) {
     float3 vpos = v.position_uv.xyz;
     float4 vcol = unpack_rgba(v.color_normal.x);
 
-    float3 position = i.position_pack.xyz;
-    float3 scale    = i.scale_pack.xyz;
-    float3 rotation = i.rotation_pack.xyz;
-
-    float cp   = cos(rotation.x), sp   = sin(rotation.x);
-    float cyaw = cos(rotation.y), syaw = sin(rotation.y);
-    float cr   = cos(rotation.z), sr   = sin(rotation.z);
-
     float4x4 m = float4x4(
-         cr * cyaw * scale.x,   (cr * syaw * sp - sr * cp) * scale.y,   (cr * syaw * cp + sr * sp) * scale.z,   0.0,
-         sr * cyaw * scale.x,   (sr * syaw * sp + cr * cp) * scale.y,   (sr * syaw * cp - cr * sp) * scale.z,   0.0,
-        -syaw * scale.x,         cyaw * sp * scale.y,                    cyaw * cp * scale.z,                    0.0,
-         position.x,              position.y,                             position.z,                             1.0
+        i.matrix_x.x, i.matrix_x.y, i.matrix_x.z, 0.0,
+        i.matrix_y.x, i.matrix_y.y, i.matrix_y.z, 0.0,
+        i.matrix_z.x, i.matrix_z.y, i.matrix_z.z, 0.0,
+        i.position.x, i.position.y, i.position.z, 1.0
     );
 
     v2f o;
+    // Slang emits row-vector math for `mul(m, v)` (v * m) and transposes
+    // ConstantBuffer matrices on load. The local matrix is not a buffer matrix,
+    // so transpose it to keep the column-vector convention: P * W * M * v.
     float4 world_pos = mul(transpose(m), float4(vpos, 1.0));
     world_pos = mul(data.uniforms.world_transform, world_pos);
     o.position = mul(data.uniforms.perspective_transform, world_pos);

@@ -1,3 +1,4 @@
+
 struct v2f {
     float4 position : SV_Position;
     float3 color    : COLOR0;
@@ -10,21 +11,21 @@ struct Vertex {
     uint4 color_normal;
 };
 
-// Matches nuppu.Instance (64 bytes, 16-byte aligned):
-//   position/scale/rotation packs + 6 x u16 material handles + entity id.
-//   `rotation_pack.w` is not rotation: it is the byte offset of this entity's
-//   instance-data blob, reinterpreted with asuint() on the shader side.
+// Matches the engine's 64-byte instance slot. `Sprite_Instance` and
+// `Mesh_Instance` share this prefix:
+//   position | color | matrix_x + data0 | matrix_y + data1 | matrix_z + material_and_flags
+// For sprites: data0 = uv_min (u16x2), data1 = uv_size (u16x2).
+// For meshes:  data0 = mesh_data_1,     data1 = mesh_data_2.
+// matrix_x/y/z are the rows of rotation * scale; position is the translation.
 struct Instance {
-    float4 position_pack;   // xyz = position
-    float4 scale_pack;      // xyz = scale
-    float4 rotation_pack;   // xyz = rotation, w = instance_data byte offset
-    uint4  materials;       // xyz = 6 x u16 Material_Handle, w = entity_id
-};
-
-// Matches nuppu.GPU_Material (8 bytes).
-struct GPU_Material {
-    uint handle_user;   // handle | (user_data_1 << 16)
-    uint user_data_2;   // inline value, or byte offset into material_params
+    float3 position;
+    uint   color;
+    float3 matrix_x;
+    uint   data0;
+    float3 matrix_y;
+    uint   data1;
+    float3 matrix_z;
+    uint   material_and_flags;
 };
 
 struct Engine_Uniform {
@@ -34,35 +35,34 @@ struct Engine_Uniform {
     float4 camera_position;
 };
 
-// Matches the Odin `nuppu.Sprite_Instance` instance-data struct, addressed by
-// Instance.rotation_pack.w (byte offset).
-struct Sprite_Instance {
-    float2 uv_min;
-    float2 uv_max;
-    uint   frame_n;
-    uint   _pad;
-};
-
-// Object params used by this example. Layout must match the Odin struct:
-//   Object_Params { color: [4]f32 }
-struct Object_Params {
+// Matches the engine's 32-byte GPU_Material record. Two float4s keep Metal's
+// natural stride at 32.
+struct GPU_Material {
     float4 color;
+    float4 _pad;
 };
 
-struct FrameData {
+struct Engine_Data {
     ConstantBuffer<Engine_Uniform> uniforms;
 
     StructuredBuffer<Vertex>          verts;
     StructuredBuffer<Instance>        instances;
     StructuredBuffer<GPU_Material>    materials;
-    ByteAddressBuffer                 material_params;
-    ByteAddressBuffer                 instance_data;
-    Texture2DArray<float4>            textures;
-
-    SamplerState sampler;
 };
 
-ParameterBlock<FrameData> data;
+ParameterBlock<Engine_Data> data;
+
+struct Shader_Data {
+    SamplerState      sampler;
+};
+
+ParameterBlock<Shader_Data> shader;
+
+struct Material_Data {
+    Texture2D<float4> albedo;
+}
+
+ParameterBlock<Material_Data> material;
 
 float4 unpack_rgba(uint packed) {
     return float4(
@@ -73,7 +73,12 @@ float4 unpack_rgba(uint packed) {
     ) * (1.0 / 255.0);
 }
 
-static const uint MATERIAL_INDEX_MASK = 0x3FFFu;
+float2 unpack_u16x2(uint packed) {
+    return float2(
+        float(( packed        & 0xFFFFu)),
+        float(((packed >> 16) & 0xFFFFu))
+    ) * (1.0 / 65535.0);
+}
 
 [shader("vertex")]
 v2f vertexMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) {
@@ -85,58 +90,65 @@ v2f vertexMain(uint vertexID : SV_VertexID, uint instanceID : SV_InstanceID) {
     uint   v_uv_packed = asuint(v.position_uv.w);
     float2 v_uv = float2(
         float(( v_uv_packed        & 0xFFFFu)),
-        float(( v_uv_packed >> 16u) & 0xFFFFu)
+        float(((v_uv_packed >> 16u) & 0xFFFFu))
     ) * (1.0 / 65535.0);
 
-    float3 position    = i.position_pack.xyz;
-    float3 scale       = i.scale_pack.xyz;
-    float3 rotation    = i.rotation_pack.xyz;
-    uint   data_offset = asuint(i.rotation_pack.w);
+    float4 icol = unpack_rgba(i.color);
 
-    // Slot 0 material handle (u16 packed in materials.x).
-    uint handle = i.materials.x & 0xFFFFu;
-    GPU_Material mat = data.materials[handle & MATERIAL_INDEX_MASK];
-    Object_Params p = data.material_params.Load<Object_Params>(mat.user_data_2);
+    uint mat   = i.material_and_flags & 0xFFFFu;
+    bool atlas = (i.material_and_flags & (1u << 16)) != 0u;
 
-    float4 icol   = p.color;
-    float2 uv_min = float2(0.0, 0.0);
-    float2 uv_max = float2(1.0, 1.0);
-    if (data_offset != 0u) { // sprite: uv rect comes from per-entity data
-        Sprite_Instance s = data.instance_data.Load<Sprite_Instance>(data_offset);
-        uv_min = s.uv_min;
-        uv_max = s.uv_max;
-        // frame_n is arbitrary non-UV per-instance data; prove it reaches the shader.
-        icol.rgb *= 0.65 + 0.35 * frac(float(s.frame_n) * 0.25 + 0.1);
+    // Sprites carry an atlas rect in data0/data1; meshes use the vertex uv.
+    float2 uv = v_uv;
+    if (atlas) {
+        uv = unpack_u16x2(i.data0) + v_uv * unpack_u16x2(i.data1);
     }
 
-    float cp   = cos(rotation.x), sp   = sin(rotation.x);
-    float cyaw = cos(rotation.y), syaw = sin(rotation.y);
-    float cr   = cos(rotation.z), sr   = sin(rotation.z);
-
+    // matrix_x/y/z are the rows of rotation * scale; add the translation row.
     float4x4 m = float4x4(
-         cr * cyaw * scale.x,   (cr * syaw * sp - sr * cp) * scale.y,   (cr * syaw * cp + sr * sp) * scale.z,   0.0,
-         sr * cyaw * scale.x,   (sr * syaw * sp + cr * cp) * scale.y,   (sr * syaw * cp - cr * sp) * scale.z,   0.0,
-        -syaw * scale.x,         cyaw * sp * scale.y,                    cyaw * cp * scale.z,                    0.0,
-         position.x,              position.y,                             position.z,                             1.0
+        i.matrix_x.x, i.matrix_x.y, i.matrix_x.z, 0.0,
+        i.matrix_y.x, i.matrix_y.y, i.matrix_y.z, 0.0,
+        i.matrix_z.x, i.matrix_z.y, i.matrix_z.z, 0.0,
+        i.position.x, i.position.y, i.position.z, 1.0
     );
 
     v2f o;
-    // Slang emits row-vector math for `mul(m, v)` (v * m), and transposes
-    // ConstantBuffer matrices on load (v * W^T == W * v). The local matrix is
-    // not a buffer matrix, so transpose it to keep the column-vector
-    // convention used by the hand-written engine uniforms: P * W * M * v.
+    // Slang emits row-vector math for `mul(m, v)` (v * m) and transposes
+    // ConstantBuffer matrices on load. The local matrix is not a buffer matrix,
+    // so transpose it to keep the column-vector convention: P * W * M * v.
     float4 world_pos = mul(transpose(m), float4(vpos, 1.0));
     world_pos = mul(data.uniforms.world_transform, world_pos);
     o.position = mul(data.uniforms.perspective_transform, world_pos);
 
     o.color     = icol.xyz;
-    o.tex_coord = uv_min + v_uv * (uv_max - uv_min);
-    o.material  = handle;
+    o.tex_coord = uv;
+    o.material  = mat;
     return o;
 }
 
 [shader("fragment")]
 float4 fragmentMain(v2f in) : SV_Target {
-    float3 texel = data.textures.Sample(data.sampler, float3(in.tex_coord, 0)).rgb;
-    return float4(in.color * texel, 1.0);
+    GPU_Material m = data.materials[in.material];
+    float3 texel = material.albedo.Sample(shader.sampler, in.tex_coord).rgb;
+    return float4(in.color * texel * m.color.rgb, 1.0);
 }
+
+// slangc examples/3-Instancing/instancing.slang \
+//   -target metal \
+//   -entry vertexMain \
+//   -stage vertex \
+//   -o examples/3-Instancing/instancing.vs.metal
+
+// slangc examples/3-Instancing/instancing.slang \
+//   -target metal \
+//   -entry fragmentMain \
+//   -stage fragment \
+//   -o examples/3-Instancing/instancing.ps.metal
+
+// slangc examples/3-Instancing/instancing.slang \
+//   -target wgsl \
+//   -entry vertexMain \
+//   -stage vertex \
+//   -entry fragmentMain \
+//   -stage fragment \
+//   -o examples/3-Instancing/instancing.wgsl

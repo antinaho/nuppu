@@ -40,12 +40,11 @@ _Shader :: struct {
     entry_v:  string,
     entry_f:  string,
 
-    bg_layout:       wgpu.BindGroupLayout,
+    // One layout + bind group per binding block, bound at slots 0..N. A dirty
+    // block's bind group is rebuilt on the next `_set_shader`.
+    block_layouts: []wgpu.BindGroupLayout,
+    block_bgs:     []wgpu.BindGroup,
     pipeline_layout: wgpu.PipelineLayout,
-    bind_group:      wgpu.BindGroup,
-
-    layout_count: u32,
-    layout_sig:   [MAX_LAYOUT_BINDINGS]wgpu.BindGroupLayoutEntry,
 
     variants:      [MAX_SHADER_VARIANTS]_Shader_Variant,
     variant_count: u32,
@@ -56,13 +55,12 @@ _Sampler :: struct {
 }
 
 _Texture :: struct {
-    using _ : struct #raw_union {
-        surface_texture: wgpu.SurfaceTexture,
-        texture: wgpu.Texture,
-    },
-    view:   wgpu.TextureView,
-    access: wgpu.StorageTextureAccess,
-    type:   Texture_Type,
+    texture:      wgpu.Texture,
+    view:         wgpu.TextureView,
+    storage_view: wgpu.TextureView, // non-nil when the texture is also used as storage
+    view_dim:     wgpu.TextureViewDimension,
+    access:       wgpu.StorageTextureAccess,
+    samples:      u32,
 }
 
 _Compute_Pipeline :: struct {
@@ -101,9 +99,9 @@ _State :: struct {
     config: wgpu.SurfaceConfiguration,
     queue: wgpu.Queue,
 
-    uniform_offset_align: u32,
-    storage_offset_align: u32,
-    index_offset_align: u32,
+    uniform_offset_align: uint,
+    storage_offset_align: uint,
+    index_offset_align: uint,
     //
 
     bg_layout_entries: [MAX_LAYOUT_BINDINGS]wgpu.BindGroupLayoutEntry,
@@ -174,8 +172,8 @@ _init :: proc(native_window: rawptr, swapchain_format: Pixel_Format) -> bool {
             panic("Failed to get limits")
         }
 
-        _state.uniform_offset_align = limits.minUniformBufferOffsetAlignment
-        _state.storage_offset_align = limits.minStorageBufferOffsetAlignment
+        _state.uniform_offset_align = uint(limits.minUniformBufferOffsetAlignment)
+        _state.storage_offset_align = uint(limits.minStorageBufferOffsetAlignment)
         _state.index_offset_align = 4
 
         _state.is_init = true
@@ -235,6 +233,10 @@ _resize_swapchain :: proc(width, height: u32) -> bool {
 }
 
 _release_texture :: proc(texture: ^Texture) {
+    if texture.native.storage_view != nil {
+        wgpu.TextureViewRelease(texture.native.storage_view)
+        texture.native.storage_view = nil
+    }
     if texture.native.view != nil {
         wgpu.TextureViewRelease(texture.native.view)
         texture.native.view = nil
@@ -242,6 +244,13 @@ _release_texture :: proc(texture: ^Texture) {
     if texture.native.texture != nil {
         wgpu.TextureRelease(texture.native.texture)
         texture.native.texture = nil
+    }
+}
+
+_release_sampler :: proc(sampler: ^Sampler) {
+    if sampler.native.s != nil {
+        wgpu.SamplerRelease(sampler.native.s)
+        sampler.native.s = nil
     }
 }
 
@@ -257,26 +266,53 @@ _release_ptr :: proc(ptr: ^ptr) {
     }
 }
 
-_copy_to_texture :: proc(texture: Texture, origin, size: [3]u32, level: u32, data: rawptr, bytes_per_row: u32) {
+_copy_to_texture :: proc(texture: Texture, origin, size: [3]uint, level: uint, data: rawptr, bytes_per_row: uint) {
     destination := wgpu.TexelCopyTextureInfo {
         texture  = texture.native.texture,
-        mipLevel = level,
-        origin   = wgpu.Origin3D { origin.x, origin.y, origin.z },
+        mipLevel = u32(level),
+        origin   = wgpu.Origin3D { u32(origin.x), u32(origin.y), u32(origin.z) },
         aspect   = .All,
     }
     layout := wgpu.TexelCopyBufferLayout {
         offset       = 0,
-        bytesPerRow  = bytes_per_row,
-        rowsPerImage = size.y,
+        bytesPerRow  = u32(bytes_per_row),
+        rowsPerImage = u32(size.y),
     }
     write_size := wgpu.Extent3D {
-        width              = size.x,
-        height             = size.y,
+        width              = u32(size.x),
+        height             = u32(size.y),
         depthOrArrayLayers = 1,
     }
-    data_size := uint(bytes_per_row) * uint(size.y)
+    data_size := bytes_per_row * size.y
 
     wgpu.QueueWriteTexture(_state.queue, &destination, data, data_size, &layout, &write_size)
+}
+
+_copy_buffer_to_texture :: proc(src: ptr, texture: ^Texture, origin, size: [3]uint, level: uint, bytes_per_row: uint, bytes_per_image: uint) {
+    if src.cpu == nil { return }
+
+    rows_per_image := bytes_per_image / max(bytes_per_row, 1)
+
+    destination := wgpu.TexelCopyTextureInfo {
+        texture  = texture.native.texture,
+        mipLevel = u32(level),
+        origin   = wgpu.Origin3D { u32(origin.x), u32(origin.y), u32(origin.z) },
+        aspect   = .All,
+    }
+    layout := wgpu.TexelCopyBufferLayout {
+        offset       = 0,
+        bytesPerRow  = u32(bytes_per_row),
+        rowsPerImage = u32(rows_per_image),
+    }
+    write_size := wgpu.Extent3D {
+        width              = u32(size.x),
+        height             = u32(size.y),
+        depthOrArrayLayers = u32(size.z),
+    }
+
+    // `writeTexture` has no bytesPerRow alignment requirement, so the padded
+    // rows laid out by the upload scope are accepted directly.
+    wgpu.QueueWriteTexture(_state.queue, &destination, src.cpu, uint(src.total_capacity_bytes), &layout, &write_size)
 }
 
 _shader_module_init :: proc(name: string, code: []u8) -> _Shader_Module {
@@ -293,38 +329,45 @@ _shader_module_init :: proc(name: string, code: []u8) -> _Shader_Module {
     }
 }
 
-// Builds/rebuilds the bind group layout, pipeline layout and bind group from
-// the block. Called at shader_init and again on set_parameter_block.
-_shader_build_bindings :: proc(shader: ^_Shader, block: Parameter_Block) {
-    b := block
-    _use_parameter_block(&b, .Graphics)
-    count := _state.parameter_count
+// Builds one layout + bind group per binding block (slots 0..N) and the pipeline
+// layout. Blocks are bound by index, so block 0 is the engine block.
+_shader_build_bindings :: proc(shader: ^_Shader, desc: ^Shader_Desc) {
+    block_count := len(desc.binding_blocks)
+    shader.block_layouts = make([]wgpu.BindGroupLayout, block_count, context.allocator)
+    shader.block_bgs     = make([]wgpu.BindGroup, block_count, context.allocator)
 
-    shader.layout_count = count
-    for i in 0 ..< int(count) {
-        shader.layout_sig[i] = _state.bg_layout_entries[i]
+    for i in 0 ..< block_count {
+        b := desc.binding_blocks[i]
+        _use_parameter_block(&b, .Graphics, uint(i))
+        count := _state.parameter_count
+
+        layout := wgpu.DeviceCreateBindGroupLayout(_state.device, &{
+            entryCount = uint(count),
+            entries    = raw_data(_state.bg_layout_entries[:count]),
+        })
+        assert(layout != nil, "_shader_build_bindings: failed to create block bind group layout")
+
+        shader.block_layouts[i] = layout
+        shader.block_bgs[i]     = _create_bind_group(layout, count, raw_data(_state.bg_entries[:count]))
     }
 
-    shader.bg_layout = wgpu.DeviceCreateBindGroupLayout(_state.device, &{
-        entryCount = uint(count),
-        entries    = raw_data(_state.bg_layout_entries[:count]),
-    })
-    assert(shader.bg_layout != nil, "_shader_build_bindings: failed to create bind group layout")
+    layouts := make([]wgpu.BindGroupLayout, block_count, context.temp_allocator)
+    for layout, i in shader.block_layouts {
+        layouts[i] = layout
+    }
 
     shader.pipeline_layout = wgpu.DeviceCreatePipelineLayout(_state.device, &{
-        bindGroupLayoutCount = 1,
-        bindGroupLayouts     = &shader.bg_layout,
+        bindGroupLayoutCount = uint(len(layouts)),
+        bindGroupLayouts     = raw_data(layouts),
     })
     assert(shader.pipeline_layout != nil, "_shader_build_bindings: failed to create pipeline layout")
-
-    shader.bind_group = _create_bind_group(shader.bg_layout, count)
 }
 
-_create_bind_group :: proc(layout: wgpu.BindGroupLayout, count: u32) -> wgpu.BindGroup {
+_create_bind_group :: proc(layout: wgpu.BindGroupLayout, count: u32, entries: [^]wgpu.BindGroupEntry) -> wgpu.BindGroup {
     bg := wgpu.DeviceCreateBindGroup(_state.device, &wgpu.BindGroupDescriptor{
         layout     = layout,
         entryCount = uint(count),
-        entries    = raw_data(_state.bg_entries[:count]),
+        entries    = entries,
     })
     assert(bg != nil, "_create_bind_group: failed to create bind group")
     return bg
@@ -416,10 +459,9 @@ _shader_init :: proc(desc: Shader_Desc) -> _Shader {
         entry_f  = strings.clone(d.fragment_entry, context.allocator),
     }
 
-    _shader_build_bindings(&shader, d.block)
-    pso := _shader_create_pipeline(&shader, &d, DEFAULT_DRAW_STATE)
-    shader.variants[0] = _Shader_Variant { state = DEFAULT_DRAW_STATE, pipeline = pso }
-    shader.variant_count = 1
+    _shader_build_bindings(&shader, &d)
+    // Pipelines are created on first draw, once the lazy set-2 layout exists.
+    shader.variant_count = 0
 
     return shader
 }
@@ -430,17 +472,23 @@ _shader_deinit :: proc(shader: ^Shader) {
     }
     shader.variant_count = 0
 
-    if shader.bind_group != nil {
-        wgpu.BindGroupRelease(shader.bind_group)
-        shader.bind_group = nil
-    }
     if shader.pipeline_layout != nil {
         wgpu.PipelineLayoutRelease(shader.pipeline_layout)
         shader.pipeline_layout = nil
     }
-    if shader.bg_layout != nil {
-        wgpu.BindGroupLayoutRelease(shader.bg_layout)
-        shader.bg_layout = nil
+    for bg in shader.block_bgs {
+        wgpu.BindGroupRelease(bg)
+    }
+    for layout in shader.block_layouts {
+        wgpu.BindGroupLayoutRelease(layout)
+    }
+    if shader.block_bgs != nil {
+        delete(shader.block_bgs, context.allocator)
+        shader.block_bgs = nil
+    }
+    if shader.block_layouts != nil {
+        delete(shader.block_layouts, context.allocator)
+        shader.block_layouts = nil
     }
     if shader.vertex.module != nil {
         wgpu.ShaderModuleRelease(shader.vertex.module)
@@ -511,13 +559,22 @@ _acquire_next_swapchain :: proc() -> Texture {
     view := wgpu.TextureCreateView(surface_texture.texture, nil)
 
     native := _Texture {
-        surface_texture = surface_texture,
-        view = view,
-        type = ._2D,
+        texture      = surface_texture.texture,
+        view         = view,
+        storage_view = nil,
+        view_dim     = ._2D,
+        access       = .WriteOnly,
+        samples      = 1,
     }
 
     return Texture {
-        dimensions = { _state.config.width, _state.config.height, 1 },
+        concrete = texture_concrete({
+            type = Texture_Type_2D {
+                dimensions = { uint(_state.config.width), uint(_state.config.height) },
+                usage      = {.Color_Attachment},
+            },
+            format = .None,
+        }),
         native = native,
     }
 }
@@ -552,14 +609,30 @@ _set_compute_pipeline :: proc(pipeline: Compute_Pipeline) {
 _set_shader :: proc(shader: ^Shader) {
     assert(_state.render_pass_encoder != nil, "_set_shader: no render pass is active")
 
-    if _state.curr_shader_valid && _state.curr_shader == rawptr(shader) {
+    same_shader := _state.curr_shader_valid && _state.curr_shader == rawptr(shader)
+    if same_shader && !shader_blocks_dirty(shader) {
         return
     }
     _state.curr_shader = rawptr(shader)
     _state.curr_shader_valid = true
-    _state.pipeline_dirty = true
+    if !same_shader {
+        _state.pipeline_dirty = true
+    }
 
-    wgpu.RenderPassEncoderSetBindGroup(_state.render_pass_encoder, 0, shader.bind_group, nil)
+    enc := _state.render_pass_encoder
+
+    // Bind groups are immutable, so dirty blocks get fresh bind groups.
+    for i in 0 ..< len(shader.block_bgs) {
+        if !shader.desc.binding_blocks[i].dirty { continue }
+        b := shader.desc.binding_blocks[i]
+        _use_parameter_block(&b, .Graphics, uint(i))
+        count := _state.parameter_count
+        wgpu.BindGroupRelease(shader.block_bgs[i])
+        shader.block_bgs[i] = _create_bind_group(shader.block_layouts[i], count, raw_data(_state.bg_entries[:count]))
+    }
+    for bg, i in shader.block_bgs {
+        wgpu.RenderPassEncoderSetBindGroup(enc, u32(i), bg, nil)
+    }
 }
 
 _set_draw_state :: proc(state: Draw_State) {
@@ -569,62 +642,6 @@ _set_draw_state :: proc(state: Draw_State) {
     _state.curr_draw_state = state
     _state.draw_state_valid = true
     _state.pipeline_dirty = true
-}
-
-_set_parameter_block :: proc(shader: ^Shader, block: ^Parameter_Block) {
-    shader.desc.block = block^
-
-    b := block^
-    _use_parameter_block(&b, .Graphics)
-    new_count := _state.parameter_count
-
-    same_layout := new_count == shader.native.layout_count
-    if same_layout {
-        for i in 0 ..< int(new_count) {
-            if shader.native.layout_sig[i] != _state.bg_layout_entries[i] {
-                same_layout = false
-                break
-            }
-        }
-    }
-
-    if same_layout {
-        // Fast path: only the resource references changed, so destroy and
-        // recreate the bind group against the existing layout. Pipelines
-        // stay valid because the layout is identical.
-        if shader.bind_group != nil {
-            wgpu.BindGroupRelease(shader.bind_group)
-        }
-        shader.bind_group = _create_bind_group(shader.bg_layout, new_count)
-    } else {
-        // Layout changed: rebuild layout, pipelines and bind group.
-        for i in 0 ..< shader.variant_count {
-            wgpu.RenderPipelineRelease(shader.variants[i].pipeline)
-        }
-        shader.variant_count = 0
-        if shader.bind_group != nil {
-            wgpu.BindGroupRelease(shader.bind_group)
-            shader.bind_group = nil
-        }
-        if shader.pipeline_layout != nil {
-            wgpu.PipelineLayoutRelease(shader.pipeline_layout)
-            shader.pipeline_layout = nil
-        }
-        if shader.bg_layout != nil {
-            wgpu.BindGroupLayoutRelease(shader.bg_layout)
-            shader.bg_layout = nil
-        }
-
-        _shader_build_bindings(&shader.native, b)
-        pso := _shader_create_pipeline(&shader.native, &shader.desc, _state.curr_draw_state)
-        shader.variant_count = 1
-        shader.variants[0] = _Shader_Variant { state = _state.curr_draw_state, pipeline = pso }
-    }
-
-    if _state.curr_shader_valid && _state.curr_shader == rawptr(shader) {
-        _state.pipeline_dirty = true
-        wgpu.RenderPassEncoderSetBindGroup(_state.render_pass_encoder, 0, shader.bind_group, nil)
-    }
 }
 
 _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
@@ -673,45 +690,79 @@ _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
     }
 }
 
-_texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
-    layers := max(texture_descriptor.layer_count, 1)
-    mip_levels := max(texture_descriptor.mip_levels, 1)
+_texture_init :: proc(concrete: Texture_Concrete, texture_descriptor: Texture_Descriptor) -> _Texture {
+    depth_or_layers := concrete.layers
+    switch concrete.view {
+    case ._1D:
+        depth_or_layers = 1
+    case ._3D:
+        depth_or_layers = concrete.size.z
+    case .Cube, .Cube_Array:
+        depth_or_layers = concrete.layers * 6
+    case ._2D, ._2D_Array:
+        // concrete.layers
+    }
 
     desc: wgpu.TextureDescriptor
-    desc.size = {texture_descriptor.dimensions.x, texture_descriptor.dimensions.y, layers}
-    desc.mipLevelCount = mip_levels
-    desc.sampleCount = 1
-    desc.dimension = _texture_type_interop(texture_descriptor.type)
-    desc.format = _pixel_format_interop(texture_descriptor.format)
-    desc.usage = _texture_usage_interop(texture_descriptor.usage, texture_descriptor.storage)
+    desc.dimension     = _texture_dimension_interop(concrete.view)
+    desc.size          = {u32(concrete.size.x), u32(concrete.size.y), u32(depth_or_layers)}
+    desc.sampleCount   = u32(concrete.samples)
+    desc.mipLevelCount = u32(concrete.mip_levels)
+    desc.format        = _pixel_format_interop(texture_descriptor.format)
+    desc.usage         = _texture_usage_interop(concrete.usage)
 
     texture := wgpu.DeviceCreateTexture(_state.device, &desc)
     if texture == nil {
-        log.panic("gpu_wgpu.odin: MTL_texture_init: failed to create texture")
+        log.panic("gpu_wgpu.odin: _texture_init: failed to create texture")
     }
 
-    switch texture_descriptor.type {
-    case ._2D:
-        return _Texture {
-            texture = texture,
-            view = wgpu.TextureCreateView(texture, nil),
-            access = _texture_access_interop(texture_descriptor.usage),
-            type = ._2D,
-        }
+    view_dim := _texture_view_dimension_interop(concrete.view)
+
+    array_layers: u32 = 1
+    switch concrete.view {
     case ._2D_Array:
-        view_desc := wgpu.TextureViewDescriptor {
-            dimension = ._2DArray,
-            mipLevelCount = mip_levels,
-            arrayLayerCount = layers,
-        }
-        return _Texture {
-            texture = texture,
-            view = wgpu.TextureCreateView(texture, &view_desc),
-            access = _texture_access_interop(texture_descriptor.usage),
-            type = ._2D_Array,
-        }
+        array_layers = u32(concrete.layers)
+    case .Cube:
+        array_layers = 6
+    case .Cube_Array:
+        array_layers = u32(concrete.layers * 6)
+    case ._1D, ._2D, ._3D:
+        // 1
     }
-    unreachable()
+
+    view := wgpu.TextureCreateView(texture, &wgpu.TextureViewDescriptor{
+        dimension       = view_dim,
+        mipLevelCount   = u32(concrete.mip_levels),
+        arrayLayerCount = array_layers,
+    })
+
+    // Storage bindings require a view with exactly one mip level, and a cube
+    // view cannot be bound as storage at all. Create a dedicated view when the
+    // texture is also used as storage.
+    storage_view: wgpu.TextureView
+    if concrete.usage.storage_read || concrete.usage.storage_write {
+        storage_dim    := view_dim
+        storage_layers := array_layers
+        #partial switch view_dim {
+        case .Cube, .CubeArray:
+            storage_dim    = ._2DArray
+            storage_layers = u32(concrete.layers * 6)
+        }
+        storage_view = wgpu.TextureCreateView(texture, &wgpu.TextureViewDescriptor{
+            dimension       = storage_dim,
+            mipLevelCount   = 1,
+            arrayLayerCount = storage_layers,
+        })
+    }
+
+    return _Texture {
+        texture      = texture,
+        view         = view,
+        storage_view = storage_view,
+        view_dim     = view_dim,
+        access       = _texture_access_interop(concrete.usage),
+        samples      = u32(concrete.samples),
+    }
 }
 
 _begin_render_pass :: proc(c_attachment: Color_Attachment, d_attachment: Depth_Attachment) {
@@ -750,7 +801,7 @@ _end_render_pass :: proc() {
     wgpu.RenderPassEncoderRelease(_state.render_pass_encoder)
 }
 
-_draw_indexed :: proc(index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
+_draw_indexed :: proc(index_buffer: ptr, index_count: uint, index_offset: uint, instance_count: uint, base_vertex: uint, base_instance: uint) {
     if instance_count == 0 {
         return
     }
@@ -785,18 +836,18 @@ _draw_indexed :: proc(index_buffer: ptr, index_count: u32, index_offset: u32, in
 
     wgpu.RenderPassEncoderDrawIndexed(
         _state.render_pass_encoder,
-        indexCount    = index_count,
-        instanceCount = instance_count,
+        indexCount    = u32(index_count),
+        instanceCount = u32(instance_count),
         firstIndex    = 0,
         baseVertex    = i32(base_vertex),
-        firstInstance = base_instance,
+        firstInstance = u32(base_instance),
     )
 }
 
 _malloc :: proc(
     #any_int bytes: uint,
-    alignment: u32,
-    flags: Buffer_Flag,
+    alignment: uint,
+    flags: Buffer_Usage,
     name: string,
     loc := #caller_location,
 ) -> _ptr {
@@ -825,7 +876,7 @@ _malloc :: proc(
 
     shadow: rawptr
     if flags == .Staging {
-        shadow_bytes, err := runtime.mem_alloc(int(aligned_bytes), 16, context.allocator)
+        shadow_bytes, err := runtime.mem_alloc(int(aligned_bytes), int(alignment), context.allocator)
         assert(err == nil, "_malloc: failed to allocate staging shadow")
         shadow = raw_data(shadow_bytes)
     }
@@ -838,7 +889,7 @@ _malloc :: proc(
     }
 }
 
-_min_alignment :: proc(flags: Buffer_Flag) -> u32 {
+_min_alignment :: proc(flags: Buffer_Usage) -> uint {
     switch flags {
     case .Staging:  return 4
     case .Default:  return _state.storage_offset_align
@@ -848,34 +899,38 @@ _min_alignment :: proc(flags: Buffer_Flag) -> u32 {
     unreachable()
 }
 
-_copy :: proc(dst, src: ptr) {
-    if src.flags == .Staging {
-        if src.cpu == nil { return }
+_copy :: proc(
+    dst, src: ptr,
+    #any_int dst_offset: uint = 0,
+    #any_int src_offset: uint = 0,
+    #any_int length_override: uint = 0,
+) {
+    assert(src_offset <= src.total_capacity_bytes, "_copy: src_offset exceeds source capacity")
+    assert(dst_offset <= dst.total_capacity_bytes, "_copy: dst_offset exceeds destination capacity")
 
-        rel := uint(0) // rel := uint(max(offset, 0))
-        length := -1
-        len := uint(src.total_capacity_bytes) - rel if length < 0 else uint(length)
+    length := length_override if length_override != 0 else src.total_capacity_bytes - src_offset
+    if length == 0 { return }
 
-        if len == 0 { return }
+    assert(src_offset + length <= src.total_capacity_bytes, "_copy: source range exceeds capacity")
+    assert(dst_offset + length <= dst.total_capacity_bytes, "_copy: destination range exceeds capacity")
 
-        assert(rel % 4 == 0 && len % 4 == 0, "_flush: QueueWriteBuffer offset/size must be 4-byte aligned")
-
+    if src.flags == .Staging && src.cpu != nil {
+        assert((src.byte_offset + src_offset) % 4 == 0 && length % 4 == 0,
+            "_copy: QueueWriteBuffer offset/size must be 4-byte aligned")
         wgpu.QueueWriteBuffer(
             _state.queue,
             src.native.buffer,
-            u64(uint(src.byte_offset) + rel),
-            rawptr(uintptr(src.cpu) + uintptr(rel)),
-            len,
+            u64(src.byte_offset + src_offset),
+            rawptr(uintptr(src.cpu) + uintptr(src_offset)),
+            length,
         )
     }
 
     wgpu.CommandEncoderCopyBufferToBuffer(
         _state.command_encoder,
-        src.native.buffer,
-        u64(uint(src.byte_offset)),
-        dst.native.buffer,
-        u64(uint(dst.byte_offset)),
-        u64(src.total_capacity_bytes),
+        src.native.buffer, u64(src.byte_offset + src_offset),
+        dst.native.buffer, u64(dst.byte_offset + dst_offset),
+        u64(length),
     )
 }
 
@@ -887,7 +942,9 @@ _gpu_address :: proc(p: _ptr) -> rawptr {
     return nil
 }
 
-_use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {
+_use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination, slot: uint) {
+    _ = slot
+
     bg_layout_entries := &_state.bg_layout_entries
     bg_entries := &_state.bg_entries
     count: u32
@@ -915,7 +972,7 @@ _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Blo
         count += 1
     }
 
-    for R in block.read_resources {
+    for R, res_idx in block.read_resources {
         switch res in R {
         case ptr:
             if res.native.buffer == nil { continue }
@@ -926,7 +983,7 @@ _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Blo
                 buffer = wgpu.BufferBindingLayout{
                     type             = .ReadOnlyStorage,
                     hasDynamicOffset = false,
-                    minBindingSize   = 0,
+                    minBindingSize   = u64(block.read_resource_min_sizes[res_idx]),
                 },
             }
 
@@ -941,27 +998,14 @@ _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Blo
         case Texture:
             if res.native.texture == nil { continue }
 
-            switch res.native.type {
-            case ._2D:
-                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                    binding = u32(count),
-                    visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
-                    texture = wgpu.TextureBindingLayout{
-                        sampleType = .Float,
-                        viewDimension = ._2D,
-                        multisampled = false,
-                    },
-                }
-            case ._2D_Array:
-                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                    binding = u32(count),
-                    visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
-                    texture = wgpu.TextureBindingLayout{
-                        sampleType = .Float,
-                        viewDimension = ._2DArray,
-                        multisampled = false,
-                    },
-                }
+            bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                binding = u32(count),
+                visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
+                texture = wgpu.TextureBindingLayout{
+                    sampleType    = _texture_sample_type_interop(wgpu.TextureGetFormat(res.native.texture), res.native.samples),
+                    viewDimension = res.native.view_dim,
+                    multisampled  = res.native.samples > 1,
+                },
             }
 
             bg_entries[count] = wgpu.BindGroupEntry{
@@ -999,32 +1043,30 @@ _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Blo
         case Texture:
             if res.native.texture == nil { continue }
 
-            switch res.native.type {
-            case ._2D:
-                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                    binding = u32(count),
-                    visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
-                    storageTexture = wgpu.StorageTextureBindingLayout{
-                        access = res.native.access,
-                        format = wgpu.TextureGetFormat(res.native.texture),
-                        viewDimension = ._2D,
-                    },
+            storage_view := res.native.storage_view
+            storage_dim  := res.native.view_dim
+            if storage_view != nil {
+                #partial switch res.native.view_dim {
+                case .Cube, .CubeArray:
+                    storage_dim = ._2DArray
                 }
-            case ._2D_Array:
-                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                    binding = u32(count),
-                    visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
-                    storageTexture = wgpu.StorageTextureBindingLayout{
-                        access = res.native.access,
-                        format = wgpu.TextureGetFormat(res.native.texture),
-                        viewDimension = ._2DArray,
-                    },
-                }
+            } else {
+                storage_view = res.native.view
+            }
+
+            bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                binding = u32(count),
+                visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
+                storageTexture = wgpu.StorageTextureBindingLayout{
+                    access = res.native.access,
+                    format = wgpu.TextureGetFormat(res.native.texture),
+                    viewDimension = storage_dim,
+                },
             }
 
             bg_entries[count] = wgpu.BindGroupEntry{
                 binding = u32(count),
-                textureView = res.native.view,
+                textureView = storage_view,
             }
 
             count += 1
@@ -1257,36 +1299,69 @@ _compare_function_interop :: proc(compare: Compare_Function) -> wgpu.CompareFunc
     unreachable()
 }
 
-_texture_type_interop :: proc(texture_type: Texture_Type) -> wgpu.TextureDimension {
-    switch texture_type {
-    case ._2D, ._2D_Array:
+_texture_dimension_interop :: proc(view: Texture_View) -> wgpu.TextureDimension {
+    switch view {
+    case ._1D:
+        return ._1D
+    case ._3D:
+        return ._3D
+    case ._2D, ._2D_Array, .Cube, .Cube_Array:
         return ._2D
     }
     unreachable()
 }
 
-_texture_usage_interop :: proc(usage: Texture_Usage, storage: StorageMode) -> wgpu.TextureUsageFlags {
-    flags: wgpu.TextureUsageFlags
-    if .Sampled          in usage { flags += {.TextureBinding} }
-    if .Read             in usage { flags += {.StorageBinding} }
-    if .Write            in usage { flags += {.StorageBinding} }
-    if .Color_Attachment in usage { flags += {.RenderAttachment, .TextureBinding} }
-    if .Depth_Attachment in usage { flags += {.RenderAttachment} }
-    if storage == .Shared && (.Sampled in usage || .Read in usage || .Write in usage) {
-        flags += {.CopyDst}
+_texture_view_dimension_interop :: proc(view: Texture_View) -> wgpu.TextureViewDimension {
+    switch view {
+    case ._1D:
+        return ._1D
+    case ._2D:
+        return ._2D
+    case ._2D_Array:
+        return ._2DArray
+    case ._3D:
+        return ._3D
+    case .Cube:
+        return .Cube
+    case .Cube_Array:
+        return .CubeArray
     }
+    unreachable()
+}
+
+_texture_usage_interop :: proc(usage: Texture_Usage_Info) -> wgpu.TextureUsageFlags {
+    // Copies are always permitted and require no user-facing flag.
+    flags: wgpu.TextureUsageFlags = {.CopySrc, .CopyDst}
+    if usage.sampled          { flags += {.TextureBinding} }
+    if usage.storage_read     { flags += {.StorageBinding} }
+    if usage.storage_write    { flags += {.StorageBinding} }
+    if usage.color_attachment { flags += {.RenderAttachment} }
+    if usage.depth_attachment { flags += {.RenderAttachment} }
     return flags
 }
 
-_texture_access_interop :: proc(usage: Texture_Usage) -> wgpu.StorageTextureAccess {
-    read  := .Read in usage
-    write := .Write in usage
+_texture_access_interop :: proc(usage: Texture_Usage_Info) -> wgpu.StorageTextureAccess {
     switch {
-    case read && write:  return .ReadWrite
-    case write:          return .WriteOnly
-    case read:           return .ReadOnly
+    case usage.storage_read && usage.storage_write: return .ReadWrite
+    case usage.storage_write:                       return .WriteOnly
+    case usage.storage_read:                        return .ReadOnly
     }
     return .WriteOnly
+}
+
+_texture_sample_type_interop :: proc(format: wgpu.TextureFormat, samples: u32) -> wgpu.TextureSampleType {
+    #partial switch format {
+    case .Depth16Unorm, .Depth24Plus, .Depth24PlusStencil8, .Depth32Float, .Depth32FloatStencil8:
+        return .Depth
+    case .RGBA32Float:
+        // Not filterable without the float32-filterable feature.
+        return .UnfilterableFloat
+    }
+    // MSAA sample types must not be filterable.
+    if samples > 1 {
+        return .UnfilterableFloat
+    }
+    return .Float
 }
 
 _pixel_format_interop :: proc(format: Pixel_Format) -> wgpu.TextureFormat {

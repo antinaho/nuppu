@@ -6,8 +6,10 @@ import gpu "../../gpu"
 state: ^State
 
 State :: struct {
-    angle: f32,
-    mesh:  nuppu.Mesh_Handle,
+    angle:    f32,
+    mesh:     nuppu.Mesh_Handle,
+    material: nuppu.Material_Handle,
+    shader:   nuppu.Shader_Handle,
 }
 
 Object_Params :: struct {
@@ -21,7 +23,7 @@ Triangle_Entity :: struct {
 _init :: proc() {
     nuppu.update_camera({0, 0, 2}, {}, 0.1, 1_000, 80)
 
-    nuppu.register_entity(Triangle_Entity, 8, {.Interpolate, .Has_Mesh})
+    nuppu.register_entity(Triangle_Entity, 8, {.Interpolate})
 
     state.mesh = nuppu.mesh_upload(
         []nuppu.Vertex {
@@ -43,6 +45,14 @@ _init :: proc() {
         fragment_code = vertex_code
     }
 
+    params := Object_Params {
+        color = {1, 1, 1, 1},
+    }
+    mat_scope := nuppu.material_upload_scope()
+    mat, mat_ok := nuppu.material_upload(&mat_scope, nuppu.DEFAULT_DRAW_STATE, &params, name = "unlit")
+    assert(mat_ok, "2-Animation: failed to upload material")
+    nuppu.material_upload_scope_end(&mat_scope)
+
     shader, shader_ok := nuppu.shader_register({
         vertex_code    = string(vertex_code),
         vertex_entry   = "vertexMain",
@@ -53,20 +63,23 @@ _init :: proc() {
         blend          = gpu.BLEND_NONE,
         multisample    = { count = 1, mask = 0xFFFFFFFF },
         topology       = .Triangle,
-    }, "unlit_vertex_color")
+    }, nuppu.Mesh_Instance, mat, "unlit_vertex_color")
     assert(shader_ok, "2-Animation: failed to register shader")
+    nuppu.connect_materials_to_shader({mat}, shader)
 
-    params := Object_Params {
-        color = {1, 1, 1, 1},
-    }
-    mat_scope := nuppu.material_upload_scope(1)
-    mat, mat_ok := nuppu.material_upload(&mat_scope, shader, nuppu.DEFAULT_DRAW_STATE, &params, name = "unlit")
-    assert(mat_ok, "2-Animation: failed to upload material")
+    state.material = mat
+    state.shader   = shader
 
     triangle := nuppu.entity_add(Triangle_Entity, "triangle")
-    triangle.mesh         = state.mesh
-    triangle.materials[0] = mat
-    triangle.scale        = {1, 1, 1}
+    triangle.mesh     = state.mesh
+    triangle.material = mat
+    triangle.scale    = {1, 1, 1}
+}
+
+_deinit :: proc() {
+    nuppu.mesh_free(state.mesh)
+    nuppu.material_free(state.material)
+    nuppu.shader_free(state.shader)
 }
 
 _update :: proc() {
@@ -83,8 +96,12 @@ _render :: proc(current: ^State, alpha: f32) {
     nuppu.update_constants(frame)
     defer nuppu.end_frame(frame)
 
-    nuppu.cull(frame)
-    nuppu.finish_instance_upload(frame)
+    culled := nuppu.cull_entities(Triangle_Entity)
+    for e in culled.entities {
+        nuppu.submit_mesh(e)
+    }
+
+    nuppu.flush_culled_instances(frame)
 
     gpu.barrier(.Transfer, .All)
 
@@ -108,6 +125,7 @@ desc := nuppu.App_Desc(State) {
     state       = &state,
     window_size = {1000, 1000},
     init        = _init,
+    deinit      = _deinit,
     update      = _update,
     render      = _render,
 }

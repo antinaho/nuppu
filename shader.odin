@@ -1,44 +1,37 @@
 #+vet unused shadowing using-param style semicolon cast explicit-allocators
 
-/*
-Shaders are the main draw object materials reference. A `gpu.Shader` bakes the
-whole immutable draw state (modules, formats, blend, multisample, topology) plus
-the resource set into one bindable object, so switching material is one bind.
-
-`Draw_State` (cull / front-face / depth) stays dynamic: Metal applies it with
-encoder calls, WGPU selects a cached pipeline variant. Neither duplicates the
-shader.
-
-Engine-global buffers always occupy the first read-resource slots; a shader's
-own textures/samplers follow.
-*/
-
 package nuppu
 
 import "gpu"
-import "bit_array"
 import "base:runtime"
 import "core:log"
 
 _ :: log
 
-#assert(CONFIG.max_shaders > 0, "CONFIG.max_shaders must be > 0")
-#assert(CONFIG.max_shaders % 64 == 0, "CONFIG.max_shaders must be a multiple of 64 (bit_array bucket)")
-#assert(CONFIG.max_shaders < (1 << 23), "CONFIG.max_shaders exceeds bit_array index space")
+SHADER_HANDLE_RAW :: u16
 
-Shader_Handle     :: Handle(bit_array.Handle)
+Shader_Handle     :: distinct Handle(SHADER_HANDLE_RAW)
 Shader_Handle_Nil :: Shader_Handle{}
+
+SHADER_INDEX_MASK :: MAX_SHADERS - 1
+#assert(MAX_SHADERS > 0 && (MAX_SHADERS & (MAX_SHADERS-1)) == 0, "MAX_SHADERS must be a power of two")
 
 Draw_State         :: gpu.Draw_State
 DEFAULT_DRAW_STATE :: gpu.DEFAULT_DRAW_STATE
 
-// Number of engine-global read-resource slots a shader block always starts
-// with: frame uniforms live in `constants`; these are the buffer bindings.
-SHADER_ENGINE_BUFFER_SLOTS :: 5
+// Parameter block slots in a registered shader's `binding_blocks`:
+// 0 engine constants, 1 instance + material, 2 shader-local, 3 material.
+SHADER_BLOCK_ENGINE   :: 0
+SHADER_BLOCK_GRAPHICS :: 1
+SHADER_BLOCK_LOCAL    :: 2
+SHADER_BLOCK_MATERIAL :: 3
 
-// Engine-level shader description. Mirrors `gpu.Shader_Desc` but takes engine
-// texture handles and no block; `shader_register` resolves them and composes
-// the full parameter block.
+Shader_Library :: struct {
+    table: Resource_Table(gpu.Shader), // slot 0 is the nil sentinel
+
+    __shader_handles: [dynamic]Shader_Handle, // debug-only, for leak reports
+}
+
 Shader_Desc :: struct {
     vertex_code:    string,
     vertex_entry:   string,
@@ -52,75 +45,120 @@ Shader_Desc :: struct {
     multisample: gpu.Multisample_State,
     topology:    gpu.Primitive,
 
-    textures: []Texture_Handle, // bound after the engine buffers, in order
-    samplers: []gpu.Sampler,    // defaults to the engine sampler when empty
+    shader_resources: struct {
+        textures: []Texture_Handle,
+        samplers: []Sampler_Handle,
+    },
 }
 
-Shader_Library :: struct {
-    shaders:   bit_array.Bit_Array(Resource(gpu.Shader, Shader_Handle), u64(CONFIG.max_shaders), Shader_Handle),
-    allocator: runtime.Allocator,
-    is_init:   bool,
+
+NUPPU_shader_lib_init :: proc(lib: ^Shader_Library, allocator := context.allocator) -> (err: runtime.Allocator_Error) {
+    err = resource_table_init(&lib.table, MAX_SHADERS, allocator)
+    if err != nil { return }
+
+    when ODIN_DEBUG {
+        lib.__shader_handles = make([dynamic]Shader_Handle, 0, 64, context.allocator)
+    }
+
+    return
 }
 
-_shader_lib_init :: proc(lib: ^Shader_Library, allocator := context.allocator) {
-    if lib.is_init { return }
-    lib.is_init   = true
-    lib.allocator = allocator
-    bit_array.init(&lib.shaders)
-}
+NUPPU_shader_lib_deinit :: proc(lib: ^Shader_Library) {
+    it := bit_mask_array_iterator_init(&lib.table.occupied)
+    for index in bit_mask_array_iterator_next(&it) {
+        if index == 0 { continue } // sentinel
+        shader := &lib.table.items[index]
+        delete(shader.desc.binding_blocks, lib.table.allocator)
+        shader.desc.binding_blocks = nil
+        gpu.shader_deinit(shader)
+    }
+    resource_table_destroy(&lib.table)
 
-_shader_lib_deinit :: proc(lib: ^Shader_Library) {
-    it := bit_array.iterator_init(&lib.shaders)
-    for {
-        shader, ok := bit_array.iterator_next(&it)
-        if !ok { break }
-        gpu.shader_deinit(&shader.data)
+    when ODIN_DEBUG {
+        delete(lib.__shader_handles)
     }
     lib^ = {}
 }
 
-// Composes the engine-global part of a shader's parameter block and appends the
-// given textures/samplers. Public so callers can rebuild a block at runtime and
-// hand it to `shader_set_parameter_block` to swap resources (e.g. textures).
-shader_block :: proc(textures: []Texture_Handle, samplers: []gpu.Sampler) -> gpu.Parameter_Block {
+material_binding_block :: proc(material: Material_Handle) -> gpu.Parameter_Block {
     block: gpu.Parameter_Block
 
-    block.constants[0] = _state.frame_uniform
+    assert(is_base_material(material), "material_binding_block: material must be a base material")
 
-    block.read_resources[0] = _state.mesh_library.vertex_arena.ptr
-    block.read_resources[1] = _state.draw_batcher.instance_base_buffer
-    block.read_resources[2] = _state.material_library.private_material_buffer
-    block.read_resources[3] = _state.material_library.private_params_buffer
-    block.read_resources[4] = _state.draw_batcher.instance_data_buffer
+    res := material_bindings_of(material)
 
-    assert(
-        len(textures) <= gpu.MAX_READ_RESOURCE - SHADER_ENGINE_BUFFER_SLOTS,
-        "shader_block: too many textures",
-    )
-    for tex_handle, i in textures {
-        tex, ok := get_resource(&_state.textures, tex_handle)
-        assert(ok, "shader_block: invalid texture handle")
-        block.read_resources[SHADER_ENGINE_BUFFER_SLOTS + i] = tex^
-    }
-
-    assert(len(samplers) <= gpu.MAX_SAMPLERS, "shader_block: too many samplers")
-    if len(samplers) == 0 {
-        block.samplers[0] = _state.sampler
-    } else {
-        for s, i in samplers {
-            block.samplers[i] = s
+    for r, i in res {
+        switch res_type in r {
+        case Texture:
+            block.read_resources[i] = res_type
+        case gpu.ptr:
+            block.read_resources[i] = res_type
         }
     }
 
     return block
 }
 
-@(require_results)
-shader_register :: proc(desc: Shader_Desc, name: string = "", loc := #caller_location) -> (Shader_Handle, bool) #optional_ok {
-    lib := &_state.shader_library
-    assert(lib.is_init, "shader_register: shader library not initialized")
+// Composes a shader's local block (set 1) must match the shader file
+shader_constant_block :: proc(
+    textures: []Texture_Handle,
+    samplers: []Sampler_Handle,
+) -> gpu.Parameter_Block {
+    block: gpu.Parameter_Block
 
-    block := shader_block(desc.textures, desc.samplers)
+    assert(len(textures) <= gpu.MAX_READ_RESOURCE, "shader_local_block: too many textures")
+    for tex_handle, i in textures {
+        tex, ok := get_texture(tex_handle)
+        assert(ok, "shader_local_block: invalid texture handle")
+        block.read_resources[i] = tex^
+    }
+
+    assert(len(samplers) <= gpu.MAX_SAMPLERS, "shader_local_block: too many samplers")
+    for s_handle, i in samplers {
+        s, ok := sampler_get(s_handle)
+        assert(ok, "shader_local_block: invalid sampler handle")
+        block.samplers[i] = s^
+    }
+
+    return block
+}
+
+
+connect_materials_to_shader :: proc(mats: []Material_Handle, shader: Shader_Handle) {
+    mat_lib := &_state.material_library
+    for mat in mats {
+        idx, ok := material_handle_unpack(mat)
+        if !ok { continue }
+        rec, got := resource_table_get(&mat_lib.table, int(idx))
+        if !got { continue }
+        rec.shader = shader
+    }
+}
+
+@(require_results)
+shader_register :: proc(desc: Shader_Desc, $I: typeid, base_material: Material_Handle, name: string = "", loc := #caller_location) -> (Shader_Handle, bool) #optional_ok {
+    lib := &_state.shader_library
+
+    // Base material used as a interface on creating the shaders bindings
+    assert(is_base_material(base_material), "shader_register: material must be a base material")
+    assert(size_of(I) % INSTANCE_SIZE_ALIGN == 0, "shader_register: instance layout must be a multiple of 16 bytes")
+    
+    material_block := material_binding_block(base_material)
+    local_block := shader_constant_block(
+            desc.shader_resources.textures,
+            desc.shader_resources.samplers,
+        )
+
+    // Instance + material block (set 1). The instance type registers this
+    // layout's buffer so WGPU can build the block from a concrete resource,
+    // the same way the material block is built from the base material.
+    graphics_block: gpu.Parameter_Block
+    graphics_block.read_resources[0] = _batcher_layout_buffer(I)
+    graphics_block.read_resources[1] = _state.material_library.private_material_buffer
+    graphics_block.read_resource_min_sizes[0] = uint(size_of(I))
+
+    binding_blocks := make([dynamic]gpu.Parameter_Block, allocator = lib.table.allocator)
+    append(&binding_blocks, _state.engine_block, graphics_block, local_block, material_block)
 
     shader := gpu.shader_init(gpu.Shader_Desc {
         vertex_code    = desc.vertex_code,
@@ -132,20 +170,57 @@ shader_register :: proc(desc: Shader_Desc, name: string = "", loc := #caller_loc
         blend          = desc.blend,
         multisample    = desc.multisample,
         topology       = desc.topology,
-        block          = block,
+        binding_blocks = binding_blocks[:],
     })
 
-    return add_resource(&lib.shaders, shader, name, loc), true
+    index, ok := resource_table_acquire(&lib.table)
+    assert(ok, "shader_register: out of shader slots, raise CONFIG.max_shaders")
+
+    lib.table.items[index] = shader
+
+    handle := Shader_Handle { handle = u16(index) }
+    when ODIN_DEBUG {
+        handle.metadata = Metadata {
+            created_at       = loc,
+            created_on_frame = _state.frame_n,
+            name             = name,
+        }
+        append(&lib.__shader_handles, handle)
+    }
+    return handle, true
 }
 
 @(require_results)
 get_shader :: proc(handle: Shader_Handle) -> (^gpu.Shader, bool) #optional_ok {
-    return get_resource(&_state.shader_library.shaders, handle)
+    index, ok := shader_handle_unpack(handle)
+    if !ok { return nil, false }
+    return resource_table_get(&_state.shader_library.table, index)
 }
 
-// Runtime resource swap. Rebuild a block with `shader_block` and pass it here.
-shader_set_parameter_block :: proc(handle: Shader_Handle, block: ^gpu.Parameter_Block) {
-    shader, ok := get_shader(handle)
+shader_free :: proc(handle: Shader_Handle) {
+    lib := &_state.shader_library
+    index, ok := shader_handle_unpack(handle)
     if !ok { return }
-    gpu.set_parameter_block(shader, block)
+    shader, got := resource_table_get(&lib.table, index)
+    if !got { return }
+
+    delete(shader.desc.binding_blocks, lib.table.allocator)
+    shader.desc.binding_blocks = nil
+    gpu.shader_deinit(shader)
+    resource_table_release(&lib.table, index)
+
+    when ODIN_DEBUG {
+        for h, i in lib.__shader_handles {
+            if h == handle {
+                unordered_remove(&lib.__shader_handles, i)
+                break
+            }
+        }
+    }
+}
+
+shader_handle_unpack :: proc "contextless" (handle: Shader_Handle) -> (idx: SHADER_HANDLE_RAW, ok: bool) #optional_ok {
+    idx = handle.handle & SHADER_INDEX_MASK
+    if idx == 0 || idx >= MAX_SHADERS { return 0, false }
+    return idx, true
 }

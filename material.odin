@@ -1,115 +1,164 @@
 #+vet unused shadowing using-param style semicolon cast explicit-allocators
 
-/*
-
-
-*/
-
 package nuppu
-
-#assert(CONFIG.max_materials <= MATERIAL_INDEX_MASK, "CONFIG.max_materials must be <= MATERIAL_INDEX_MASK")
 
 import "base:intrinsics"
 import "base:runtime"
 import "core:log"
 import "gpu"
+import "core:slice"
 
 _ :: log
+_ :: slice
 
-MATERIAL_HANDLE_RAW       :: u16
-MATERIAL_INDEX_MASK       :: (1 << 15) - 1
-MATERIAL_EMBED_BIT        ::  1 << 15
 
-MATERIAL_EMBED_DATA_BYTES :: 6
+MATERIAL_PARAM_BYTES :: 32
 
-Material_Handle :: Handle(MATERIAL_HANDLE_RAW)
+MATERIAL_HANDLE_RAW :: u16
+MATERIAL_BASE_BIT   :: 1 << 9
+MATERIAL_INDEX_MASK :: MAX_MATERIALS - 1
+#assert(MAX_MATERIALS > 0 && (MAX_MATERIALS & (MAX_MATERIALS-1)) == 0, "MAX_MATERIALS must be a power of two")
+#assert(MATERIAL_INDEX_MASK < MATERIAL_BASE_BIT, "material index collides with the base-material bit")
+
+Material_Constant :: struct #align(16) {
+    params: [MATERIAL_PARAM_BYTES]u8,
+}
+#assert(size_of(Material_Constant) == MATERIAL_PARAM_BYTES)
+
+Material_Handle :: distinct Handle(MATERIAL_HANDLE_RAW)
 MATERIAL_NIL    :: Material_Handle{}
 
-when !ODIN_DEBUG {
-    #assert(size_of(Material_Handle) == size_of(MATERIAL_HANDLE_RAW))
+// Resolves an engine texture handle into a material resource.
+material_texture :: proc(handle: Texture_Handle) -> gpu.Parameter_Resource {
+    tex, ok := get_texture(handle)
+    assert(ok, "material_texture: invalid texture handle")
+    return tex^
 }
 
-#assert(size_of(GPU_Material_Instance) == 8)
-GPU_Material_Instance :: struct #align(8) {
-    handle     : MATERIAL_HANDLE_RAW,
-    user_data_1: u16,
-    user_data_2: u32,                 // extra inline data or byte offset into the parameter buffer
+// Render order bucket a material belongs to. Opaque draws are batched purely by
+// pipeline; Transparent draws are depth-sorted back-to-front.
+Render_Queue :: enum u8 {
+    Opaque = 0,
+    Transparent,
+}
+
+Built_In_Material :: enum u8 {
+    Sprite,
+}
+
+// CPU-side companion to one 32-byte GPU material record.
+Material_Record :: struct {
+    shader:   Shader_Handle,
+    state:    Draw_State,
+    queue:    Render_Queue,
+    bindings: [dynamic]gpu.Parameter_Resource,
+}
+
+get_built_in_material :: proc(mat: Built_In_Material) -> Material_Handle {
+    return _state.material_library.built_in[mat]
 }
 
 Material_Library :: struct {
-    private_material_buffer: gpu.ptr, // [CONFIG.max_materials]GPU_Material
-    private_params_buffer  : gpu.ptr, // [CONFIG.material_param_bytes]u8 variable-size params
+    private_material_buffer: gpu.ptr,
+    built_in: [Built_In_Material]Material_Handle,
 
-    material_types         : [dynamic]typeid,
-    material_shaders       : [dynamic]Shader_Handle,
-    material_draw_states   : [dynamic]Draw_State,
+    material_type_set: map[typeid]Material_Handle,
+    table: Resource_Table(Material_Record),
 
-    occupied               : Bit_Mask_Array,
+    __material_handles: [dynamic]Material_Handle, // debug-only
+}
 
-    allocator              : runtime.Allocator,
-    is_init                : bool,
+NUPPU_material_lib_init :: proc(lib: ^Material_Library, allocator := context.allocator) -> (err: runtime.Allocator_Error) {
+    ok: bool
+    lib.private_material_buffer, ok = gpu.malloc(
+        u32(MAX_MATERIALS * size_of(Material_Constant)),
+        256, .Default, "Material Buffer",
+    )
+    assert(ok, "material_lib_init: failed to alloc material buffer")
 
-    material_handles       : [dynamic]Material_Handle, // debug-only
+    resource_table_init(&lib.table, MAX_MATERIALS, allocator) or_return
+    lib.material_type_set = make(map[typeid]Material_Handle, capacity = MAX_MATERIALS, allocator = allocator) or_return
+
+    when ODIN_DEBUG {
+        lib.__material_handles = make([dynamic]Material_Handle, 0, 64, context.allocator)
+    }
+
+    return
+}
+
+NUPPU_material_lib_deinit :: proc(lib: ^Material_Library) {
+    gpu.release_ptr(&lib.private_material_buffer)
+
+    it := bit_mask_array_iterator_init(&lib.table.occupied)
+    for index in bit_mask_array_iterator_next(&it) {
+        if index == 0 { continue }
+        delete(lib.table.items[index].bindings)
+    }
+    resource_table_destroy(&lib.table)
+    delete(lib.material_type_set)
+
+    when ODIN_DEBUG {
+        delete(lib.__material_handles)
+    }
+    lib^ = {}
 }
 
 Material_Upload_Scope :: struct {
-    staging_mat   : gpu.ptr,
-    staging_params: gpu.Arena,
-    active        : bool,
+    staging: gpu.ptr,
+    occupied: Bit_Mask_Array,
 }
 
-@(require_results, deferred_out_by_ptr = __material_upload_scope_end)
-material_upload_scope :: proc(count: int) -> Material_Upload_Scope {
-    // `material_upload` writes each material at its global library index, and
-    // the scope-end blit copies the whole staging buffer to the private buffer
-    // at offset 0. Size the staging buffer to the full library so both stay in
-    // bounds and aligned.
-    assert(count > 0 && count <= CONFIG.max_materials, "material_upload_scope: bad count")
+@(require_results)
+material_upload_scope :: proc(loc := #caller_location) -> Material_Upload_Scope {
     staging_mat, ok := gpu.malloc(
-        size_of(GPU_Material_Instance) * CONFIG.max_materials,
-        u32(align_of(GPU_Material_Instance)), .Staging,
+        size_of(Material_Constant) * MAX_MATERIALS,
+        align_of(Material_Constant),
+        .Staging,
     )
     assert(ok, "material_upload_scope: failed to alloc material buffer")
-    staging_params, ok_par := gpu.arena_init(CONFIG.material_param_bytes, 16, .Staging)
-    assert(ok_par, "material_upload_scope: failed to alloc material params buffer")
-    
-    return Material_Upload_Scope {
-        staging_mat = staging_mat,
-        staging_params = staging_params,
-        active = true,
+    intrinsics.mem_zero(staging_mat.cpu, size_of(Material_Constant) * MAX_MATERIALS)
+
+    lib := &_state.material_library
+    scope_occupied := bit_mask_array_init(lib.table.occupied.bit_count, allocator = context.temp_allocator)
+    intrinsics.mem_copy_non_overlapping(
+        rawptr(scope_occupied.words), rawptr(lib.table.occupied.words),
+        lib.table.occupied.word_count * size_of(Bit_Mask64),
+    )
+    scope_occupied.free_hint = lib.table.occupied.free_hint
+    scope_occupied.live      = lib.table.occupied.live
+
+    return {
+        staging = staging_mat,
+        occupied = scope_occupied,
     }
 }
 
 @(require_results)
-material_upload :: proc(scope: ^Material_Upload_Scope, shader: Shader_Handle, state: Draw_State, data: ^$M, is_embed: bool = false, name: string = "", loc := #caller_location) -> (Material_Handle, bool) #optional_ok {
+material_upload :: proc(
+    scope: ^Material_Upload_Scope,
+    state: Draw_State,
+    data: ^$M,
+    queue: Render_Queue = .Opaque,
+    bindings: []gpu.Parameter_Resource = nil,
+    name: string = "",
+    loc := #caller_location,
+) -> (Material_Handle, bool) #optional_ok {
+    assert(size_of(M) <= MATERIAL_PARAM_BYTES, "material_upload: parameter payload exceeds MATERIAL_PARAM_BYTES", loc = loc)
+
     lib := &_state.material_library
-    assert(lib.is_init, "material_upload: material library not initialized")
-    assert(scope.active, "material_upload: scope is not active, call material_upload_scope() first")
-    free_idx, ok := bit_mask_array_flip_first_zero(&_state.material_library.occupied)
-    assert(ok, "material_upload: Ran out of space, increase max materials in config")
+    free_idx, ok := bit_mask_array_flip_first_zero(&scope.occupied)
+    assert(ok, "material_upload: Ran out of space, increase max materials")
+    
     handle_raw := u16(free_idx)
+    mat_slot := &([^]Material_Constant)(scope.staging.cpu)[free_idx]
+    intrinsics.mem_copy_non_overlapping(mat_slot, rawptr(data), size_of(M))
 
-    if is_embed {
-        if size_of(M) > MATERIAL_EMBED_DATA_BYTES {
-            log.error("material_register: embed data size is too large", location = loc)
-            return MATERIAL_NIL, false
-        }
-        handle_raw |= MATERIAL_EMBED_BIT
-    }
-
-    mat := &([^]GPU_Material_Instance)(scope.staging_mat.cpu)[free_idx]
-    mat.handle = handle_raw
-    mat.user_data_1 = 0
-    mat.user_data_2 = 0
-
-    size_t := size_of(M)
-    if size_t <= MATERIAL_EMBED_DATA_BYTES && is_embed {
-        intrinsics.mem_copy_non_overlapping(&mat.user_data_1, rawptr(data), size_t)
-    } else {
-        view := gpu.arena_alloc_raw(&scope.staging_params, uint(size_t), 1, 16)
-        intrinsics.mem_zero(view.cpu, size_t)
-        intrinsics.mem_copy_non_overlapping(view.cpu, rawptr(data), size_t)
-        mat.user_data_2 = view.byte_offset
+    rec := &lib.table.items[free_idx]
+    rec.state = state
+    rec.queue = queue
+    if len(bindings) > 0 {
+        clear(&rec.bindings)
+        append(&rec.bindings, ..bindings)
     }
 
     handle := Material_Handle { handle = handle_raw }
@@ -119,83 +168,108 @@ material_upload :: proc(scope: ^Material_Upload_Scope, shader: Shader_Handle, st
             created_on_frame = _state.frame_n,
             name             = name,
         }
-        append(&lib.material_handles, handle)
     }
 
-    append(&lib.material_types, M)
-    append(&lib.material_shaders, shader)
-    append(&lib.material_draw_states, state)
+    if M not_in lib.material_type_set {
+        handle.handle |= MATERIAL_BASE_BIT
+        lib.material_type_set[M] = handle
+    }
+
+    when ODIN_DEBUG {
+        append(&lib.__material_handles, handle)
+    }
 
     return handle, true
 }
 
-__material_upload_scope_end :: proc(scope: ^Material_Upload_Scope) {
+material_upload_scope_end :: proc(scope: ^Material_Upload_Scope) {
     lib := &_state.material_library
+
     gpu.begin_commands()
-    gpu.copy(lib.private_material_buffer, scope.staging_mat)
-    gpu.copy(lib.private_params_buffer, scope.staging_params.ptr)
-    gpu.barrier(.Transfer, .All)
-    gpu.commit_commands()
+    ranges := bit_mask_array_diff_ranges(&scope.occupied, &lib.table.occupied, context.temp_allocator) 
+    for r in ranges {
+        gpu.copy(
+            lib.private_material_buffer,
+            scope.staging,
+            dst_offset      = r.start * size_of(Material_Constant),
+            src_offset      = r.start * size_of(Material_Constant),
+            length_override = size_of(Material_Constant) * r.length,
+        )
+    }
+    gpu.transfer_submit(&scope.staging)
 
-    gpu.release_ptr(&scope.staging_mat)
-    gpu.release_ptr(&scope.staging_params.ptr)
-    scope.active = false
-}
-
-
-@(require_results)
-material_shader_of :: proc(handle: Material_Handle) -> (Shader_Handle, Draw_State) {
-    lib := &_state.material_library
-    index := _material_handle_unpack(handle)
-    return lib.material_shaders[index], lib.material_draw_states[index]
-}
-
-_material_lib_init :: proc(lib: ^Material_Library, allocator := context.allocator) {
-    if lib.is_init { return }
-    lib.is_init = true
-    lib.allocator = allocator
-
-    lib.occupied = bit_mask_array_init(CONFIG.max_materials, allocator = context.allocator)
-
-    ok: bool
-    lib.private_material_buffer, ok = gpu.malloc(
-        u32(CONFIG.max_materials * size_of(GPU_Material_Instance)),
-        256, .Default, "Material Buffer",
+    // update to the new state
+    lib.table.occupied.free_hint = scope.occupied.free_hint
+    lib.table.occupied.live      = scope.occupied.live
+    intrinsics.mem_copy_non_overlapping(
+        rawptr(lib.table.occupied.words), rawptr(scope.occupied.words),
+        scope.occupied.word_count * size_of(Bit_Mask64),
     )
-    assert(ok, "material_lib_init: failed to alloc material buffer")
+}
 
-    lib.private_params_buffer, ok = gpu.malloc(CONFIG.material_param_bytes, 256, .Default, "Material params") 
-    assert(ok, "material_lib_init: failed to alloc material params buffer")
+material_free :: proc(handle: Material_Handle) {
+    lib := &_state.material_library
+    idx, ok := material_handle_unpack(handle)
+    if !ok { return }
+    rec, got := resource_table_get(&lib.table, int(idx))
+    if !got { return }
 
-    lib.material_types       = make([dynamic]typeid, 0, 64, allocator)
-    lib.material_shaders     = make([dynamic]Shader_Handle, 0, 64, allocator)
-    lib.material_draw_states = make([dynamic]Draw_State, 0, 64, allocator)
+    // Drop the base-material registration pointing at this slot, if any.
+    base_type: typeid
+    is_base: bool
+    for t, base in lib.material_type_set {
+        if base == handle {
+            base_type = t
+            is_base = true
+            break
+        }
+    }
+    if is_base {
+        delete_key(&lib.material_type_set, base_type)
+    }
 
-    // Slot 0 is MATERIAL_NIL; keep the per-index arrays aligned with `top`.
-    append(&lib.material_types, typeid_of(int))
-    append(&lib.material_shaders, Shader_Handle_Nil)
-    append(&lib.material_draw_states, DEFAULT_DRAW_STATE)
-    bit_mask_array_flip_first_zero(&lib.occupied)
+    delete(rec.bindings)
+    rec^ = {}
+    resource_table_release(&lib.table, int(idx))
 
     when ODIN_DEBUG {
-        lib.material_handles = make([dynamic]Material_Handle, 0, 64, allocator)
-        append(&lib.material_handles, Material_Handle{})
+        i, found := slice.linear_search(lib.__material_handles[:], handle)
+        if found {
+            unordered_remove(&lib.__material_handles, i)
+        }
     }
 }
 
-_material_lib_deinit :: proc(lib: ^Material_Library) {
-    gpu.release_ptr(&lib.private_material_buffer)
-    gpu.release_ptr(&lib.private_params_buffer)
-    bit_mask_array_destroy(&lib.occupied)
-    delete(lib.material_types)
-    delete(lib.material_shaders)
-    delete(lib.material_draw_states)
-    when ODIN_DEBUG {
-        delete(lib.material_handles)
-    }
-    lib^ = {}
+material_handle_unpack :: proc "contextless" (handle: Material_Handle) -> (idx: MATERIAL_HANDLE_RAW, ok: bool) #optional_ok { 
+    idx = handle.handle & MATERIAL_INDEX_MASK
+    if idx == 0 || idx >= MAX_MATERIALS { return 0, false }
+    return idx, true
 }
 
-_material_handle_unpack :: proc(handle: Material_Handle) -> u16 {
-    return handle.handle & MATERIAL_INDEX_MASK
+is_base_material :: proc "contextless" (handle: Material_Handle) -> bool {
+    return (handle.handle & MATERIAL_BASE_BIT) != 0
+}
+
+material_shader_of     :: proc "contextless" (handle: Material_Handle) -> Shader_Handle {
+    idx, ok := material_handle_unpack(handle)
+    if !ok { return {} }
+    return _state.material_library.table.items[int(idx)].shader
+}
+
+material_draw_state_of :: proc "contextless" (handle: Material_Handle) -> Draw_State {
+    idx, ok := material_handle_unpack(handle)
+    if !ok { return DEFAULT_DRAW_STATE }
+    return _state.material_library.table.items[int(idx)].state
+}
+
+material_queue_of      :: proc "contextless" (handle: Material_Handle) -> Render_Queue {
+    idx, ok := material_handle_unpack(handle)
+    if !ok { return .Opaque }
+    return _state.material_library.table.items[int(idx)].queue
+}
+
+material_bindings_of :: proc "contextless" (handle: Material_Handle) -> []gpu.Parameter_Resource {
+    idx, ok := material_handle_unpack(handle)
+    if !ok { return nil }
+    return _state.material_library.table.items[int(idx)].bindings[:]
 }

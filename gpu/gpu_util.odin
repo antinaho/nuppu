@@ -2,31 +2,28 @@ package nuppu_gpu
 
 import "base:runtime"
 import "core:log"
-import "core:mem"
 
 Arena :: struct {
     using ptr: ptr,
     offset: uint,
 }
 
-
-// Linear bump arena that allocates staging buffer. Helps if multiple types of staging data is needed to be copied simultaneously.
 arena_init :: proc(
-    #any_int bytes: u32,
-    #any_int alignment: u32 = 16,
-    flags: Buffer_Flag      = .Staging,
-    loc:                    = #caller_location,
+    #any_int bytes    : uint,
+    #any_int alignment: uint = 16,
+    usage             : Buffer_Usage = .Staging,
+    loc               := #caller_location,
 ) -> (Arena, bool) {
     arena: Arena
 
-    if min_alignment := _min_alignment(flags); alignment < min_alignment {
-        log.errorf("In malloc() passed in alignment %i is less than the minimum required for flags %v. Bump to %i", alignment, flags, min_alignment, location = loc)
+    if min_alignment := _min_alignment(usage); alignment < min_alignment {
+        log.errorf("In arena_init: passed in alignment (%i) is less than the minimum required for usage (%v). Bump to at least (%i)", alignment, usage, min_alignment, location = loc)
         return {}, false
     }
 
-    capacity := runtime.align_forward(uint(bytes), uint(alignment))
+    capacity := runtime.align_forward(bytes, alignment)
 
-    _ptr := _malloc(bytes, alignment, flags, "ARENA", loc)
+    _ptr := _malloc(bytes, alignment, usage, "Arena", loc)
 
     arena.ptr = {
         meta = Metadata {
@@ -34,11 +31,11 @@ arena_init :: proc(
             created_at = loc,
         },
         native = _ptr,
-        cpu = _cpu_address(_ptr) if flags == .Staging else nil,
+        cpu = _cpu_address(_ptr) if usage == .Staging else nil,
         gpu = _gpu_address(_ptr),
-        flags = flags,
+        flags = usage,
         alignment = alignment,
-        total_capacity_bytes = u32(capacity),
+        total_capacity_bytes = capacity,
         byte_offset = 0,
     }
     arena.offset = 0
@@ -47,31 +44,29 @@ arena_init :: proc(
     return arena, true
 }
 
-// Returns ptr with correct field values.
-arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, align: uint, loc := #caller_location) -> ptr {
-    alignment := max(u32(align), arena.ptr.alignment)
+arena_alloc_raw :: proc(arena: ^Arena, el_size, el_count, alignment: uint, loc := #caller_location) -> ptr {
+
     if arena.ptr.cpu != nil && uintptr(arena.ptr.cpu) % uintptr(alignment) != uintptr(arena.ptr.gpu) % uintptr(alignment) {
-        panic("Could not satisfy alignment requirements in GPU arena allocation.")
+        log.panicf("In arena_alloc_raw: Could not satisfy alignment requirements with existing alignment (%v) and passed in alignment (%v)", arena.ptr.alignment, alignment, location = loc)
     }
 
-    bytes := el_size * el_count
     assert(alignment > 0)
-    bytes_aligned := runtime.align_forward_uint(uint(bytes), uint(alignment))
+    bytes := runtime.align_forward(el_size * el_count, alignment)
 
-    arena.offset = mem.align_forward_uint(arena.offset, uint(alignment))
+    arena.offset = runtime.align_forward(arena.offset, alignment)
     temp := arena.offset
-    if arena.offset + bytes_aligned > uint(arena.total_capacity_bytes) {
-        panic("Arena: out of space")
+    if arena.offset + bytes > uint(arena.total_capacity_bytes) {
+        log.panicf("In arena_alloc_raw: Arena ran out of space while trying to allocate (%v) bytes, with remaining space being (%v)", bytes, arena.total_capacity_bytes - arena.offset, location = loc)
     }
-    arena.offset += bytes_aligned
+    arena.offset += bytes
 
-    view := sub_alloc(arena.ptr, u32(temp), u32(bytes_aligned))
+    view := sub_alloc(arena.ptr, temp, bytes)
 
     return view
 }
 
 // Helper for arena alloc
-arena_alloc :: proc(arena: ^Arena, $T: typeid, el_count: uint = 1, loc := #caller_location) -> ptr {
+arena_alloc :: proc(arena: ^Arena, $T: typeid, #any_int el_count: uint = 1, loc := #caller_location) -> ptr {
     temp := arena_alloc_raw(arena, size_of(T), el_count, align_of(T), loc)
 
     // NOTE add typed return?
@@ -81,7 +76,15 @@ arena_alloc :: proc(arena: ^Arena, $T: typeid, el_count: uint = 1, loc := #calle
     return temp
 }
 
-sub_alloc :: proc(parent: ptr, offset, length: u32) -> ptr {
+// Closes a transfer batch opened with `begin_commands`: flushes the recorded
+// copies with a Transfer->All barrier, commits, and releases the staging buffer.
+transfer_submit :: proc(staging: ^ptr) {
+    barrier(.Transfer, .All)
+    commit_commands()
+    release_ptr(staging)
+}
+
+sub_alloc :: proc(parent: ptr, offset, length: uint) -> ptr {
     assert(offset + length <= parent.total_capacity_bytes)
     assert(length <= parent.total_capacity_bytes - offset)
 

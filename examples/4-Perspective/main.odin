@@ -7,22 +7,19 @@ import "core:math"
 state: ^State
 
 State :: struct {
-    angle:  f32,
-    center: [3]f32,
+    angle:    f32,
+    center:   [3]f32,
+    material: nuppu.Material_Handle,
+    shader:   nuppu.Shader_Handle,
 }
 
 Object_Params :: struct {
     color: [4]f32,
 }
 
-// Per-entity data uploaded every frame through the `gpu_instance` field.
-Color_Instance :: struct {
-    color: [4]f32,
-}
-
 Cube_Entity :: struct {
     using e: ^nuppu.Entity,
-    gpu_instance: Color_Instance,
+    color: [4]f32,
 }
 
 INSTANCE_WIDTH  :: 3
@@ -33,7 +30,7 @@ INSTANCE_COUNT  :: INSTANCE_WIDTH * INSTANCE_HEIGHT * INSTANCE_DEPTH
 _init :: proc() {
     nuppu.update_camera({0, 0, 0}, {}, 0.03, 500, 45)
 
-    nuppu.register_entity(Cube_Entity, 8, {.Interpolate, .Has_Mesh}, Color_Instance)
+    nuppu.register_entity(Cube_Entity, 8, {.Interpolate})
 
     vertex_code: []u8
     fragment_code: []u8
@@ -45,6 +42,14 @@ _init :: proc() {
         fragment_code = vertex_code
     }
 
+    params := Object_Params {
+        color = {1, 1, 1, 1},
+    }
+    mat_scope := nuppu.material_upload_scope()
+    mat, mat_ok := nuppu.material_upload(&mat_scope, nuppu.DEFAULT_DRAW_STATE, &params, name = "unlit")
+    assert(mat_ok, "4-Perspective: failed to upload material")
+    nuppu.material_upload_scope_end(&mat_scope)
+
     shader, shader_ok := nuppu.shader_register({
         vertex_code    = string(vertex_code),
         vertex_entry   = "vertexMain",
@@ -55,15 +60,12 @@ _init :: proc() {
         blend          = gpu.BLEND_NONE,
         multisample    = { count = 1, mask = 0xFFFFFFFF },
         topology       = .Triangle,
-    }, "unlit_instance_color")
+    }, nuppu.Mesh_Instance, mat, "unlit_instance_color")
     assert(shader_ok, "4-Perspective: failed to register shader")
+    nuppu.connect_materials_to_shader({mat}, shader)
 
-    params := Object_Params {
-        color = {1, 1, 1, 1},
-    }
-    mat_scope := nuppu.material_upload_scope(1)
-    mat, mat_ok := nuppu.material_upload(&mat_scope, shader, nuppu.DEFAULT_DRAW_STATE, &params, name = "unlit")
-    assert(mat_ok, "4-Perspective: failed to upload material")
+    state.material = mat
+    state.shader   = shader
 
     cube_handle := nuppu.built_in_mesh_handle(.Cube)
 
@@ -74,7 +76,7 @@ _init :: proc() {
             for ix in 0 ..< INSTANCE_WIDTH {
                 c := nuppu.entity_add(Cube_Entity, "cube")
                 c.mesh         = cube_handle
-                c.materials[0] = mat
+                c.material = mat
                 c.scale        = {0.4, 0.4, 0.4}
                 c.position = {
                     (f32(ix) - f32(INSTANCE_WIDTH - 1)  * 0.5) * spacing,
@@ -84,11 +86,16 @@ _init :: proc() {
                 center_sum += c.position
 
                 t := f32(ix * INSTANCE_HEIGHT * INSTANCE_DEPTH + iy * INSTANCE_DEPTH + iz) / f32(INSTANCE_COUNT)
-                c.gpu_instance.color = {t, 1 - t, math.sin(math.TAU * t), 1}
+                c.color = {t, 1 - t, math.sin(math.TAU * t), 1}
             }
         }
     }
     state.center = center_sum / f32(INSTANCE_COUNT)
+}
+
+_deinit :: proc() {
+    nuppu.material_free(state.material)
+    nuppu.shader_free(state.shader)
 }
 
 _update :: proc() {
@@ -113,8 +120,13 @@ _render :: proc(current: ^State, alpha: f32) {
     nuppu.update_constants(frame)
     defer nuppu.end_frame(frame)
 
-    nuppu.cull(frame)
-    nuppu.finish_instance_upload(frame)
+    culled := nuppu.cull_entities(Cube_Entity)
+    for e in culled.entities {
+        cube := (^Cube_Entity)(e.v.data)
+        nuppu.submit_mesh(e, cube.color)
+    }
+
+    nuppu.flush_culled_instances(frame)
 
     gpu.barrier(.Transfer, .All)
 
@@ -138,6 +150,7 @@ desc := nuppu.App_Desc(State) {
     state       = &state,
     window_size = {1000, 1000},
     init        = _init,
+    deinit      = _deinit,
     update      = _update,
     render      = _render,
 }

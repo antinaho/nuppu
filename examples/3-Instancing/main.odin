@@ -3,15 +3,19 @@ package main
 import nuppu "../.."
 import gpu "../../gpu"
 import "../../platform"
-import "core:fmt"
 import "core:image"
 import _ "core:image/png"
 
 State :: struct {
     angle: f32,
 
-    textures: nuppu.Texture_Handle,
-    sampler:  gpu.Sampler,
+    tex_browser: nuppu.Texture_Handle,
+    tex_peach:   nuppu.Texture_Handle,
+    sampler:     nuppu.Sampler_Handle,
+
+    m_browser: nuppu.Material_Handle,
+    m_peach:   nuppu.Material_Handle,
+    shader:    nuppu.Shader_Handle,
 }
 
 INSTANCE_COUNT :: 4
@@ -20,45 +24,53 @@ ATLAS_ROWS :: 2
 
 state: ^State
 
-_upload_png_to_array_layer :: proc(texture: gpu.Texture, layer: int, data: []u8, label: string) {
-    img, img_err := image.load_from_bytes(data, {.alpha_add_if_missing}, context.temp_allocator)
-    if img_err != nil {
-        panic(fmt.tprintf("3-Instancing: failed to decode %s: %v", label, img_err))
-    }
-    defer image.destroy(img, context.temp_allocator)
-
-    gpu.copy_to_texture(texture, {0, 0, u32(layer)}, {u32(img.width), u32(img.height), 1}, 0, raw_data(img.pixels.buf[:]), u32(img.width * 4))
-}
-
 _init :: proc() {
-    state.textures = nuppu.texture_init_ex({
-        dimensions  = {63, 63},
-        format      = .RGBA8Unorm,
-        type        = ._2D_Array,
-        storage     = .Shared,
-        usage       = {.Sampled},
-        layer_count = 2,
-    }, name = "sprite_atlas")
 
-    texture, texture_ok := nuppu.get_texture(state.textures)
-    assert(texture_ok, "3-Instancing: failed to get texture")
-    _upload_png_to_array_layer(texture^, 0, #load("bowser.png", []u8), "bowser.png")
-    _upload_png_to_array_layer(texture^, 1, #load("peach.png", []u8), "peach.png")
+    // MATERIALS
+    // 1. Malloc per material gpu space
+    // 2. Upload data to that gpu space
 
-    state.sampler = gpu.sampler_init({
+    // Malloc gpu space for materials different variants
+    tex_browser := nuppu.texture_2D( {63, 63}, .RGBA8Unorm, {.Sampled}, name = "Browser tex" )
+    tex_peach := nuppu.texture_2D( {63, 63}, .RGBA8Unorm, {.Sampled}, name = "Peach tex" )
+
+    // Load texture data from disk
+    tex_bowser_data, tex_bowser_load_err := image.load_from_bytes(#load("bowser.png", []u8), {.alpha_add_if_missing}, context.temp_allocator)
+    assert(tex_bowser_load_err == nil, "3-Instancing: failed to decode bowser.png")
+    defer image.destroy(tex_bowser_data, context.temp_allocator)
+
+    tex_peach_data, tex_peach_load_err := image.load_from_bytes(#load("peach.png", []u8), {.alpha_add_if_missing}, context.temp_allocator)
+    assert(tex_peach_load_err == nil, "3-Instancing: failed to decode peach.png")
+    defer image.destroy(tex_peach_data, context.temp_allocator)
+
+    tex_upload_scope := nuppu.texture_upload_scope(2 * nuppu.texture_upload_image_bytes(63, 63, .RGBA8Unorm))
+    nuppu.texture_upload(&tex_upload_scope, tex_browser, .RGBA8Unorm, raw_data(tex_bowser_data.pixels.buf[:]))
+    nuppu.texture_upload(&tex_upload_scope, tex_peach, .RGBA8Unorm, raw_data(tex_peach_data.pixels.buf[:]))
+    nuppu.texture_upload_scope_end(&tex_upload_scope)
+
+    // Material constants are just scalars; the texture is set-2 per material.
+    sprite_params := Sprite_Material_Constants {
+        color = {1, 1, 1, 1},
+    }
+
+    mat_scope := nuppu.material_upload_scope()
+    mat_browser, mat_browser_ok := nuppu.material_upload(&mat_scope, nuppu.DEFAULT_DRAW_STATE, &sprite_params, .Opaque, { nuppu.material_texture(tex_browser) }, "browser mat")
+    mat_peach, mat_peach_ok := nuppu.material_upload(&mat_scope, nuppu.DEFAULT_DRAW_STATE, &sprite_params, .Opaque, { nuppu.material_texture(tex_peach) }, "peach mat")
+    assert(mat_browser_ok && mat_peach_ok, "3-Instancing: failed to upload materials")
+    nuppu.material_upload_scope_end(&mat_scope)
+
+    // SHADER RESOURCES
+    // 1. Create shader's constant resources (buffers, textures, samplers)
+    shader_sampler := nuppu.sampler_create({
         min_filter = .Nearest,
         mag_filter = .Nearest,
         mip_filter = .Nearest,
         wrap_s     = .ClampToEdge,
         wrap_t     = .ClampToEdge,
         wrap_r     = .ClampToEdge,
-    })
+    }, "instancing_sampler")
 
-    nuppu.update_camera({0, 0, 2}, {}, 0.1, 1_000, 80)
-
-    nuppu.register_entity(Quad_Entity, 8, {.Interpolate, .Has_Mesh}, nuppu.Sprite_Instance)
-    nuppu.register_entity(Cube_Entity, 8, {.Interpolate, .Has_Mesh})
-
+    // SHADER
     vertex_code: []u8
     fragment_code: []u8
     when ODIN_OS == .Darwin {
@@ -69,7 +81,7 @@ _init :: proc() {
         fragment_code = vertex_code
     }
 
-    shader, shader_ok := nuppu.shader_register({
+    sprite_shader, sprite_shader_ok := nuppu.shader_register({
         vertex_code    = string(vertex_code),
         vertex_entry   = "vertexMain",
         fragment_code  = string(fragment_code),
@@ -79,62 +91,68 @@ _init :: proc() {
         blend          = gpu.BLEND_NONE,
         multisample    = { count = 1, mask = 0xFFFFFFFF },
         topology       = .Triangle,
-        textures       = []nuppu.Texture_Handle{ state.textures },
-        samplers       = []gpu.Sampler{ state.sampler },
-    }, "sprite_shader")
-    assert(shader_ok, "3-Instancing: failed to register shader")
+        shader_resources = {
+            samplers = { shader_sampler },
+        },
+    }, nuppu.Sprite_Instance, mat_browser, "sprite_shader")
+    assert(sprite_shader_ok, "3-Instancing: failed to register shader")
 
-    sprite_params := Object_Params {
-        color = {1, 1, 1, 1},
-    }
+    nuppu.connect_materials_to_shader({mat_browser, mat_peach}, sprite_shader)
 
-    mat_scope := nuppu.material_upload_scope(1)
-    mat, mat_ok := nuppu.material_upload(&mat_scope, shader, nuppu.DEFAULT_DRAW_STATE, &sprite_params, name = "sprite")
-    assert(mat_ok, "3-Instancing: failed to register material")
 
-    quad_handle := nuppu.built_in_mesh_handle(.Quad)
-    cube_handle := nuppu.built_in_mesh_handle(.Cube)
 
+    state.tex_browser = tex_browser
+    state.tex_peach   = tex_peach
+    state.sampler     = shader_sampler
+    state.m_browser   = mat_browser
+    state.m_peach     = mat_peach
+    state.shader      = sprite_shader
+
+
+    // Entities
+    nuppu.register_entity(Quad_Entity, 8, {.Interpolate})
+    nuppu.register_entity(Cube_Entity, 8, {.Interpolate})
+
+    // Register entities that use browser material
     for idx in 0 ..< INSTANCE_COUNT {
         q := nuppu.entity_add(Quad_Entity, "quad")
-        q.mesh         = quad_handle
-        q.materials[0] = mat
-        q.scale        = {1, 1, 1}
-        q.position     = {-1 + f32(idx) * 0.5, 0.5, 0}
-        nuppu.sprite_animation_configure(&q.gpu_instance, &q.anim, ATLAS_COLS, ATLAS_ROWS, 6.0)
-        q.gpu_instance.frame_n = u32(idx) % (ATLAS_COLS * ATLAS_ROWS) // phase offset per quad
-        nuppu.sprite_animation_advance(&q.gpu_instance, &q.anim, 0)
+        q.mesh     = nuppu.built_in_mesh_handle(.Quad)
+        q.material = mat_browser
+        q.position = {-1 + f32(idx) * 0.5, 0.5, 0}
+        nuppu.sprite_animation_configure(&q.anim, ATLAS_COLS, ATLAS_ROWS, 6.0)
+        q.anim.frame_n = u32(idx) % (ATLAS_COLS * ATLAS_ROWS) // phase offset per quad
     }
 
-    for idx in 0 ..< INSTANCE_COUNT {
-        c := nuppu.entity_add(Cube_Entity, "cube")
-        c.mesh         = cube_handle
-        c.materials[0] = mat
-        c.scale        = {1, 1, 1}
-        c.position     = {0, f32(idx) * 0.05 - 0.8, 0}
-    }
-
+    // Register entities that use peach material
     for idx in 0 ..< INSTANCE_COUNT {
         q := nuppu.entity_add(Quad_Entity, "quad")
-        q.mesh         = quad_handle
-        q.materials[0] = mat
-        q.scale        = {1, 1, 1}
-        q.position     = {0.5, -1 + f32(idx) * 0.5, 0}
-        nuppu.sprite_animation_configure(&q.gpu_instance, &q.anim, ATLAS_COLS, ATLAS_ROWS, 6.0)
-        q.gpu_instance.frame_n = u32(idx + 2) % (ATLAS_COLS * ATLAS_ROWS)
-        nuppu.sprite_animation_advance(&q.gpu_instance, &q.anim, 0)
+        q.mesh     = nuppu.built_in_mesh_handle(.Quad)
+        q.material = mat_peach
+        q.scale    = {1, 1, 1}
+        q.position = {0.5, -1 + f32(idx) * 0.5, 0}
+        nuppu.sprite_animation_configure(&q.anim, ATLAS_COLS, ATLAS_ROWS, 6.0)
+        q.anim.frame_n = u32(idx + 2) % (ATLAS_COLS * ATLAS_ROWS)
     }
+
+    nuppu.update_camera({0, 0, 2}, {}, 0.1, 1_000, 80)
+    
+    // cube_handle := nuppu.built_in_mesh_handle(.Cube)
+    // for idx in 0 ..< INSTANCE_COUNT {
+    //     c := nuppu.entity_add(Cube_Entity, "cube")
+    //     c.mesh     = cube_handle
+    //     c.material = mat
+    //     c.position = {0, f32(idx) * 0.05 - 0.8, 0}
+    // }
 }
 
-Object_Params :: struct {
+Sprite_Material_Constants :: struct {
     color: [4]f32,
 }
 
-// The engine uploads the `gpu_instance` field verbatim; `anim` is CPU-only
-// playback state.
+// `anim` is CPU-only sprite-sheet playback; its uv rect is passed to
+// submit_sprite each frame.
 Quad_Entity :: struct {
     using e: ^nuppu.Entity,
-    gpu_instance: nuppu.Sprite_Instance,
     anim: nuppu.Sprite_Animation,
 }
 
@@ -143,7 +161,12 @@ Cube_Entity :: struct {
 }
 
 _deinit :: proc() {
-
+    nuppu.texture_free(state.tex_browser)
+    nuppu.texture_free(state.tex_peach)
+    nuppu.material_free(state.m_browser)
+    nuppu.material_free(state.m_peach)
+    nuppu.shader_free(state.shader)
+    nuppu.sampler_free(state.sampler)
 }
 
 _update :: proc() {
@@ -168,8 +191,7 @@ _update :: proc() {
     qit := nuppu.entities_of(Quad_Entity)
     for e, _ in nuppu.entity_variant_iterator_next(&qit, Quad_Entity) {
         e.rotation.z = angle
-        // Advances frame_n and writes uv_min/uv_max; the gather pass uploads them.
-        nuppu.sprite_animation_advance(&e.gpu_instance, &e.anim, nuppu.sim_delta_time())
+        nuppu.sprite_animation_advance(&e.anim, nuppu.sim_delta_time())
     }
 
     cit := nuppu.entities_of(Cube_Entity)
@@ -184,8 +206,19 @@ _render :: proc(current: ^State, alpha: f32) {
     nuppu.update_constants(frame)
     defer nuppu.end_frame(frame)
 
-    nuppu.cull(frame)
-    nuppu.finish_instance_upload(frame)
+    culled_sprites := nuppu.cull_entities(Quad_Entity)
+    for q in culled_sprites.entities {
+        quad := (^Quad_Entity)(q.v.data)
+        uv_min, uv_size := nuppu.sprite_animation_uv(&quad.anim)
+        nuppu.submit_sprite(q, uv_min, uv_size)
+    }
+
+    culled_meshes := nuppu.cull_entities(Cube_Entity)
+    for c in culled_meshes.entities {
+        nuppu.submit_mesh(c)
+    }
+
+    nuppu.flush_culled_instances(frame)
 
     gpu.barrier(.Transfer, .All)
 
@@ -219,3 +252,12 @@ desc := nuppu.App_Desc(State) {
 main :: proc() {
     nuppu.run(desc)
 }
+
+
+// slangc examples/3-Instancing/instancing.slang \
+//   -target metal \
+//   -entry vertexMain \
+//   -stage vertex \
+//   -entry fragmentMain \
+//   -stage fragment \
+//   -o T.metal

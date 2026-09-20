@@ -12,7 +12,7 @@ ENTITY_INDEX      :: u16
 ENTITY_GENERATION :: u8
 ENTITY_VARIANT    :: u8
 
-ENTITY_INDEX_BITS :: 8*size_of(ENTITY_INDEX)
+ENTITY_INDEX_BITS :: 8 * size_of(ENTITY_INDEX)
 
 MIN_SHIFT :: 1 // smallest first chunk (2 slots); Space for sentinel + 1 entity
 MAX_SHIFT :: ENTITY_INDEX_BITS - 1
@@ -41,7 +41,7 @@ Entity :: struct {
     prev_sibling: Entity_Handle,
 
     mesh:         Mesh_Handle,
-    materials:    [CONFIG.entity_max_materials]Material_Handle,
+    material:    Material_Handle, // Mesh <-> Material, no submeshes yet
 
     position:     [3]f32,
     prev_position:[3]f32,
@@ -49,16 +49,14 @@ Entity :: struct {
     prev_rotation:[3]f32,
     scale:        [3]f32,
     prev_scale:   [3]f32,
+
+    v: any,
 }
 
 Entity_Flag  :: enum u32 {
     Interpolate,
-    Has_Mesh,
 }
 Entity_Flags :: bit_set[Entity_Flag]
-
-// Type for variants that register no GPU instance data.
-NO_INSTANCE_DATA :: struct {}
 
 Entity_Chunk :: struct {
     entities:  [^]Entity,                  // count * entities
@@ -82,10 +80,6 @@ Entity_Manager :: struct
     type_sizes:    [dynamic]int,
     flags:         [dynamic]Entity_Flags,
     variants:      [dynamic]Entity_Data,
-
-    // Per-variant view of the optional shader instance-data field on drawn entities
-    instance_data_offsets: [dynamic]int,
-    instance_data_sizes:   [dynamic]int,
 
     root_data:     Entity,
     is_init:       bool,
@@ -117,8 +111,6 @@ entity_manager_init :: proc(
     manager.types      = make([dynamic]typeid, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
     manager.type_sizes = make([dynamic]int, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
     manager.flags      = make([dynamic]Entity_Flags, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
-    manager.instance_data_offsets = make([dynamic]int, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
-    manager.instance_data_sizes   = make([dynamic]int, len=0, cap=INITIAL_CAPACITY, allocator=allocator)
 
     // World root: a reserved transform-only node. Its parent is NIL and every
     // entity is parented either to it or to another entity.
@@ -161,8 +153,6 @@ entity_manager_destroy :: proc(
     delete(manager.types)
     delete(manager.type_sizes)
     delete(manager.flags)
-    delete(manager.instance_data_offsets)
-    delete(manager.instance_data_sizes)
 
     alloc := manager.allocator
     manager^ = {}
@@ -225,19 +215,7 @@ entity_manager_add_variant :: proc(
 )
     where intrinsics.type_is_struct(Entity_Type) && SHIFT >= MIN_SHIFT && SHIFT <= MAX_SHIFT
 {
-    _entity_manager_add_variant(manager, Entity_Type, NO_INSTANCE_DATA, SHIFT, flags)
-}
-
-entity_manager_add_variant_data :: proc(
-    manager: ^Entity_Manager,
-    $Entity_Type: typeid,
-    $SHIFT: uint,
-    flags: Entity_Flags = {},
-    $GPU_Instance: typeid,
-)
-    where intrinsics.type_is_struct(Entity_Type) && SHIFT >= MIN_SHIFT && SHIFT <= MAX_SHIFT
-{
-    _entity_manager_add_variant(manager, Entity_Type, GPU_Instance, SHIFT, flags)
+    _entity_manager_add_variant(manager, Entity_Type, SHIFT, flags)
 }
 
 @(require_results)
@@ -546,18 +524,16 @@ _struct_find_type :: proc(sti: ^runtime.Type_Info_Struct, target: typeid, base: 
     return
 }
 
+
+
 _entity_manager_add_variant :: proc(
     manager: ^Entity_Manager,
     $Entity_Type: typeid,
-    $Instance_Type: typeid,
     shift: uint,
     flags: Entity_Flags,
 )
-    where intrinsics.type_is_struct(Entity_Type),
-          Instance_Type == NO_INSTANCE_DATA || intrinsics.type_has_field(Entity_Type, "gpu_instance"),
-          size_of(Instance_Type) <= CONFIG.max_instance_data_bytes
+    where intrinsics.type_is_struct(Entity_Type)
 {
-
     assert(manager.is_init)
 
     for type in manager.types {
@@ -574,22 +550,9 @@ _entity_manager_add_variant :: proc(
         panic("All variants must have a ^Entity member at offset 0")
     }
 
-    // The where clause guarantees `gpu_instance` exists when instance data is
-    // requested; assert the rest of the contract and resolve the offset here.
-    data_offset: int
-    data_size:   int
-    when Instance_Type != NO_INSTANCE_DATA {
-        #assert(intrinsics.type_field_type(Entity_Type, "gpu_instance") == Instance_Type,
-                "entity_manager_add_variant: gpu_instance must have the registered instance-data type")
-        data_offset = int(offset_of_by_string(Entity_Type, "gpu_instance"))
-        data_size   = size_of(Instance_Type)
-    }
-
     append(&manager.types, Entity_Type)
     append(&manager.flags, flags)
     append(&manager.type_sizes, size_of(Entity_Type))
-    append(&manager.instance_data_offsets, data_offset)
-    append(&manager.instance_data_sizes, data_size)
     append(&manager.variants, Entity_Data {
         first_chunk_size = 1 << shift,
         partial          = NO_PARTIAL,
@@ -672,12 +635,13 @@ _entity_add :: proc (
     entity_ptr  := &c.entities[index_within_chunk]
     size_t := manager.type_sizes[variant_idx]
     variant_ptr := rawptr(uintptr(c.variants) + uintptr(index_within_chunk * size_t))
-
     prev_gen := entity_ptr.handle.handle.gen
 
     intrinsics.mem_zero(rawptr(entity_ptr), size_of(Entity))
     intrinsics.mem_zero(variant_ptr, size_t)
-
+    
+    entity_ptr.v = any{ data = variant_ptr, id = T }
+    entity_ptr.scale = {1, 1, 1}
     entity_ptr.handle = Entity_Handle {
         handle = Entity_Raw {
             index   = ENTITY_INDEX(index),
@@ -741,6 +705,33 @@ when ODIN_DEBUG {
             loc.line,
         )
     }
+}
+
+iter_next_entity :: proc "contextless" (iter: ^Entity_Iterator) -> (e: ^Entity, ok: bool) #no_bounds_check {
+    data := &iter.manager.variants[iter.variant_idx]
+
+    for iter.chunk_idx < len(data.chunks) {
+        count := CHUNK_CAP(data.first_chunk_size, int(iter.chunk_idx))
+        start := CHUNK_START(data.first_chunk_size, int(iter.chunk_idx))
+        for iter.offset < count {
+            index := start + iter.offset
+            defer iter.offset += 1
+
+            if index >= data.top {
+                return nil, false
+            }
+            
+            c := &data.chunks[iter.chunk_idx]
+            ent := &c.entities[iter.offset]
+            if ent.handle.handle.index == 0 { continue }
+            
+            return ent, true
+        }
+        iter.chunk_idx += 1
+        iter.offset = 0
+    }
+
+    return nil, false
 }
 
 // Walks chunks linearly and returns both slot views for the current position.

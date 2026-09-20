@@ -2,44 +2,27 @@ package nuppu
 
 import "core:mem"
 
-CONFIG : struct {
-    // Material
-    max_materials: int,
-    material_param_bytes: int,
+// Compile-time engine tunables. Each subsystem owns the handle masks and
+// validity asserts derived from these numbers (see material/shader/texture/mesh).
 
-    // Shader
-    max_shaders: int,
+// MATERIALS
+MAX_MATERIALS :: 1 << 8
 
-    // Mesh
-    max_meshes: int,
+// TEXTURES
+MAX_TEXTURES :: 512
 
-    // Entity
-    entity_max_materials: int,
+// SAMPLERS
+MAX_SAMPLERS :: 64
 
-    // Instance data
-    max_instance_data_bytes: int, // per entity, per frame
+// SHADERS
+MAX_SHADERS :: 1 << 6
 
-    // Frame upload arena (per frame in flight)
-    frame_upload_bytes: int,
+// MESHES
+MAX_MESHES          :: 512
+INDEX_STORAGE_BYTES :: 8 * mem.Megabyte
+VERTEX_STORAGE_BYTES :: 8 * mem.Megabyte
 
-} : {
+MAX_INSTANCES_PER_TYPE :: max(u16)
 
-    // Material
-    max_materials = 512,
-    material_param_bytes = 1 * mem.Megabyte,
-
-    // Shader
-    max_shaders = 64,
-
-    // Mesh
-    max_meshes = 512,
-
-    // Entity
-    entity_max_materials = 6,
-
-    // Instance data
-    max_instance_data_bytes = 64,
-
-    // Frame upload arena (per frame in flight)
-    frame_upload_bytes = 16 * mem.Megabyte,
-}
+FRAMES_IN_FLIGHT  :: 2
+FRAME_ARENA_BYTES :: 16 * mem.Megabyte

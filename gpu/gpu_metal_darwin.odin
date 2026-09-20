@@ -27,17 +27,14 @@ _Shader :: struct {
     vertex_library:   ^MTL.Library,
     fragment_library: ^MTL.Library,
     pipeline:         ^MTL.RenderPipelineState,
-
-    resource_table: [MAX_LAYOUT_BINDINGS]uintptr,
-    resource_count: u32,
 }
 
 _Sampler :: ^MTL.SamplerState
 
 _Texture :: struct #all_or_none {
-    type: Texture_Type,
-    usage: Texture_Usage,
-    texture: ^MTL.Texture,
+    texture:        ^MTL.Texture,
+    mtl_type:       MTL.TextureType,
+    resource_usage: MTL.ResourceUsage,
 }
 
 _Depth_Stencil_State :: ^MTL.DepthStencilState
@@ -52,10 +49,11 @@ Depth_State_Cache :: struct {
     state:   ^MTL.DepthStencilState,
 }
 
-    _State :: struct {
+_State :: struct {
     device: ^MTL.Device,
     metal_layer: ^CA.MetalLayer,
     queue: ^MTL.CommandQueue,
+    swapchain_format: Pixel_Format,
     //
     frame_pool: ^NS.AutoreleasePool,
     command_buffer: ^MTL.CommandBuffer,
@@ -105,6 +103,7 @@ _init :: proc(
 
     native_window := cast(^NS.Window)(native_window)
 
+    _state.swapchain_format = swapchain_format
     _state.device = MTL.CreateSystemDefaultDevice()
 
     metal_layer := CA.MetalLayer.layer()
@@ -173,14 +172,21 @@ _release_texture :: proc(texture: ^Texture) {
     }
 }
 
-_release_ptr :: proc(ptr: ^ptr) {
+_release_sampler :: proc(sampler: ^Sampler) {
+    if sampler.native != nil {
+        sampler.native->release()
+        sampler.native = nil
+    }
+}
+
+_release_ptr :: proc(ptr: ^$P/ptr) {
     if ptr.native.buffer != nil {
         ptr.native.buffer->release()
         ptr.native.buffer = nil
     }
 }
 
-_copy_to_texture :: proc(texture: Texture, origin, size: [3]u32, level: u32, data: rawptr, bytes_per_row: u32) {
+_copy_to_texture :: proc(texture: Texture, origin, size: [3]uint, level: uint, data: rawptr, bytes_per_row: uint) {
     native := texture.native
 
     region := MTL.Region {
@@ -192,13 +198,51 @@ _copy_to_texture :: proc(texture: Texture, origin, size: [3]u32, level: u32, dat
         },
     }
 
-    switch native.type {
-    case ._2D:
+    switch native.mtl_type {
+    case .Type1D, .Type2D:
         native.texture->replaceRegion(region, NS.UInteger(level), data, NS.UInteger(bytes_per_row))
-    case ._2D_Array:
+    case .Type2DArray, .Type3D, .TypeCube, .TypeCubeArray:
         bytes_per_image := NS.UInteger(bytes_per_row) * NS.UInteger(size.y)
         native.texture->replaceRegionWithLevel(region, NS.UInteger(level), NS.UInteger(origin.z), data, NS.UInteger(bytes_per_row), bytes_per_image)
+    case .Type2DMultisample, .Type2DMultisampleArray, .Type1DArray, .TypeTextureBuffer:
+        unreachable()
     }
+}
+
+_copy_buffer_to_texture :: proc(src: ptr, texture: ^Texture, origin, size: [3]uint, level: uint, bytes_per_row: uint, bytes_per_image: uint) {
+    if src.native.buffer == nil { return }
+
+    if _state.blit_command_encoder == nil {
+        _state.blit_command_encoder = _state.command_buffer->blitCommandEncoder()
+    }
+
+    // 3D textures index depth through the origin; arrays/cubes use the slice.
+    slice: NS.UInteger = NS.UInteger(origin.z)
+    origin_z: NS.UInteger = 0
+    if texture.concrete.view == ._3D {
+        slice = 0
+        origin_z = NS.UInteger(origin.z)
+    }
+
+    _state.blit_command_encoder->copyFromBufferEx(
+        src.native.buffer,
+        NS.UInteger(src.byte_offset),
+        NS.UInteger(bytes_per_row),
+        NS.UInteger(bytes_per_image),
+        MTL.Size {
+            width  = NS.Integer(size.x),
+            height = NS.Integer(size.y),
+            depth  = NS.Integer(size.z),
+        },
+        texture.native.texture,
+        slice,
+        NS.UInteger(level),
+        MTL.Origin {
+            NS.Integer(origin.x),
+            NS.Integer(origin.y),
+            NS.Integer(origin_z),
+        },
+    )
 }
 
 _shader_module_init :: proc(name: string, code: []u8) -> _Shader_Module {
@@ -263,7 +307,6 @@ _shader_init :: proc(desc: Shader_Desc) -> _Shader {
         fragment_library = fmod.library,
         pipeline         = pso,
     }
-    result.resource_table, result.resource_count = _resource_table(desc.block)
 
     return result
 }
@@ -349,15 +392,21 @@ _acquire_next_swapchain :: proc() -> Texture {
     drawable->addPresentedHandler(_state.presentation_handler)
 
     native := _Texture {
-        type = ._2D,
-        texture = drawable->texture(),
-        usage = {.Color_Attachment},
+        texture        = drawable->texture(),
+        mtl_type       = .Type2D,
+        resource_usage = {},
     }
     
     _state.curr_drawable = drawable
-    
+
     return Texture {
-        dimensions = {u32(native.texture->width()), u32(native.texture->height()), 1},
+        concrete = texture_concrete({
+            type = Texture_Type_2D {
+                dimensions = {uint(native.texture->width()), uint(native.texture->height())},
+                usage      = {.Color_Attachment},
+            },
+            format = _state.swapchain_format,
+        }),
         native = native,
     }
 }
@@ -388,14 +437,16 @@ _set_compute_pipeline :: proc(compute_pipeline: Compute_Pipeline) {
 _set_shader :: proc(shader: ^Shader) {
     assert(_state.render_command_encoder != nil, "_set_shader: no render pass is active")
 
-    if _state.curr_shader_valid && _state.curr_shader == rawptr(shader) {
+    if _state.curr_shader_valid && _state.curr_shader == rawptr(shader) && !shader_blocks_dirty(shader) {
         return
     }
     _state.curr_shader = rawptr(shader)
     _state.curr_shader_valid = true
 
     _state.render_command_encoder->setRenderPipelineState(shader.pipeline)
-    _bind_parameter_block(&shader.desc.block, shader.resource_table[:], shader.resource_count)
+    for &block, I in shader.desc.binding_blocks {
+        _bind_parameter_block(&block, I)
+    }
 }
 
 _get_depth_stencil_state :: proc(compare: Compare_Function, write: bool) -> ^MTL.DepthStencilState {
@@ -440,18 +491,6 @@ _set_draw_state :: proc(state: Draw_State) {
     encoder->setDepthStencilState(_get_depth_stencil_state(state.depth_compare, state.depth_write))
 }
 
-_set_parameter_block :: proc(shader: ^Shader, block: ^Parameter_Block) {
-    shader.desc.block = block^
-    shader.resource_table, shader.resource_count = _resource_table(block^)
-
-    // If this shader is currently bound, rebind immediately so the next draw
-    // sees the new resources.
-    if _state.curr_shader_valid && _state.curr_shader == rawptr(shader) {
-        assert(_state.render_command_encoder != nil, "_set_parameter_block: no render pass is active")
-        _bind_parameter_block(block, shader.resource_table[:], shader.resource_count)
-    }
-}
-
 _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
     sampler_desc := MTL.SamplerDescriptor.alloc()->init()
     defer sampler_desc->release()
@@ -467,24 +506,41 @@ _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
     return _state.device->newSamplerState(sampler_desc)
 }
 
-_texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
+_texture_init :: proc(concrete: Texture_Concrete, texture_descriptor: Texture_Descriptor) -> _Texture {
     desc := MTL.TextureDescriptor.alloc()->init()
     defer desc->release()
-    
-    desc->setWidth(NS.UInteger(texture_descriptor.dimensions.x))
-    desc->setHeight(NS.UInteger(texture_descriptor.dimensions.y))
+
+    desc->setWidth(NS.UInteger(concrete.size.x))
+    desc->setHeight(NS.UInteger(concrete.size.y))
+    desc->setDepth(NS.UInteger(concrete.size.z))
     desc->setPixelFormat(_pixel_format_interop(texture_descriptor.format))
-    desc->setUsage(_texture_usage_interop(texture_descriptor.usage))
+    desc->setMipmapLevelCount(NS.UInteger(concrete.mip_levels))
+    desc->setSampleCount(NS.UInteger(concrete.samples))
     desc->setStorageMode(_storage_mode_interop(texture_descriptor.storage))
-    desc->setTextureType(_texture_type_interop(texture_descriptor.type))
-    
-    mip_levels := max(texture_descriptor.mip_levels, 1)
-    desc->setMipmapLevelCount(NS.UInteger(mip_levels))
-    
-    layers := max(texture_descriptor.layer_count, 1)
-    if texture_descriptor.type == ._2D_Array {
-        desc->setArrayLength(NS.UInteger(layers))
+
+    mtl_type: MTL.TextureType
+    array_length: NS.UInteger = 1
+    switch concrete.view {
+    case ._1D:
+        mtl_type = .Type1D
+    case ._2D:
+        mtl_type = concrete.samples > 1 ? .Type2DMultisample : .Type2D
+    case ._2D_Array:
+        mtl_type     = concrete.samples > 1 ? .Type2DMultisampleArray : .Type2DArray
+        array_length = NS.UInteger(concrete.layers)
+    case ._3D:
+        mtl_type = .Type3D
+    case .Cube:
+        mtl_type     = .TypeCube
+        array_length = NS.UInteger(concrete.layers * 6)
+    case .Cube_Array:
+        mtl_type     = .TypeCubeArray
+        array_length = NS.UInteger(concrete.layers * 6)
     }
+
+    desc->setArrayLength(array_length)
+    desc->setTextureType(mtl_type)
+    desc->setUsage(_texture_usage_interop(concrete.usage))
 
     texture := _state.device->newTextureWithDescriptor(desc)
     if texture == nil {
@@ -492,9 +548,9 @@ _texture_init :: proc(texture_descriptor: Texture_Descriptor) -> _Texture {
     }
 
     return _Texture {
-        type = texture_descriptor.type,
-        texture = texture,
-        usage = texture_descriptor.usage,
+        texture        = texture,
+        mtl_type       = mtl_type,
+        resource_usage = _texture_resource_usage_interop(concrete.usage),
     }
 }
 
@@ -532,7 +588,7 @@ _end_render_pass :: proc() {
     _state.render_command_encoder = nil
 }
 
-_draw_indexed :: proc(index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
+_draw_indexed :: proc(index_buffer: ptr, index_count: uint, index_offset: uint, instance_count: uint, base_vertex: uint, base_instance: uint) {
     if instance_count == 0 {
         return
     }
@@ -546,21 +602,21 @@ _draw_indexed :: proc(index_buffer: ptr, index_count: u32, index_offset: u32, in
 
     _state.render_command_encoder->drawIndexPrimitivesWithBaseVertex(
         _primitive_type_interop(shader.desc.topology), NS.UInteger(index_count), index_format,
-        index_buffer.native.buffer, NS.UInteger(index_offset * u32(index_bytes)), NS.UInteger(instance_count), NS.Integer(base_vertex), NS.UInteger(base_instance)
+        index_buffer.native.buffer, NS.UInteger(index_offset) * index_bytes, NS.UInteger(instance_count), NS.Integer(base_vertex), NS.UInteger(base_instance)
     )
 }
 
 _malloc :: proc(
     #any_int bytes: uint,
-    alignment: u32,
-    flags: Buffer_Flag,
+    #any_int alignment: uint,
+    usage: Buffer_Usage,
     name: string,
     loc := #caller_location,
 ) -> _ptr {
     capacity := runtime.align_forward(bytes, uint(alignment))
 
     options: MTL.ResourceOptions
-    switch flags {
+    switch usage {
     case .Staging:
         options = MTL.ResourceStorageModeShared
     case .Default, .Index, .Constant:
@@ -578,7 +634,7 @@ _malloc :: proc(
     }
 }
 
-_temp_malloc :: proc(bytes: []u8, index: u32, shader_stage: Shader_Stage) {
+_temp_malloc :: proc(bytes: []u8, index: uint, shader_stage: Shader_Stage) {
     switch shader_stage {
     case .Vertex:
         _state.render_command_encoder->setVertexBytes(bytes, NS.UInteger(index))
@@ -597,24 +653,30 @@ _gpu_address :: proc(p: _ptr) -> rawptr {
     return rawptr(uintptr(p.buffer->gpuAddress()))
 }
 
-_copy :: proc(dst, src: ptr) {
+_copy :: proc(dst: $ptrD/ptr, src: $ptrS/ptr, #any_int dst_offset: uint = 0, #any_int src_offset: uint = 0, #any_int length_override: uint = 0) {
+    assert(src_offset <= src.total_capacity_bytes, "_copy: src_offset exceeds source capacity")
+    assert(dst_offset <= dst.total_capacity_bytes, "_copy: dst_offset exceeds destination capacity")
+
+    length := length_override if length_override != 0 else src.total_capacity_bytes - src_offset
+    if length == 0 { return }
+    
     if _state.blit_command_encoder == nil {
         _state.blit_command_encoder = _state.command_buffer->blitCommandEncoder()
     }
 
     _state.blit_command_encoder->copyFromBuffer(
-        src.native.buffer, NS.UInteger(src.byte_offset),
-        dst.native.buffer, NS.UInteger(dst.byte_offset),
-        NS.UInteger(src.total_capacity_bytes),
+        src.native.buffer, NS.UInteger(src.byte_offset + src_offset),
+        dst.native.buffer, NS.UInteger(dst.byte_offset + dst_offset),
+        NS.UInteger(length),
     )
 }
 
-_min_alignment :: proc(flags: Buffer_Flag) -> u32 {
+_min_alignment :: proc(flags: Buffer_Usage) -> uint {
     return 4
 }
 
 // Pure: builds the flat GPU-address table in binding order (constants, read,
-// read/write, samplers). No encoder required, so it can run at shader_init.
+// read/write, samplers). No encoder required.
 _resource_table :: proc(block: Parameter_Block) -> ([MAX_LAYOUT_BINDINGS]uintptr, u32) {
     table: [MAX_LAYOUT_BINDINGS]uintptr
     n: u32
@@ -662,9 +724,13 @@ _resource_table :: proc(block: Parameter_Block) -> ([MAX_LAYOUT_BINDINGS]uintptr
 }
 
 // Marks every resource resident for the current render encoder and pushes the
-// precomputed address table with one call per stage.
-_bind_parameter_block :: proc(block: ^Parameter_Block, table: []uintptr, count: u32) {
+// block's address table at `buffer_index` with one call per stage.
+_bind_parameter_block :: proc(block: ^Parameter_Block, #any_int buffer_index: uint) {
     assert(_state.render_command_encoder != nil, "_bind_parameter_block: no render pass is active")
+    if block == nil { return }
+
+    table, count := _resource_table(block^)
+    if count == 0 { return }
 
     for C in block.constants {
         if C.native.buffer == nil { continue }
@@ -678,7 +744,7 @@ _bind_parameter_block :: proc(block: ^Parameter_Block, table: []uintptr, count: 
             _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex, .Fragment})
         case Texture:
             if res.native.texture == nil { continue }
-            _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
+            _state.render_command_encoder->useResourceWithStages(res.native.texture, res.native.resource_usage, {.Vertex, .Fragment})
         }
     }
 
@@ -689,23 +755,22 @@ _bind_parameter_block :: proc(block: ^Parameter_Block, table: []uintptr, count: 
             _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read, .Write}, {.Vertex, .Fragment})
         case Texture:
             if res.native.texture == nil { continue }
-            _state.render_command_encoder->useResourceWithStages(res.native.texture, _texture_resource_usage_interop(res.native.usage), {.Vertex, .Fragment})
+            _state.render_command_encoder->useResourceWithStages(res.native.texture, res.native.resource_usage, {.Vertex, .Fragment})
         }
     }
 
-    assert(len(table) >= int(count), "_bind_parameter_block: table smaller than count")
-    bytes := slice.bytes_from_ptr(raw_data(table), int(count) * size_of(uintptr))
-    _temp_malloc(bytes, 0, .Vertex)
-    _temp_malloc(bytes, 0, .Fragment)
+    bytes := slice.bytes_from_ptr(raw_data(table[:]), int(count) * size_of(uintptr))
+    _temp_malloc(bytes, buffer_index, .Vertex)
+    _temp_malloc(bytes, buffer_index, .Fragment)
 }
 
 // Low-level block bind used by the compute path. Graphics go through
 // _set_shader / _bind_parameter_block.
-_use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination) {
+_use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination, slot: uint) {
     table, count := _resource_table(block^)
 
     if destination == .Graphics {
-        _bind_parameter_block(block, table[:], count)
+        _bind_parameter_block(block, slot)
         return
     }
 
@@ -721,7 +786,7 @@ _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Blo
             _compute_command_encoder()->useResource(res.native.buffer, {.Read})
         case Texture:
             if res.native.texture == nil { continue }
-            _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
+            _compute_command_encoder()->useResource(res.native.texture, res.native.resource_usage)
         }
     }
 
@@ -732,12 +797,12 @@ _use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Blo
             _compute_command_encoder()->useResource(res.native.buffer, {.Read, .Write})
         case Texture:
             if res.native.texture == nil { continue }
-            _compute_command_encoder()->useResource(res.native.texture, _texture_resource_usage_interop(res.native.usage))
+            _compute_command_encoder()->useResource(res.native.texture, res.native.resource_usage)
         }
     }
 
     bytes := slice.bytes_from_ptr(raw_data(table[:]), int(count) * size_of(uintptr))
-    _temp_malloc(bytes, 0, .Compute)
+    _temp_malloc(bytes, slot, .Compute)
 }
 
 _barrier :: proc(before: Stage, after: Stage) {
@@ -925,42 +990,32 @@ _store_action_interop :: proc(action: Store_Action) -> MTL.StoreAction {
 
 }
 
-_texture_type_interop :: proc(texture_type: Texture_Type) -> MTL.TextureType {
-    switch texture_type {
-    case ._2D:
-        return .Type2D
-    case ._2D_Array:
-        return .Type2DArray
-    }
-    unreachable()
-}
-
-_texture_usage_interop :: proc(usage: Texture_Usage) -> MTL.TextureUsage {
-    flags: MTL.TextureUsage
-    if .Sampled          in usage { flags += {.ShaderRead} }
-    if .Read             in usage { flags += {.ShaderRead} }
-    if .Write            in usage { flags += {.ShaderWrite} }
-    if .Color_Attachment in usage { flags += {.RenderTarget, .ShaderRead} }
-    if .Depth_Attachment in usage { flags += {.RenderTarget} }
-    return flags
-}
-
-_texture_resource_usage_interop :: proc(usage: Texture_Usage) -> MTL.ResourceUsage {
-    flags: MTL.ResourceUsage
-    if .Sampled in usage { flags += {.Sample} }
-    if .Read    in usage { flags += {.Read} }
-    if .Write   in usage { flags += {.Write} }
-    return flags
-}
-
-_storage_mode_interop :: proc(storage_mode: StorageMode) -> MTL.StorageMode {
-    switch storage_mode {
+_storage_mode_interop :: proc(mode: Storage_Mode) -> MTL.StorageMode {
+    switch mode {
     case .Shared:
         return .Shared
     case .Private:
         return .Private
     }
     unreachable()
+}
+
+_texture_usage_interop :: proc(usage: Texture_Usage_Info) -> MTL.TextureUsage {
+    flags: MTL.TextureUsage
+    if usage.sampled          { flags += {.ShaderRead} }
+    if usage.storage_read     { flags += {.ShaderRead} }
+    if usage.storage_write    { flags += {.ShaderWrite} }
+    if usage.color_attachment { flags += {.RenderTarget} }
+    if usage.depth_attachment { flags += {.RenderTarget} }
+    return flags
+}
+
+_texture_resource_usage_interop :: proc(usage: Texture_Usage_Info) -> MTL.ResourceUsage {
+    flags: MTL.ResourceUsage
+    if usage.sampled       { flags += {.Sample} }
+    if usage.storage_read  { flags += {.Read} }
+    if usage.storage_write { flags += {.Write} }
+    return flags
 }
 
 _cull_mode_interop :: proc(cull_mode: Cull_Mode) -> MTL.CullMode {

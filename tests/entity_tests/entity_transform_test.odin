@@ -86,7 +86,8 @@ test_set_transform_stale_handle_is_noop :: proc(t: ^testing.T) {
     e, _ := nuppu.entity_get(manager, node)
     testing.expect_value(t, e.position, [3]f32{0, 0, 0})
     testing.expect_value(t, e.rotation, [3]f32{0, 0, 0})
-    testing.expect_value(t, e.scale,    [3]f32{0, 0, 0})
+    // New entities default to unit scale.
+    testing.expect_value(t, e.scale,    [3]f32{1, 1, 1})
 }
 
 @(test)

@@ -78,12 +78,19 @@ State :: struct #align(64) {
     name_arena: mem.Dynamic_Arena,
 }
 
-// Mimics ParameterBlock from slang. 
+// Mimics ParameterBlock from slang. `dirty` marks array contents changed since
+// the last bind; set by `update_parameter_block`, cleared by `set_shader`.
 Parameter_Block :: struct {
     constants           : [MAX_CONSTANT_BUFFERS]ptr,
     read_resources      : [MAX_READ_RESOURCE]Parameter_Resource,
     read_write_resources: [MAX_READ_WRITE_RESOURCES]Parameter_Resource,
     samplers            : [MAX_SAMPLERS]Sampler,
+
+    // Minimum bytes a read resource must bind, per slot; 0 means unspecified.
+    // WGPU bakes this into the bind group layout's `minBindingSize`.
+    read_resource_min_sizes: [MAX_READ_RESOURCE]uint,
+
+    dirty: bool,
 }
 
 Parameter_Resource :: union {
@@ -100,17 +107,17 @@ ptr :: struct #all_or_none {
     cpu                 : rawptr,
     gpu                 : rawptr,
 
-    flags               : Buffer_Flag,
-    alignment           : u32,
-    total_capacity_bytes: u32,
-    byte_offset         : u32,
+    flags               : Buffer_Usage,
+    alignment           : uint,
+    total_capacity_bytes: uint,
+    byte_offset         : uint,
 
     meta                : Metadata,
 
     using native        : _ptr,
 }
 
-Buffer_Flag :: enum u32 {
+Buffer_Usage :: enum u32 {
     Staging = 0,  // Host + Device visible
 
     Default,      // Device local
@@ -146,12 +153,25 @@ Shader_Desc :: struct {
     multisample: Multisample_State,
     topology:    Primitive,
 
-    block: Parameter_Block,
+    // Parameter blocks bound at backend slots 0..N, in order.
+    binding_blocks: []Parameter_Block,
 }
+
+#assert(u16(Cull_Mode.Back) <= 0b11)
+#assert(u16(Compare_Function.Always) <= 0b111)
+#assert(u16(Front_Face.CW) <= 0b1)
 
 Shader :: struct {
     using native: _Shader,
     desc: Shader_Desc,
+}
+
+// True when any of the shader's parameter blocks changed since the last bind.
+shader_blocks_dirty :: proc(shader: ^Shader) -> bool {
+    for block in shader.desc.binding_blocks {
+        if block.dirty { return true }
+    }
+    return false
 }
 
 Draw_State :: struct #packed {
@@ -236,38 +256,182 @@ Sampler_Descriptor :: struct {
 }
 
 Texture :: struct #all_or_none {
-    dimensions: [3]u32,
+    concrete: Texture_Concrete,
     using native: _Texture,
 }
 
-Texture_Type :: enum u8 {
-    _2D,
-    _2D_Array,
-}
-
-Texture_Descriptor :: struct {
-    dimensions: [2]u32,
-    format: Pixel_Format,
-    storage: StorageMode,
-    usage: Texture_Usage,
-    type: Texture_Type,
-    layer_count: u32, // 0 == 1
-    mip_levels: u32, // 0 == 1
-}
-
-StorageMode :: enum u8 {
-	Shared     = 0,
-	Private    = 2,
-}
-
-Texture_Usage_Flag :: enum u8 {
+Texture_Usage_1D_Flag :: enum u8 {
     Sampled,
-    Read,
-    Write,
+    Storage_Read,
+    Storage_Write,
+}
+Texture_Usage_1D :: bit_set[Texture_Usage_1D_Flag; u8]
+
+Texture_Usage_2D_Flag :: enum u8 {
+    Sampled,
+    Storage_Read,
+    Storage_Write,
     Color_Attachment,
     Depth_Attachment,
 }
-Texture_Usage :: bit_set[Texture_Usage_Flag; u8]
+Texture_Usage_2D :: bit_set[Texture_Usage_2D_Flag; u8]
+
+Texture_Usage_3D_Flag :: enum u8 {
+    Sampled,
+    Storage_Read,
+    Storage_Write,
+    Color_Attachment,
+}
+Texture_Usage_3D :: bit_set[Texture_Usage_3D_Flag; u8]
+
+Texture_Usage_Cube_Flag :: enum u8 {
+    Sampled,
+    Storage_Read,
+    Storage_Write,
+    Color_Attachment,
+    Depth_Attachment,
+}
+Texture_Usage_Cube :: bit_set[Texture_Usage_Cube_Flag; u8]
+
+Texture_Type :: union {
+    Texture_Type_1D,
+    Texture_Type_2D,
+    Texture_Type_3D,
+    Texture_Type_Cube,
+}
+
+Texture_Type_1D :: struct {
+    width: uint,
+    usage: Texture_Usage_1D,
+}
+
+Texture_Type_2D :: struct {
+    dimensions: [2]uint,
+    array_length: uint, // 0 == 1
+    usage: Texture_Usage_2D,
+    sample_count: uint, // 0 == 1
+}
+
+Texture_Type_3D :: struct {
+    dimensions: [3]uint,
+    usage: Texture_Usage_3D,
+}
+
+Texture_Type_Cube :: struct {
+    dimensions: [2]uint,
+    array_length: uint, // 0 == 1
+    usage: Texture_Usage_Cube,
+}
+
+Texture_Descriptor :: struct {
+    type: Texture_Type,
+    format: Pixel_Format,
+    mip_levels: uint, // 0 == 1
+    storage: Storage_Mode,
+}
+
+// Where the texture's memory lives. `Shared` is CPU-visible and required by the
+// CPU-side `copy_to_texture`; `Private` is GPU-only. The GPU upload scope
+// (`texture_upload_scope`) works with either.
+Storage_Mode :: enum u8 {
+    Shared,
+    Private,
+}
+
+// The dimension a texture is bound as, derived from its type.
+Texture_View :: enum u8 {
+    _1D,
+    _2D,
+    _2D_Array,
+    _3D,
+    Cube,
+    Cube_Array,
+}
+
+// Backend-agnostic view of the requested usages. Each backend projects this
+// onto its native usage flags.
+Texture_Usage_Info :: struct {
+    sampled:          bool,
+    storage_read:     bool,
+    storage_write:    bool,
+    color_attachment: bool,
+    depth_attachment: bool,
+}
+
+// Fully resolved texture description: the union has been switched on and the
+// "0 == 1" defaults applied. This is what the backends consume.
+Texture_Concrete :: struct {
+    view:       Texture_View,
+    size:       [3]uint, // width, height, depth (depth is 1 unless 3D)
+    layers:     uint,    // effective, >= 1; for Cube/Cube_Array the cubemap count
+    samples:    uint,    // effective, >= 1
+    mip_levels: uint,    // effective, >= 1
+    format:     Pixel_Format,
+    usage:      Texture_Usage_Info,
+}
+
+texture_concrete :: proc(desc: Texture_Descriptor) -> Texture_Concrete {
+    c := Texture_Concrete {
+        samples    = 1,
+        layers     = 1,
+        mip_levels = max(desc.mip_levels, 1),
+        format     = desc.format,
+    }
+
+    switch t in desc.type {
+    case Texture_Type_1D:
+        c.view                = ._1D
+        c.size                = {t.width, 1, 1}
+        c.usage.sampled       = .Sampled in t.usage
+        c.usage.storage_read  = .Storage_Read in t.usage
+        c.usage.storage_write = .Storage_Write in t.usage
+
+    case Texture_Type_2D:
+        c.layers                 = max(t.array_length, 1)
+        c.samples                = max(t.sample_count, 1)
+        c.size                   = {t.dimensions.x, t.dimensions.y, 1}
+        c.view                   = c.samples > 1 ? ._2D : (c.layers > 1 ? ._2D_Array : ._2D)
+        c.usage.sampled          = .Sampled in t.usage
+        c.usage.storage_read     = .Storage_Read in t.usage
+        c.usage.storage_write    = .Storage_Write in t.usage
+        c.usage.color_attachment = .Color_Attachment in t.usage
+        c.usage.depth_attachment = .Depth_Attachment in t.usage
+
+    case Texture_Type_3D:
+        c.view                   = ._3D
+        c.size                   = t.dimensions
+        c.usage.sampled          = .Sampled in t.usage
+        c.usage.storage_read     = .Storage_Read in t.usage
+        c.usage.storage_write    = .Storage_Write in t.usage
+        c.usage.color_attachment = .Color_Attachment in t.usage
+
+    case Texture_Type_Cube:
+        assert(t.dimensions.x == t.dimensions.y, "texture_concrete: cube textures must be square")
+        c.layers                 = max(t.array_length, 1)
+        c.size                   = {t.dimensions.x, t.dimensions.y, 1}
+        c.view                   = c.layers > 1 ? .Cube_Array : .Cube
+        c.usage.sampled          = .Sampled in t.usage
+        c.usage.storage_read     = .Storage_Read in t.usage
+        c.usage.storage_write    = .Storage_Write in t.usage
+        c.usage.color_attachment = .Color_Attachment in t.usage
+        c.usage.depth_attachment = .Depth_Attachment in t.usage
+    }
+
+    assert(!(c.samples > 1 && c.layers > 1), "texture_concrete: multisampled arrays are unsupported")
+    assert(!(c.samples > 1 && (c.usage.storage_read || c.usage.storage_write)), "texture_concrete: multisampled textures cannot be storage")
+    assert(!(c.samples > 1 && c.mip_levels > 1), "texture_concrete: multisampled textures cannot have mipmaps")
+    assert(!(c.samples > 1 && !(c.usage.color_attachment || c.usage.depth_attachment)), "texture_concrete: multisampled textures must be render attachments")
+
+    if c.mip_levels > 1 {
+        max_dim := max(c.size.x, max(c.size.y, c.size.z))
+        max_mips: uint
+        for d := max_dim; d > 0; d >>= 1 { max_mips += 1 }
+        assert(c.mip_levels <= max_mips, "texture_concrete: mip_levels exceeds the maximum for this size")
+        assert(c.view != ._1D, "texture_concrete: 1D textures cannot have mipmaps")
+    }
+
+    return c
+}
 
 Clear_Color :: [4]u8
 
@@ -277,6 +441,17 @@ Pixel_Format :: enum u8 {
     RGBA8Unorm,
     RGBA32Float,
     Depth32Float,
+}
+
+pixel_format_bytes :: proc(format: Pixel_Format) -> uint {
+    switch format {
+    case .None:         return 0
+    case .BGRA8Unorm:   return 4
+    case .RGBA8Unorm:   return 4
+    case .RGBA32Float:  return 16
+    case .Depth32Float: return 4
+    }
+    return 0
 }
 
 Timeline_Semaphore :: distinct rawptr
@@ -302,7 +477,7 @@ Depth_Attachment :: struct {
 }
 
 Compare_Function :: enum u8 {
-    Never,
+    Never = 0,
     Less,
     Equal,
     LessEqual,
@@ -328,12 +503,12 @@ Compute_Pipeline :: struct {
 }
 
 Front_Face :: enum u8 {
-    CCW,
+    CCW = 0,
     CW,
 }
 
 Cull_Mode :: enum u8 {
-    None,
+    None = 0,
 	Front,
 	Back,
 }
@@ -416,10 +591,16 @@ deinit :: proc() {
 resize_swapchain : proc(width, height: u32) -> bool : _resize_swapchain
 
 release_texture: proc(texture: ^Texture) : _release_texture
-release_ptr : proc(ptr: ^ptr) : _release_ptr
+release_sampler: proc(sampler: ^Sampler) : _release_sampler
+release_ptr :: _release_ptr
 
 // CPU side copy
-copy_to_texture : proc(texture: Texture, origin, size: [3]u32, level: u32, data: rawptr, bytes_per_row: u32) : _copy_to_texture
+copy_to_texture : proc(texture: Texture, origin, size: [3]uint, level: uint, data: rawptr, bytes_per_row: uint) : _copy_to_texture
+
+// GPU side copy from a staging buffer range into a texture subresource. Works
+// for both shared and private target textures. `bytes_per_row`/`bytes_per_image`
+// describe the layout inside `src`.
+copy_buffer_to_texture : proc(src: ptr, texture: ^Texture, origin, size: [3]uint, level: uint, bytes_per_row: uint, bytes_per_image: uint) : _copy_buffer_to_texture
 
 shader_module_init :: proc(identifier: string, code: []u8) -> Shader_Module {
     native := _shader_module_init(identifier, code)
@@ -437,7 +618,6 @@ shader_init :: proc(desc: Shader_Desc) -> Shader {
     assert(desc.vertex_entry != "", "shader_init: vertex_entry is empty")
     assert(desc.fragment_entry != "", "shader_init: fragment_entry is empty")
     assert(desc.color_format != .None, "shader_init: color_format must be set")
-
     native := _shader_init(desc)
 
     return Shader {
@@ -476,16 +656,65 @@ set_hz : proc(hz: u32) : _set_hz
 compute_dispatch : proc(num_groups: [3]u32, num_threads_per_group: [3]u32) : _compute_dispatch
 set_compute_pipeline : proc(compute_pipeline: Compute_Pipeline) : _set_compute_pipeline
 
-// Binds the prebuilt shader (pipeline + baked block). One engine call; the
-// backend no-ops when the same shader is already bound.
-set_shader : proc(shader: ^Shader) : _set_shader
+// Binds the prebuilt shader (pipeline + all binding blocks). The backend
+// no-ops when the same shader is bound and no block is dirty.
+set_shader :: proc(shader: ^Shader) {
+    _set_shader(shader)
+    for &block in shader.desc.binding_blocks {
+        block.dirty = false
+    }
+}
+
+// Overwrites the given arrays of `block` from the slices (nil leaves an array
+// untouched) and marks it so the next `set_shader` rebinds. No-ops when the
+// provided arrays already match.
+update_parameter_block :: proc(
+    block: ^Parameter_Block,
+    read_resources: []Parameter_Resource = nil,
+    constants: []ptr = nil,
+    read_write_resources: []Parameter_Resource = nil,
+    samplers: []Sampler = nil,
+) {
+    changed := false
+
+    if read_resources != nil {
+        assert(len(read_resources) <= MAX_READ_RESOURCE, "update_parameter_block: too many read resources")
+        if _update_parameter_array(block.read_resources[:], read_resources) { changed = true }
+    }
+    if constants != nil {
+        assert(len(constants) <= MAX_CONSTANT_BUFFERS, "update_parameter_block: too many constants")
+        if _update_parameter_array(block.constants[:], constants) { changed = true }
+    }
+    if read_write_resources != nil {
+        assert(len(read_write_resources) <= MAX_READ_WRITE_RESOURCES, "update_parameter_block: too many read-write resources")
+        if _update_parameter_array(block.read_write_resources[:], read_write_resources) { changed = true }
+    }
+    if samplers != nil {
+        assert(len(samplers) <= MAX_SAMPLERS, "update_parameter_block: too many samplers")
+        if _update_parameter_array(block.samplers[:], samplers) { changed = true }
+    }
+
+    if changed {
+        block.dirty = true
+    }
+}
+
+// Copies `src` over `dst` when they differ, clearing dst's tail. Returns whether
+// anything changed.
+_update_parameter_array :: proc(dst: []$T, src: []T) -> bool {
+    for v, i in src {
+        if dst[i] != v {
+            for &d in dst { d = {} }
+            for s, j in src { dst[j] = s }
+            return true
+        }
+    }
+    return false
+}
 
 // Applies the cheap dynamic state (cull/front/depth). Metal: encoder calls.
 // WGPU: selects a cached pipeline variant.
 set_draw_state : proc(state: Draw_State) : _set_draw_state
-
-// Runtime resource swap: replace the shader's block (e.g. bind a different texture)
-set_parameter_block : proc(shader: ^Shader, block: ^Parameter_Block) : _set_parameter_block
 
 sampler_init :: proc(desc: Sampler_Descriptor) -> Sampler {
     native := _sampler_init(desc)
@@ -495,28 +724,31 @@ sampler_init :: proc(desc: Sampler_Descriptor) -> Sampler {
     }
 }
 
+// Releases a sampler's native handle.
+sampler_deinit :: proc(sampler: ^Sampler) {
+    _release_sampler(sampler)
+}
+
 texture_init :: proc(desc: Texture_Descriptor) -> Texture {
-    assert(desc.dimensions.x <= MAX_2D_TEXTURE_SIZE)
-    assert(desc.dimensions.y <= MAX_2D_TEXTURE_SIZE)
-    native := _texture_init(desc)
+    concrete := texture_concrete(desc)
+    native := _texture_init(concrete, desc)
 
-    tex := Texture { 
-        dimensions = {desc.dimensions.x, desc.dimensions.y, max(1, desc.layer_count)},
-        native = native 
+    return Texture {
+        concrete = concrete,
+        native   = native,
     }
-
-    return tex
 }
 
 // Helper for depth texture
-texture_depth_init :: proc(dimensions: [2]u32, format: Pixel_Format) -> Texture {
+texture_depth_init :: proc(dimensions: [2]uint, format: Pixel_Format) -> Texture {
     desc := Texture_Descriptor {
-        dimensions = dimensions,
+        type = Texture_Type_2D {
+            dimensions = dimensions,
+            usage = {.Depth_Attachment},
+        },
+        
         format = format,
-        usage = {.Depth_Attachment},
         storage = .Private,
-        type = ._2D,
-        layer_count = 1,
     }
     return texture_init(desc)
 }
@@ -526,17 +758,17 @@ end_render_pass : proc() : _end_render_pass
 
 when ODIN_OS != .JS {
 // Push struct to buffer
-temp_malloc : proc(bytes: []u8, buffer_index: u32, shader_stage: Shader_Stage) : _temp_malloc
+temp_malloc : proc(bytes: []u8, buffer_index: uint, shader_stage: Shader_Stage) : _temp_malloc
 }
 
-draw_indexed :: proc(index_buffer: ptr, index_count: u32, index_offset: u32, instance_count: u32, base_vertex: u32, base_instance: u32) {
+draw_indexed :: proc(index_buffer: ptr, index_count: uint, index_offset: uint, instance_count: uint, base_vertex: uint, base_instance: uint) {
     _draw_indexed(index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance)
 }
 
 malloc :: proc(
     #any_int bytes: uint,
-    alignment:   u32,
-    flag: Buffer_Flag,
+    alignment:   uint,
+    flag: Buffer_Usage,
     name:        string     = "",
     loc:                    = #caller_location,
 ) -> (ptr, bool) #optional_ok {
@@ -556,7 +788,7 @@ malloc :: proc(
         gpu    = _gpu_address(_ptr),
         flags = flag,
         alignment = alignment,
-        total_capacity_bytes = u32(capacity),
+        total_capacity_bytes = capacity,
         byte_offset = 0,
         meta   = Metadata {
             name = strings.clone(name, mem.dynamic_arena_allocator(&_state.name_arena)),
@@ -566,11 +798,18 @@ malloc :: proc(
 }
 
 // Copies src data into dst
-copy : proc(dst, src: ptr) : _copy
+copy :: _copy
 
-// Low-level resource bind. Graphics use `set_shader`/`set_parameter_block`;
-// this remains for the compute dispatch path.
-use_parameter_block : proc(block: ^Parameter_Block, destination: Parameter_Block_Destination = .Graphics) : _use_parameter_block
+// Low-level block bind. Graphics go through `set_shader`; this remains for the
+// compute dispatch path. `slot` is the backend buffer or
+// bind-group index to bind at.
+use_parameter_block :: proc(
+    block: ^Parameter_Block,
+    destination: Parameter_Block_Destination = .Graphics,
+    slot: uint = 0,
+) {
+    _use_parameter_block(block, destination, slot)
+}
 
 // Ends 'before' stage
 barrier : proc(before: Stage, after: Stage) : _barrier

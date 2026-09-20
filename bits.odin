@@ -49,7 +49,7 @@ Bit_Mask_Array :: struct {
 @(require_results)
 bit_mask_array_init :: proc(
     #any_int bit_count: int,
-    alignment: int = align_of(Bit_Mask64),
+    alignment: int = mem.DEFAULT_ALIGNMENT,
     allocator := context.allocator,
 ) -> (arr: Bit_Mask_Array, err: runtime.Allocator_Error) #optional_allocator_error {
     assert(bit_count >= 0, "bit_mask_array_init: negative bit_count")
@@ -183,4 +183,39 @@ bit_mask_array_iterator_next :: proc "contextless" (it: ^Bit_Mask_Array_Iterator
         it.bits = it.array.words[it.word]
         it.word += 1
     }
+}
+
+
+// Yields maximal runs of bits set in `a` but not in `b`, as [start, start+length).
+// Requires equal word counts; padding bits are zero in the diff by construction.
+bit_mask_array_diff_ranges :: proc(a, b: ^Bit_Mask_Array, allocator := context.temp_allocator) -> []Range {
+    assert(a.word_count == b.word_count, "diff_ranges: word count mismatch")
+
+    ranges := make([dynamic]Range, 0, 8, allocator = allocator)
+    current := Range{ start = -1, length = 0 }
+
+    for w in 0 ..< a.word_count {
+        diff := a.words[w] &~ b.words[w]
+        base := w * MASK_BITS
+
+        for diff != 0 {
+            start := int(intrinsics.count_trailing_zeros(u64(diff)))
+            ones  := int(intrinsics.count_trailing_ones(u64(diff) >> uint(start)))
+            g_start := base + start
+
+            if current.start >= 0 && g_start == current.start + int(current.length) {
+                current.length += uint(ones)        // continues (even across a word)
+            } else {
+                if current.start >= 0 { append(&ranges, current) }
+                current = { start = g_start, length = uint(ones) }
+            }
+
+            end := start + ones
+            if end >= MASK_BITS { diff = 0 }
+            else { diff &~= (Bit_Mask64(1) << uint(end)) - 1 }
+        }
+    }
+
+    if current.start >= 0 { append(&ranges, current) }
+    return ranges[:]
 }

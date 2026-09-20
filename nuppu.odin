@@ -9,25 +9,15 @@ import "core:log"
 import glm "core:math/linalg/glsl"
 import "./platform"
 import "./gpu"
-import "bit_array"
 
 _ :: fmt
 _ :: log
 
-UNION_LEN :: intrinsics.type_union_variant_count
-
 SIM_TICKS_PER_SECOND :: 180
 SIM_NS_PER_TICK     :: time.Second / SIM_TICKS_PER_SECOND
 
-FRAMES_IN_FLIGHT :: 2
-
 MAX_FRAME_DT_NS :: u64(f64(time.Second) * 0.1)
 MAX_SIM_TICKS :: 5
-
-MAX_TEXTURES :: 256
-
-Texture :: gpu.Texture
-Texture_Descriptor :: gpu.Texture_Descriptor
 
 Handle :: struct($Raw: typeid) {
     handle:   Raw,
@@ -45,13 +35,13 @@ when ODIN_DEBUG {
     Metadata :: struct{}
 }
 
-Texture_Handle :: Handle(bit_array.Handle)
-Texture_Handle_Nil :: Texture_Handle{}
-
 @(require_results)
 get_texture :: proc(handle: Texture_Handle) -> (^gpu.Texture, bool) #optional_ok {
-    return get_resource(&_state.textures, handle)
+    index, ok := texture_handle_unpack(handle)
+    if !ok { return nil, false }
+    return resource_table_get(&_state.texture_library.table, index)
 }
+
 
 // Handles carry metadata on debug builds
 when ODIN_DEBUG {
@@ -98,26 +88,25 @@ State :: struct #align(64) {
 
     mesh_library: Mesh_Library,
     frame_uniform: gpu.ptr,
+    engine_block: gpu.Parameter_Block,
 
     draw_batcher: Draw_Batcher,
     material_library: Material_Library,
     shader_library: Shader_Library,
-
-    sampler: gpu.Sampler,
+    texture_library: Texture_Library,
+    sampler_library: Sampler_Library,
 
     frame_semaphore: gpu.Timeline_Semaphore,
     frame_arenas: [FRAMES_IN_FLIGHT]gpu.Arena,
     frame_n: u64,
 
-    //
-    
-
-
-    textures: bit_array.Bit_Array(Resource(Texture, Texture_Handle), MAX_TEXTURES, Texture_Handle),
-    built_in_textures: [Built_in_texture]Texture_Handle,
-
     entity_manager: ^Entity_Manager,
     main_camera: Entity_Handle,
+
+    // Cached each frame by update_constants so submit can depth-sort without a
+    // camera lookup per instance.
+    camera_position: [3]f32,
+    camera_far:      f32,
 }
 
 camera :: proc "contextless" () -> Entity_Handle {
@@ -131,6 +120,9 @@ Camera :: struct {
     far: f32,
     fovy: f32,
     aspect_ratio: f32,
+
+    view_proj: matrix[4,4]f32,
+    frustum: Frustum,
 }
 
 update_camera :: proc(
@@ -149,18 +141,9 @@ update_camera :: proc(
     cam.fovy  = fovy
 }
 
-// Registers an entity variant with the global entity manager. Must be called
-// before register_drawable for that type. Pass a data type as the fourth
-// argument to upload the variant's field named `gpu_instance` (which must have
-// that exact type) into the per-frame instance-data buffer.
-register_entity :: proc{_register_entity, _register_entity_data}
-
-_register_entity :: proc($T: typeid, $SHIFT: uint, flags: Entity_Flags = {}) {
+// Registers an entity variant with the global entity manager.
+register_entity :: proc($T: typeid, $SHIFT: uint, flags: Entity_Flags = {}) {
     entity_manager_add_variant(_state.entity_manager, T, SHIFT, flags)
-}
-
-_register_entity_data :: proc($T: typeid, $SHIFT: uint, flags: Entity_Flags, $D: typeid) {
-    entity_manager_add_variant_data(_state.entity_manager, T, SHIFT, flags, D)
 }
 
 _state: ^State
@@ -186,14 +169,6 @@ App_Optional :: struct {
     window_title: string,
     init: proc(),
     deinit: proc(),
-}
-
-// The slot's `handle` is the full wrapper `H` (not the raw bit_array handle),
-// so the debug metadata (name + creation site) travels with the resource and
-// the owning library can report leaks on shutdown.
-Resource :: struct($T: typeid, $H: typeid) {
-    handle: H,
-    data:   T,
 }
 
 run :: proc(desc: App_Desc($T)) {
@@ -295,21 +270,16 @@ deinit :: proc() {
     }
 
     destroy_draw_batcher(&_state.draw_batcher)
-    _shader_lib_deinit(&_state.shader_library)
-    _material_lib_deinit(&_state.material_library)
+    NUPPU_shader_lib_deinit(&_state.shader_library)
+    NUPPU_material_lib_deinit(&_state.material_library)
+    NUPPU_sampler_library_deinit(&_state.sampler_library)
+    NUPPU_mesh_library_deinit(&_state.mesh_library)
+    NUPPU_texture_library_deinit(&_state.texture_library)
 
     for i in 0 ..< FRAMES_IN_FLIGHT {
         gpu.release_ptr(&_state.frame_arenas[i].ptr)
     }
     gpu.release_ptr(&_state.frame_uniform)
-    gpu.release_ptr(&_state.mesh_library.vertex_arena.ptr)
-    gpu.release_ptr(&_state.mesh_library.index_arena.ptr)
-
-    if depth_handle := _state.built_in_textures[.Depth]; depth_handle.handle != bit_array.NIL_HANDLE {
-        if depth_texture, ok := get_resource(&_state.textures, depth_handle); ok {
-            gpu.release_texture(depth_texture)
-        }
-    }
 
     gpu.deinit()
 
@@ -357,16 +327,11 @@ when ODIN_DEBUG {
 when ODIN_DEBUG {
     _report_unfreed_resources :: proc() {
         total := 0
-        total += _report_unfreed_library("mesh", &_state.mesh_library.meshes, []Mesh_Handle{
-            _state.mesh_library.built_in_lookup[.Quad],
-            _state.mesh_library.built_in_lookup[.Cube],
-        })
-        total += _report_unfreed_library("texture", &_state.textures, []Texture_Handle{
-            _state.built_in_textures[.Depth],
-            _state.built_in_textures[.Swapchain],
-        })
-        total += _report_unfreed_library("shader", &_state.shader_library.shaders)
+        total += _report_unfreed_meshes()
+        total += _report_unfreed_textures()
+        total += _report_unfreed_shaders()
         total += _report_unfreed_materials()
+        total += _report_unfreed_samplers()
         total += _report_live_entities()
 
         if total > 0 {
@@ -377,6 +342,7 @@ when ODIN_DEBUG {
     // Entities are not GPU resources, but a non-empty manager at shutdown is
     // usually a leak. Print every live entity's handle metadata (name + site).
     _report_live_entities :: proc() -> int {
+    
         em := _state.entity_manager
         if em == nil { return 0 }
 
@@ -401,27 +367,37 @@ when ODIN_DEBUG {
         return count
     }
 
-    _report_unfreed_library :: proc(
-        kind:    string,
-        array:   ^bit_array.Bit_Array(Resource($Res, $RHandle), $N, $H),
-        exclude: []RHandle = nil,
-    ) -> int {
+    _report_unfreed_textures :: proc() -> int {
         count := 0
-        it := bit_array.iterator_init(array)
-        for {
-            item, ok := bit_array.iterator_next(&it)
-            if !ok { break }
-
-            skip := false
-            for e in exclude {
-                if item.handle == e {
-                    skip = true
-                    break
-                }
+        for handle in _state.texture_library.__texture_handles {
+            if handle == _state.texture_library.built_in_textures[.Depth] ||
+               handle == _state.texture_library.built_in_textures[.Swapchain] {
+                continue
             }
-            if skip { continue }
+            _report_unfreed("texture", handle.metadata)
+            count += 1
+        }
+        return count
+    }
 
-            _report_unfreed(kind, item.handle.metadata)
+    _report_unfreed_meshes :: proc() -> int {
+        lib := &_state.mesh_library
+        count := 0
+        for handle in lib.__mesh_handles {
+            if handle == lib.built_in_lookup[.Quad] || handle == lib.built_in_lookup[.Cube] {
+                continue
+            }
+            _report_unfreed("mesh", handle.metadata)
+            count += 1
+        }
+        return count
+    }
+
+    _report_unfreed_shaders :: proc() -> int {
+        lib := &_state.shader_library
+        count := 0
+        for handle in lib.__shader_handles {
+            _report_unfreed("shader", handle.metadata)
             count += 1
         }
         return count
@@ -430,8 +406,19 @@ when ODIN_DEBUG {
     _report_unfreed_materials :: proc() -> int {
         lib := &_state.material_library
         count := 0
-        for i in 1 ..< len(lib.material_handles) {
-            _report_unfreed("material", lib.material_handles[i].metadata)
+        for handle in lib.__material_handles {
+            _report_unfreed("material", handle.metadata)
+            count += 1
+        }
+        return count
+    }
+
+    _report_unfreed_samplers :: proc() -> int {
+        lib := &_state.sampler_library
+        count := 0
+        for handle in lib.__sampler_handles {
+            if handle == lib.default { continue }
+            _report_unfreed("sampler", handle.metadata)
             count += 1
         }
         return count
@@ -470,9 +457,52 @@ end_frame :: proc(frame: Frame) {
     _state.frame_n += 1
 }
 
+Frustum :: [6][4]f32
+import "core:math"
+_sphere_in_frustum :: proc(planes: Frustum, center: [3]f32, radius: f32) -> bool {
+    for p in planes {
+        d := p[0]*center.x + p[1]*center.y + p[2]*center.z + p[3]
+        if d < -radius { return false }
+    }
+    return true
+}
+
+_frustum_from_view_proj :: proc(m: matrix[4,4]f32) -> Frustum {
+    _normalize_plane :: proc(p: [4]f32) -> [4]f32 {
+        n := math.sqrt(p[0]*p[0] + p[1]*p[1] + p[2]*p[2])
+        if n == 0 { return p }
+        return {p[0]/n, p[1]/n, p[2]/n, p[3]/n}
+    }
+
+    _add4 :: proc(a, b: [4]f32) -> [4]f32 { return {a[0]+b[0], a[1]+b[1], a[2]+b[2], a[3]+b[3]} }
+
+    _sub4 :: proc(a, b: [4]f32) -> [4]f32 { return {a[0]-b[0], a[1]-b[1], a[2]-b[2], a[3]-b[3]} }
+
+    r0 := [4]f32{m[0,0], m[0,1], m[0,2], m[0,3]}
+    r1 := [4]f32{m[1,0], m[1,1], m[1,2], m[1,3]}
+    r2 := [4]f32{m[2,0], m[2,1], m[2,2], m[2,3]}
+    r3 := [4]f32{m[3,0], m[3,1], m[3,2], m[3,3]}
+    return {
+        _normalize_plane(_add4(r3, r0)), // left
+        _normalize_plane(_sub4(r3, r0)), // right
+        _normalize_plane(_add4(r3, r1)), // bottom
+        _normalize_plane(_sub4(r3, r1)), // top
+        _normalize_plane(_add4(r3, r2)), // near
+        _normalize_plane(_sub4(r3, r2)), // far
+    }
+}
+
 update_constants :: proc(frame: Frame) {
     cam, ok := entity_get_typed(_state.entity_manager, _state.main_camera, Camera)
     if !ok { return }
+
+    perspective := glm.mat4Perspective(glm.radians_f32(cam.fovy), cam.aspect_ratio, cam.near, cam.far)
+    world       := glm.mat4Translate(-cam.position)
+    cam.view_proj = perspective * world
+    cam.frustum   = _frustum_from_view_proj(cam.view_proj)
+
+    _state.camera_position = cam.position
+    _state.camera_far      = cam.far
 
     uniform := gpu.arena_alloc(frame.arena, Engine_Uniform, 1)
     u := (^Engine_Uniform)(uniform.cpu)
@@ -492,18 +522,21 @@ frame_arena :: proc(frame: Frame) -> ^gpu.Arena {
 }
 
 depth :: proc() -> Texture_Handle {
-    return _state.built_in_textures[.Depth]
+    return _state.texture_library.built_in_textures[.Depth]
 }
 
-resize_depth :: proc(width, height: u32) {
-    if old_handle := _state.built_in_textures[.Depth]; old_handle.handle != bit_array.NIL_HANDLE {
-        if old_tex, ok := get_resource(&_state.textures, old_handle); ok {
-            gpu.release_texture(old_tex)
-            bit_array.remove(&_state.textures, old_handle)
-        }
+// The engine's default nearest/clamp sampler. Shaders that need a sampler in
+// their shader-local block pass this explicitly.
+default_sampler :: proc "contextless" () -> Sampler_Handle {
+    return sampler_default()
+}
+
+resize_depth :: proc(width, height: uint) {
+    if old_handle := _state.texture_library.built_in_textures[.Depth]; old_handle.handle != 0 {
+        _texture_remove(old_handle)
     }
     gpu_tex := gpu.texture_depth_init({width, height}, .Depth32Float)
-    _state.built_in_textures[.Depth] = add_resource(&_state.textures, gpu_tex)
+    _state.texture_library.built_in_textures[.Depth] = _register_tex_handle(gpu_tex)
 }
 
 Load_Action  :: gpu.Load_Action
@@ -526,15 +559,15 @@ Depth_Attachment :: struct {
 
 begin_render_pass :: proc(color: Color_Attachment, depth: Depth_Attachment = {}) {
     color_tex: gpu.Texture
-    if tex, ok := get_resource(&_state.textures, color.texture); ok {
+    if tex, ok := get_texture(color.texture); ok {
         color_tex = tex^
     }
     color_resolve: gpu.Texture
-    if tex, ok := get_resource(&_state.textures, color.resolve_texture); ok {
+    if tex, ok := get_texture(color.resolve_texture); ok {
         color_resolve = tex^
     }
     depth_tex: gpu.Texture
-    if tex, ok := get_resource(&_state.textures, depth.texture); ok {
+    if tex, ok := get_texture(depth.texture); ok {
         depth_tex = tex^
     }
 
@@ -637,7 +670,7 @@ _frame :: proc(external_ns : u64 = 0) -> Frame_Result {
     current := platform.window_size_pixel()
     if _state.window_size.x != current.x || _state.window_size.y != current.y {
         gpu.resize_swapchain(u32(current.x), u32(current.y))
-        resize_depth(u32(current.x), u32(current.y))
+        resize_depth(uint(current.x), uint(current.y))
         _state.window_size = current
 
         camera_ptr, ok := entity_get_typed(_state.entity_manager, _state.main_camera, Camera)
@@ -649,19 +682,29 @@ _frame :: proc(external_ns : u64 = 0) -> Frame_Result {
     return .Continue
 }
 
+import "core:image"
 _ready_up :: proc() {
     _state.frame_n = 1
     _state.frame_semaphore = gpu.semaphore(0)
 
     for i in 0 ..< FRAMES_IN_FLIGHT {
-        _state.frame_arenas[i], _ = gpu.arena_init(CONFIG.frame_upload_bytes)
+        _state.frame_arenas[i], _ = gpu.arena_init(FRAME_ARENA_BYTES)
     }
 
     _state.window_size = platform.window_size_pixel()
     gpu.resize_swapchain(u32(_state.window_size.x), u32(_state.window_size.y))
 
-    bit_array.init(&_state.textures)
-    resize_depth(u32(_state.window_size.x), u32(_state.window_size.y))
+    texture_err := NUPPU_texture_library_init(&_state.texture_library)
+    switch texture_err {
+    case .Out_Of_Memory:
+        panic("Failed to allocate required resources for texture library, increase CONFIG.texture_lib_data or decrease CONFIG.max_textures")
+    case .Invalid_Pointer, .Invalid_Argument, .Mode_Not_Implemented:
+        panic("Failed to allocate required resources for texture library")
+    case .None:
+        log.info("texture library init ok")
+    }
+
+    resize_depth(uint(_state.window_size.x), uint(_state.window_size.y))
 
     _state.entity_manager = new(Entity_Manager)
     entity_manager_init(_state.entity_manager)
@@ -681,24 +724,115 @@ _ready_up :: proc() {
         _state.main_camera = camera.handle
     }
 
-    mesh_library_init(&_state.mesh_library)
+
+    mesh_err := NUPPU_mesh_library_init(&_state.mesh_library)
+    switch mesh_err {
+    case .Out_Of_Memory:
+        panic("Failed to allocate required resources for mesh library, increase CONFIG.mesh_lib_data or decrease CONFIG.max_meshes")
+    case .Invalid_Pointer, .Invalid_Argument, .Mode_Not_Implemented:
+        panic("Failed to allocate required resources for mesh library")
+    case .None:
+        log.info("mesh library init ok")
+    }
 
     _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), 256, .Constant, "Frame Uniform")
 
-    _state.sampler = gpu.sampler_init({
-        mag_filter = .Nearest,
-        min_filter = .Nearest,
-        mip_filter = .Nearest,
-        wrap_r = .ClampToEdge,
-        wrap_s = .ClampToEdge,
-        wrap_t = .ClampToEdge,
-    })
+    sampler_err := NUPPU_sampler_library_init(&_state.sampler_library)
+    switch sampler_err {
+    case .Out_Of_Memory:
+        panic("Failed to allocate required resources for sampler library, increase CONFIG.max_samplers")
+    case .Invalid_Pointer, .Invalid_Argument, .Mode_Not_Implemented:
+        panic("Failed to allocate required resources for sampler library")
+    case .None:
+        log.info("sampler library init ok")
+    }
 
     init_draw_batcher(&_state.draw_batcher)
-    _material_lib_init(&_state.material_library)
-    _shader_lib_init(&_state.shader_library)
+
+    mat_err := NUPPU_material_lib_init(&_state.material_library)
+    switch mat_err {
+    case .Out_Of_Memory:
+        panic("Failed to allocate required resources for material library, increase CONFIG.material_lib_data or decrease CONFIG.max_materials")
+    case .Invalid_Pointer, .Invalid_Argument, .Mode_Not_Implemented:
+        panic("Failed to allocate required resources for material library")
+    case .None:
+        log.info("material library init ok")
+    }
+    
+    shader_err := NUPPU_shader_lib_init(&_state.shader_library)
+    switch shader_err {
+    case .Out_Of_Memory:
+        panic("Failed to allocate required resources for shader library")
+    case .Invalid_Pointer, .Invalid_Argument, .Mode_Not_Implemented:
+        panic("Failed to allocate required resources for shader library")
+    case .None:
+        log.info("shader library init ok")
+    }
+
+    // Shared engine block (slot 0) every shader reads from.
+    {
+        _state.engine_block.constants[0] = _state.frame_uniform
+        _state.engine_block.read_resources[0] = _state.mesh_library.vertex_arena.ptr
+    }
+
+    create_built_in_shaders_and_materials()
 
     _state.initialized = true
+}
+
+create_built_in_shaders_and_materials :: proc() {
+
+    white_2x2 := texture_2D({2, 2}, .RGBA8Unorm, {.Sampled}, name = "white 2x2")
+    {
+        img, err := image.load_from_bytes(#load("data/white_2x2.png", []u8), {.alpha_add_if_missing}, context.temp_allocator)
+        assert(err == nil)
+        defer image.destroy(img, context.temp_allocator)
+
+        scope := texture_upload_scope(texture_upload_image_bytes(2, 2, .RGBA8Unorm))
+        texture_upload(&scope, white_2x2, .RGBA8Unorm, raw_data(img.pixels.buf[:]))
+        texture_upload_scope_end(&scope)
+    }
+
+
+    vertex_code: []u8
+    fragment_code: []u8
+    when ODIN_OS == .Darwin {
+        vertex_code   = #load("./data/sprite.vs.metal", []u8)
+        fragment_code = #load("./data/sprite.ps.metal", []u8)
+    } else when ODIN_OS == .JS {
+        vertex_code   = #load("./data/sprite.wgsl", []u8)
+        fragment_code = vertex_code
+    }
+
+    Sprite_Mat_Constants :: struct {}
+    params := Sprite_Mat_Constants {}
+    
+    mat_scope := material_upload_scope()
+    mat, mat_ok := material_upload(
+        &mat_scope, DEFAULT_DRAW_STATE, &params,
+        .Opaque, { material_texture(white_2x2) }, "sprite",
+    )
+    assert(mat_ok, "8-Sprite: failed to upload material")
+    material_upload_scope_end(&mat_scope)
+
+    shader, shader_ok := shader_register({
+        vertex_code    = string(vertex_code),
+        vertex_entry   = "vertexMain",
+        fragment_code  = string(fragment_code),
+        fragment_entry = "fragmentMain",
+        color_format   = .BGRA8Unorm,
+        depth_format   = .Depth32Float,
+        blend          = gpu.ALPHA_BLEND,
+        multisample    = { count = 1, mask = 0xFFFFFFFF },
+        topology       = .Triangle,
+        shader_resources = {
+            samplers = { default_sampler() },
+        },
+    }, Sprite_Instance, mat, "sprite_shader")
+    assert(shader_ok, "8-Sprite: failed to register shader")
+    connect_materials_to_shader({mat}, shader)
+
+    _state.material_library.built_in[.Sprite] = mat
 }
 
 ///////////////////////////////////////////////////////////////
@@ -724,14 +858,14 @@ set_gpu_hz_target :: proc(hz: u32) {
 acquire_next_swapchain :: proc() -> Texture_Handle {
     gpu_tex := gpu.acquire_next_swapchain()
 
-    if _state.built_in_textures[.Swapchain].handle == bit_array.NIL_HANDLE {
-        _state.built_in_textures[.Swapchain] = add_resource(&_state.textures, gpu_tex)
-        return _state.built_in_textures[.Swapchain]
+    if _state.texture_library.built_in_textures[.Swapchain].handle == 0 {
+        _state.texture_library.built_in_textures[.Swapchain] = _register_tex_handle(gpu_tex)
+        return _state.texture_library.built_in_textures[.Swapchain]
     }
 
-    tex_ptr, _ := get_resource(&_state.textures, _state.built_in_textures[.Swapchain])
+    tex_ptr, _ := get_texture(_state.texture_library.built_in_textures[.Swapchain])
     tex_ptr^ = gpu_tex
-    return _state.built_in_textures[.Swapchain]
+    return _state.texture_library.built_in_textures[.Swapchain]
 }
 
 Screen_Bounds :: struct #align(16) {
@@ -785,86 +919,7 @@ compute_screen_layout :: proc(window_w, window_h: i32, internal_w, internal_h: i
     }
 }
 
-add_resource :: proc(
-    array: ^bit_array.Bit_Array(Resource($Res, $RHandle), $N, $H),
-    res:   Res,
-    name:  string = "",
-    loc:          = #caller_location,
-) -> H {
-    handle, _ := bit_array.add(array, Resource(Res, RHandle) {
-        data = res,
-    })
-    when ODIN_DEBUG {
-        handle.metadata = Metadata {
-            created_at       = loc,
-            created_on_frame = _state.frame_n,
-            name             = name,
-        }
-        // Stash the full handle (with metadata) back in the slot so the leak
-        // report can find it without a separate registry.
-        if slot, ok := bit_array.get(array, handle); ok {
-            slot.handle = handle
-        }
-    }
-    return handle
-}
-
-get_resource :: proc(array: ^bit_array.Bit_Array(Resource($Res, $RHandle), $N, $H), handle: H, loc := #caller_location) -> (^Res, bool) {
-    resource_ptr, ok := bit_array.get(array, handle)
-    when ODIN_DEBUG {
-        if !ok && handle.handle != bit_array.NIL_HANDLE {
-            h := debug_warn_hash(loc)
-            if h not_in _debug_warned_call_sites {
-                index, _ := bit_array.unpack_handle(handle.handle)
-                log.warnf(
-                    "[nuppu] stale handle idx=%v — created at %v:%v on frame %v (lookup at %v:%v)",
-                    index,
-                    handle.metadata.created_at.file_path,
-                    handle.metadata.created_at.line,
-                    handle.metadata.created_on_frame,
-                    loc.file_path,
-                    loc.line,
-                )
-                _debug_warned_call_sites[h] = true
-            }
-        }
-    }
-    return &resource_ptr.data, ok
-}
-
-// Simple 2D texture
-texture_2D_init :: proc(
-    dimensions: [2]u32,
-    data: rawptr = nil,
-    name: string = "",
-    loc: = #caller_location,
-) -> Texture_Handle {
-    desc := gpu.Texture_Descriptor {
-        dimensions = dimensions,
-        format = .RGBA8Unorm,
-        storage = .Shared,
-        usage = {.Sampled},
-        layer_count = 1,
-        type = ._2D,
-    }
-
-    return texture_init_ex(desc, data, name, loc)
-}
-
-texture_init_ex :: proc(
-    descriptor: Texture_Descriptor,
-    data: rawptr = nil,
-    name: string = "",
-    loc: = #caller_location,
-) -> Texture_Handle {
-
-    texture := gpu.texture_init(descriptor)
-
-    handle := add_resource(&_state.textures, texture, name, loc)
-
-    if data != nil {
-        gpu.copy_to_texture(texture, {0, 0, 0}, {descriptor.dimensions.x, descriptor.dimensions.y, 1}, 0, data, descriptor.dimensions.x * 4)
-    }
-
-    return handle
+Range :: struct {
+    start: int,
+    length: uint,
 }

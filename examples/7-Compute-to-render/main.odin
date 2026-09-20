@@ -12,6 +12,9 @@ State :: struct {
     animation_index: u32,
 
     texture:           nuppu.Texture_Handle,
+    sampler:           nuppu.Sampler_Handle,
+    material:          nuppu.Material_Handle,
+    shader:            nuppu.Shader_Handle,
     animation_uniform: gpu.ptr,
     compute_pso:       gpu.Compute_Pipeline,
 }
@@ -20,14 +23,9 @@ Object_Params :: struct {
     color: [4]f32,
 }
 
-// Per-entity data uploaded every frame through the `gpu_instance` field.
-Color_Instance :: struct {
-    color: [4]f32,
-}
-
 Cube_Entity :: struct {
     using e: ^nuppu.Entity,
-    gpu_instance: Color_Instance,
+    color: [4]f32,
 }
 
 TEXTURE_WIDTH  :: 128
@@ -41,17 +39,13 @@ INSTANCE_COUNT  :: INSTANCE_WIDTH * INSTANCE_HEIGHT * INSTANCE_DEPTH
 _init :: proc() {
     nuppu.update_camera({0, 0, 0}, {}, 0.03, 500, 45)
 
-    nuppu.register_entity(Cube_Entity, 8, {.Interpolate, .Has_Mesh}, Color_Instance)
+    nuppu.register_entity(Cube_Entity, 8, {.Interpolate})
 
     // A storage texture the compute pass writes into and the render pass samples.
-    state.texture = nuppu.texture_init_ex({
-        dimensions  = {TEXTURE_WIDTH, TEXTURE_HEIGHT},
-        format      = .RGBA8Unorm,
-        type        = ._2D,
-        storage     = .Shared,
-        usage       = {.Write, .Sampled},
-        layer_count = 1,
-    }, name = "mandelbrot")
+    state.texture = nuppu.texture_2D(
+        {TEXTURE_WIDTH, TEXTURE_HEIGHT}, .RGBA8Unorm, {.Storage_Write, .Sampled},
+        name = "mandelbrot",
+    )
 
     compute_code: []u8
     when ODIN_OS == .Darwin {
@@ -65,14 +59,14 @@ _init :: proc() {
 
     state.animation_uniform, _ = gpu.malloc(size_of(u32), 256, .Constant, "Animation")
 
-    sampler := gpu.sampler_init({
+    sampler := nuppu.sampler_create({
         min_filter = .Linear,
         mag_filter = .Linear,
         mip_filter = .Linear,
         wrap_s     = .Repeat,
         wrap_t     = .Repeat,
         wrap_r     = .Repeat,
-    })
+    }, "compute_to_render_sampler")
 
     vertex_code: []u8
     fragment_code: []u8
@@ -84,6 +78,17 @@ _init :: proc() {
         fragment_code = vertex_code
     }
 
+    params := Object_Params {
+        color = {1, 1, 1, 1},
+    }
+    mat_scope := nuppu.material_upload_scope()
+    mat, mat_ok := nuppu.material_upload(
+        &mat_scope, nuppu.DEFAULT_DRAW_STATE, &params,
+        .Opaque, { nuppu.material_texture(state.texture) }, "mandelbrot",
+    )
+    assert(mat_ok, "7-Compute-to-render: failed to upload material")
+    nuppu.material_upload_scope_end(&mat_scope)
+
     shader, shader_ok := nuppu.shader_register({
         vertex_code    = string(vertex_code),
         vertex_entry   = "vertexMain",
@@ -94,17 +99,16 @@ _init :: proc() {
         blend          = gpu.BLEND_NONE,
         multisample    = { count = 1, mask = 0xFFFFFFFF },
         topology       = .Triangle,
-        textures       = []nuppu.Texture_Handle{ state.texture },
-        samplers       = []gpu.Sampler{ sampler },
-    }, "lit_textured")
+        shader_resources = {
+            samplers = []nuppu.Sampler_Handle{ sampler },
+        },
+    }, nuppu.Mesh_Instance, mat, "lit_textured")
     assert(shader_ok, "7-Compute-to-render: failed to register shader")
+    nuppu.connect_materials_to_shader({mat}, shader)
 
-    params := Object_Params {
-        color = {1, 1, 1, 1},
-    }
-    mat_scope := nuppu.material_upload_scope(1)
-    mat, mat_ok := nuppu.material_upload(&mat_scope, shader, nuppu.DEFAULT_DRAW_STATE, &params, name = "mandelbrot")
-    assert(mat_ok, "7-Compute-to-render: failed to upload material")
+    state.sampler  = sampler
+    state.material = mat
+    state.shader   = shader
 
     cube_handle := nuppu.built_in_mesh_handle(.Cube)
 
@@ -115,7 +119,7 @@ _init :: proc() {
             for ix in 0 ..< INSTANCE_WIDTH {
                 c := nuppu.entity_add(Cube_Entity, "cube")
                 c.mesh         = cube_handle
-                c.materials[0] = mat
+                c.material = mat
                 c.scale        = {scl, scl, scl}
                 c.position = {
                     (f32(ix) - f32(INSTANCE_WIDTH)  * 0.5) * 2 * scl + scl,
@@ -125,7 +129,7 @@ _init :: proc() {
                 center_sum += c.position
 
                 t := f32(ix * INSTANCE_HEIGHT * INSTANCE_DEPTH + iy * INSTANCE_DEPTH + iz) / f32(INSTANCE_COUNT)
-                c.gpu_instance.color = {t, 1 - t, math.sin(math.TAU * t), 1}
+                c.color = {t, 1 - t, math.sin(math.TAU * t), 1}
             }
         }
     }
@@ -175,8 +179,13 @@ _render :: proc(current: ^State, alpha: f32) {
     gpu.compute_dispatch({TEXTURE_WIDTH, TEXTURE_HEIGHT, 1}, {128, 1, 1})
     gpu.barrier(.Compute, .All)
 
-    nuppu.cull(frame)
-    nuppu.finish_instance_upload(frame)
+    culled := nuppu.cull_entities(Cube_Entity)
+    for e in culled.entities {
+        cube := (^Cube_Entity)(e.v.data)
+        nuppu.submit_mesh(e, cube.color)
+    }
+
+    nuppu.flush_culled_instances(frame)
 
     gpu.barrier(.Transfer, .All)
 
@@ -197,6 +206,10 @@ _render :: proc(current: ^State, alpha: f32) {
 }
 
 _deinit :: proc() {
+    nuppu.texture_free(state.texture)
+    nuppu.sampler_free(state.sampler)
+    nuppu.material_free(state.material)
+    nuppu.shader_free(state.shader)
     gpu.release_ptr(&state.animation_uniform)
 }
 

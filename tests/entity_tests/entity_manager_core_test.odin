@@ -18,80 +18,6 @@ Frog :: struct {
     jump: f32,
 }
 
-Sprite_Data :: struct {
-    uv_min:  [2]f32,
-    uv_max:  [2]f32,
-    frame_n: u32,
-    _pad:    u32,
-}
-
-Animated :: struct {
-    using e: ^nuppu.Entity,
-    gpu_instance: Sprite_Data,
-}
-
-@(test)
-test_instance_data_field_registration :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_destroy(manager)
-
-    nuppu.entity_manager_init(manager)
-    nuppu.entity_manager_add_variant_data(manager, Animated, 6, {}, Sprite_Data)
-
-    testing.expect_value(t, manager.instance_data_sizes[0], size_of(Sprite_Data))
-    testing.expect_value(t, manager.instance_data_offsets[0], int(offset_of(Animated, gpu_instance)))
-
-    h, ok := nuppu._entity_add(manager, Animated)
-    testing.expect(t, ok, "add should succeed")
-    if !ok { return }
-
-    a, a_ok := nuppu.entity_get_typed(manager, h, Animated)
-    testing.expect(t, a_ok, "typed get should succeed")
-    if !a_ok { return }
-
-    a.gpu_instance.uv_min  = {0.25, 0.5}
-    a.gpu_instance.uv_max  = {0.75, 1.0}
-    a.gpu_instance.frame_n = 3
-    testing.expect_value(t, a.gpu_instance.uv_min, [2]f32{0.25, 0.5})
-    testing.expect_value(t, a.gpu_instance.uv_max, [2]f32{0.75, 1.0})
-    testing.expect_value(t, a.gpu_instance.frame_n, u32(3))
-}
-
-// Exercises reflection through a nested `using` wrapper.
-Wrap :: struct($T: typeid) {
-    gpu_instance: T,
-}
-
-Nested :: struct {
-    using e: ^nuppu.Entity,
-    tag: i32,
-    using w: Wrap(Sprite_Data),
-}
-
-@(test)
-test_instance_data_nested_using :: proc(t: ^testing.T) {
-    manager, _ := new(nuppu.Entity_Manager)
-    defer nuppu.entity_manager_destroy(manager)
-
-    nuppu.entity_manager_init(manager)
-    nuppu.entity_manager_add_variant_data(manager, Nested, 6, {}, Sprite_Data)
-
-    testing.expect_value(t, manager.instance_data_sizes[0], size_of(Sprite_Data))
-    testing.expect_value(t, manager.instance_data_offsets[0], int(offset_of_by_string(Nested, "gpu_instance")))
-
-    h, ok := nuppu._entity_add(manager, Nested)
-    testing.expect(t, ok, "add should succeed")
-    if !ok { return }
-
-    n, n_ok := nuppu.entity_get_typed(manager, h, Nested)
-    testing.expect(t, n_ok, "typed get should succeed")
-    if !n_ok { return }
-
-    // Promotion reaches through the `using` level.
-    n.gpu_instance.uv_min = {0.1, 0.2}
-    testing.expect_value(t, n.gpu_instance.uv_min, [2]f32{0.1, 0.2})
-}
-
 // The ^Entity back-pointer may also sit behind a `using` chain.
 Entity_Base :: struct {
     using e: ^nuppu.Entity,
@@ -99,7 +25,6 @@ Entity_Base :: struct {
 
 Deep_Entity :: struct {
     using base: Entity_Base,
-    gpu_instance: Sprite_Data,
 }
 
 @(test)
@@ -108,7 +33,7 @@ test_entity_back_pointer_through_using :: proc(t: ^testing.T) {
     defer nuppu.entity_manager_destroy(manager)
 
     nuppu.entity_manager_init(manager)
-    nuppu.entity_manager_add_variant_data(manager, Deep_Entity, 6, {}, Sprite_Data)
+    nuppu.entity_manager_add_variant(manager, Deep_Entity, 6)
 
     h, ok := nuppu._entity_add(manager, Deep_Entity)
     testing.expect_value(t, ok, true)
@@ -130,54 +55,53 @@ test_entity_back_pointer_through_using :: proc(t: ^testing.T) {
 @(test)
 test_sprite_animation_frames :: proc(t: ^testing.T) {
     a: nuppu.Sprite_Animation
-    ga: nuppu.Sprite_Instance
-    nuppu.sprite_animation_configure(&ga, &a, 2, 2, 10.0) // 2x2 atlas, 10 fps
+    nuppu.sprite_animation_configure(&a, 2, 2, 10.0) // 2x2 atlas, 10 fps
 
-    testing.expect_value(t, ga.frame_n, u32(0))
-    testing.expect_value(t, ga.uv_min, [2]f32{0.0, 0.0})
-    testing.expect_value(t, ga.uv_max, [2]f32{0.5, 0.5})
+    testing.expect_value(t, a.frame_n, u32(0))
+    uv_min, uv_size := nuppu.sprite_animation_uv(&a)
+    testing.expect_value(t, uv_min, [2]f32{0.0, 0.0})
+    testing.expect_value(t, uv_size, [2]f32{0.5, 0.5})
 
-    nuppu.sprite_animation_advance(&ga, &a, 0.1) // exactly one frame
-    testing.expect_value(t, ga.frame_n, u32(1))
-    testing.expect_value(t, ga.uv_min, [2]f32{0.5, 0.0})
-    testing.expect_value(t, ga.uv_max, [2]f32{1.0, 0.5})
+    nuppu.sprite_animation_advance(&a, 0.1) // exactly one frame
+    testing.expect_value(t, a.frame_n, u32(1))
+    uv_min, uv_size = nuppu.sprite_animation_uv(&a)
+    testing.expect_value(t, uv_min, [2]f32{0.5, 0.0})
+    testing.expect_value(t, uv_size, [2]f32{0.5, 0.5})
 
     // Large dt must not hang and must wrap correctly.
-    nuppu.sprite_animation_advance(&ga, &a, 1_000_000.0)
-    testing.expect(t, ga.frame_n < 4, "frame_n must stay within the atlas")
+    nuppu.sprite_animation_advance(&a, 1_000_000.0)
+    testing.expect(t, a.frame_n < 4, "frame_n must stay within the atlas")
 
-    // Out-of-range frame_n is reduced and uv stays inside the atlas.
-    ga.frame_n = 9
-    nuppu.sprite_animation_advance(&ga, &a, 0)
-    testing.expect_value(t, ga.frame_n, u32(1))
-    testing.expect(t, ga.uv_max.x <= 1.0 && ga.uv_max.y <= 1.0, "uv must stay inside the atlas")
+    // Out-of-range frame_n is reduced by uv computation; rect stays in the atlas.
+    a.frame_n = 9
+    uv_min, uv_size = nuppu.sprite_animation_uv(&a)
+    testing.expect(t, uv_min.x >= 0 && uv_min.x + uv_size.x <= 1.0, "uv must stay inside the atlas")
+    testing.expect(t, uv_min.y >= 0 && uv_min.y + uv_size.y <= 1.0, "uv must stay inside the atlas")
 
     // Non-square grid: 3x2 = 6 frames, all rects inside [0,1], wraps cleanly.
     b: nuppu.Sprite_Animation
-    gb: nuppu.Sprite_Instance
-    nuppu.sprite_animation_configure(&gb, &b, 3, 2, 10.0)
+    nuppu.sprite_animation_configure(&b, 3, 2, 10.0)
     for _ in 0 ..< 6 {
-        testing.expect(t, gb.uv_max.x <= 1.0 && gb.uv_max.y <= 1.0)
-        nuppu.sprite_animation_advance(&gb, &b, 0.1)
+        bmin, bsize := nuppu.sprite_animation_uv(&b)
+        testing.expect(t, bmin.x + bsize.x <= 1.0 && bmin.y + bsize.y <= 1.0)
+        nuppu.sprite_animation_advance(&b, 0.1)
     }
-    testing.expect_value(t, gb.frame_n, u32(0))
+    testing.expect_value(t, b.frame_n, u32(0))
 
-    // fps <= 0 only re-applies the current frame.
+    // fps <= 0 leaves frame_n untouched.
     c: nuppu.Sprite_Animation
-    gc: nuppu.Sprite_Instance
-    nuppu.sprite_animation_configure(&gc, &c, 2, 2, 0)
-    gc.frame_n = 2
-    nuppu.sprite_animation_advance(&gc, &c, 1.0)
-    testing.expect_value(t, gc.frame_n, u32(2))
+    nuppu.sprite_animation_configure(&c, 2, 2, 0)
+    c.frame_n = 2
+    nuppu.sprite_animation_advance(&c, 1.0)
+    testing.expect_value(t, c.frame_n, u32(2))
 
     // Sub-frame remainder must accumulate across calls (dt not a multiple of 1/fps).
     d: nuppu.Sprite_Animation
-    gd: nuppu.Sprite_Instance
-    nuppu.sprite_animation_configure(&gd, &d, 2, 2, 4.0) // frame_dt = 0.25
-    nuppu.sprite_animation_advance(&gd, &d, 0.375) // 1 step + 0.125 remainder
-    testing.expect_value(t, gd.frame_n, u32(1))
-    nuppu.sprite_animation_advance(&gd, &d, 0.375) // 0.5 -> 2 more steps
-    testing.expect_value(t, gd.frame_n, u32(3))
+    nuppu.sprite_animation_configure(&d, 2, 2, 4.0) // frame_dt = 0.25
+    nuppu.sprite_animation_advance(&d, 0.375) // 1 step + 0.125 remainder
+    testing.expect_value(t, d.frame_n, u32(1))
+    nuppu.sprite_animation_advance(&d, 0.375) // 0.5 -> 2 more steps
+    testing.expect_value(t, d.frame_n, u32(3))
 }
 
 @(test)

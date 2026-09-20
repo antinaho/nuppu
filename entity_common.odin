@@ -38,71 +38,61 @@ move :: proc "contextless" (
     entity_move(_state.entity_manager, handle, delta)
 }
 
-// Shader-visible per-entity instance data for a sprite-sheet frame. Put this in
-// a field literally named `gpu_instance` on the entity variant; that field's
-// bytes are uploaded to the GPU every frame.
-Sprite_Instance :: struct {
-    uv_min:  [2]f32,
-    uv_max:  [2]f32,
-    frame_n: u32,
-    _pad:    u32,
-}
-#assert(size_of(Sprite_Instance) == 24)
-#assert(offset_of(Sprite_Instance, frame_n) == 16)
-
-// CPU-side sprite-sheet playback state. Keep it next to the `gpu_instance`
-// field so only the 24-byte `Sprite_Instance` is uploaded:
+// CPU-side sprite-sheet playback state. Pair it with a sprite entity and feed
+// the resulting uv rect to `submit_sprite`:
 //
 //   Sprite :: struct {
 //       using e: ^Entity,
-//       gpu_instance: Sprite_Instance,
-//       anim:         Sprite_Animation,
+//       anim: nuppu.Sprite_Animation,
 //   }
+//
+//   uv_min, uv_size := nuppu.sprite_animation_uv(&e.anim)
+//   nuppu.submit_sprite(e, uv_min, uv_size)
 Sprite_Animation :: struct {
-    elapsed:   f32,
-    fps:       f32,
-    columns:   u32,
-    rows:      u32,
+    elapsed: f32,
+    fps:     f32,
+    columns: u32,
+    rows:    u32,
+    frame_n: u32,
 }
 
-sprite_animation_configure :: proc(gpu: ^Sprite_Instance, anim: ^Sprite_Animation, columns, rows: u32, fps: f32) {
+sprite_animation_configure :: proc(anim: ^Sprite_Animation, columns, rows: u32, fps: f32) {
     anim.columns = max(columns, 1)
     anim.rows    = max(rows, 1)
     anim.fps     = fps
     anim.elapsed = 0
-    gpu.frame_n  = 0
-    _sprite_animation_apply(gpu, anim)
+    anim.frame_n = 0
 }
 
-// Advances playback by `dt` seconds and writes the current frame's uv rect.
-// O(1) in `dt`; non-finite or non-positive `dt` only re-applies the uv rect.
-sprite_animation_advance :: proc(gpu: ^Sprite_Instance, anim: ^Sprite_Animation, dt: f32) {
+// Advances playback by `dt` seconds. O(1) in `dt`; non-finite or non-positive
+// `dt` leaves `frame_n` unchanged.
+sprite_animation_advance :: proc(anim: ^Sprite_Animation, dt: f32) {
     if anim.columns == 0 || anim.rows == 0 { return }
+    if anim.fps <= 0 || dt <= 0 || math.is_nan_f32(dt) || math.is_inf_f32(dt) { return }
 
-    if anim.fps > 0 && dt > 0 && !math.is_nan_f32(dt) && !math.is_inf_f32(dt) {
-        frame_dt := 1.0 / anim.fps
-        if frame_dt > 0 {
-            anim.elapsed += dt
-            if anim.elapsed >= frame_dt {
-                steps := math.floor(f64(anim.elapsed) / f64(frame_dt))
-                anim.elapsed = f32(f64(anim.elapsed) - steps * f64(frame_dt))
-                if anim.elapsed < 0 { anim.elapsed = 0 }
-                total := u64(max(anim.columns * anim.rows, 1))
-                gpu.frame_n = u32(math.mod(f64(gpu.frame_n) + steps, f64(total)))
-            }
-        }
+    frame_dt := 1.0 / anim.fps
+    if frame_dt <= 0 { return }
+
+    anim.elapsed += dt
+    if anim.elapsed >= frame_dt {
+        steps := math.floor(f64(anim.elapsed) / f64(frame_dt))
+        anim.elapsed = f32(f64(anim.elapsed) - steps * f64(frame_dt))
+        if anim.elapsed < 0 { anim.elapsed = 0 }
+        total := u64(max(anim.columns * anim.rows, 1))
+        anim.frame_n = u32(math.mod(f64(anim.frame_n) + steps, f64(total)))
     }
-    _sprite_animation_apply(gpu, anim)
 }
 
-_sprite_animation_apply :: proc(gpu: ^Sprite_Instance, anim: ^Sprite_Animation) {
-    if anim.columns == 0 || anim.rows == 0 { return }
+// UV rect of the current frame, as (min, size).
+sprite_animation_uv :: proc(anim: ^Sprite_Animation) -> (uv_min, uv_size: [2]f32) {
+    columns := max(anim.columns, 1)
+    rows    := max(anim.rows, 1)
+    total   := columns * rows
+    frame   := anim.frame_n % total
+    col     := frame % columns
+    row     := frame / columns
 
-    total := max(anim.columns * anim.rows, 1)
-    f     := gpu.frame_n % total
-    gpu.frame_n = f
-    col   := f % anim.columns
-    row   := f / anim.columns
-    gpu.uv_min = {f32(col) / f32(anim.columns), f32(row) / f32(anim.rows)}
-    gpu.uv_max = {f32(col + 1) / f32(anim.columns), f32(row + 1) / f32(anim.rows)}
+    uv_min  = {f32(col) / f32(columns), f32(row) / f32(rows)}
+    uv_size = {1.0 / f32(columns), 1.0 / f32(rows)}
+    return
 }
