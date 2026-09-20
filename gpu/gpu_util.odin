@@ -34,6 +34,7 @@ arena_init :: proc(
         cpu = _cpu_address(_ptr) if usage == .Staging else nil,
         gpu = _gpu_address(_ptr),
         flags = usage,
+        access = .Read,
         alignment = alignment,
         total_capacity_bytes = capacity,
         byte_offset = 0,

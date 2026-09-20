@@ -59,7 +59,7 @@ _Texture :: struct {
     view:         wgpu.TextureView,
     storage_view: wgpu.TextureView, // non-nil when the texture is also used as storage
     view_dim:     wgpu.TextureViewDimension,
-    access:       wgpu.StorageTextureAccess,
+    access:       Texture_Access,
     samples:      u32,
 }
 
@@ -338,7 +338,7 @@ _shader_build_bindings :: proc(shader: ^_Shader, desc: ^Shader_Desc) {
 
     for i in 0 ..< block_count {
         b := desc.binding_blocks[i]
-        _use_parameter_block(&b, .Graphics, uint(i))
+        _use_parameter_block(b, .Graphics, uint(i))
         count := _state.parameter_count
 
         layout := wgpu.DeviceCreateBindGroupLayout(_state.device, &{
@@ -563,7 +563,7 @@ _acquire_next_swapchain :: proc() -> Texture {
         view         = view,
         storage_view = nil,
         view_dim     = ._2D,
-        access       = .WriteOnly,
+        access       = .Write,
         samples      = 1,
     }
 
@@ -625,7 +625,7 @@ _set_shader :: proc(shader: ^Shader) {
     for i in 0 ..< len(shader.block_bgs) {
         if !shader.desc.binding_blocks[i].dirty { continue }
         b := shader.desc.binding_blocks[i]
-        _use_parameter_block(&b, .Graphics, uint(i))
+        _use_parameter_block(b, .Graphics, uint(i))
         count := _state.parameter_count
         wgpu.BindGroupRelease(shader.block_bgs[i])
         shader.block_bgs[i] = _create_bind_group(shader.block_layouts[i], count, raw_data(_state.bg_entries[:count]))
@@ -690,7 +690,7 @@ _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
     }
 }
 
-_texture_init :: proc(concrete: Texture_Concrete, texture_descriptor: Texture_Descriptor) -> _Texture {
+_texture_init :: proc(concrete: Texture_Concrete, texture_descriptor: Texture_Descriptor, access: Texture_Access) -> _Texture {
     depth_or_layers := concrete.layers
     switch concrete.view {
     case ._1D:
@@ -760,7 +760,7 @@ _texture_init :: proc(concrete: Texture_Concrete, texture_descriptor: Texture_De
         view         = view,
         storage_view = storage_view,
         view_dim     = view_dim,
-        access       = _texture_access_interop(concrete.usage),
+        access       = access,
         samples      = u32(concrete.samples),
     }
 }
@@ -942,154 +942,124 @@ _gpu_address :: proc(p: _ptr) -> rawptr {
     return nil
 }
 
-_use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination, slot: uint) {
+_use_parameter_block :: proc(block: Resource_Block, destination: Parameter_Block_Destination, slot: uint) {
     _ = slot
 
     bg_layout_entries := &_state.bg_layout_entries
     bg_entries := &_state.bg_entries
     count: u32
 
-    for C in block.constants {
-        if C.native.buffer == nil { continue }
-
-        bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-            binding    = u32(count),
-            visibility = {.Vertex, .Fragment, .Compute},
-            buffer = wgpu.BufferBindingLayout{
-                type             = .Uniform,
-                hasDynamicOffset = false,
-                minBindingSize   = 0,
-            },
-        }
-
-        bg_entries[count] = wgpu.BindGroupEntry{
-            binding = u32(count),
-            buffer  = C.buffer,
-            offset  = u64(C.byte_offset),
-            size    = max(u64(C.total_capacity_bytes), u64(_state.uniform_offset_align)),
-        }
-
-        count += 1
+    visibility: wgpu.ShaderStageFlags = {.Vertex, .Fragment}
+    if destination == .Compute {
+        visibility = {.Compute}
     }
 
-    for R, res_idx in block.read_resources {
-        switch res in R {
+    for R, res_idx in block.resources {
+        switch r in R {
         case ptr:
-            if res.native.buffer == nil { continue }
+            if r.native.buffer == nil { continue }
+
+            is_uniform := r.flags == .Constant
+
+            binding_type: wgpu.BufferBindingType = .Uniform
+            min_size: u64
+            if !is_uniform {
+                binding_type = .Storage if r.access == .Read_Write else .ReadOnlyStorage
+                if res_idx < len(block._resource_size) {
+                    min_size = u64(block._resource_size[res_idx])
+                }
+            }
 
             bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
                 binding    = u32(count),
-                visibility = {.Vertex, .Fragment, .Compute},
+                visibility = visibility,
                 buffer = wgpu.BufferBindingLayout{
-                    type             = .ReadOnlyStorage,
+                    type             = binding_type,
                     hasDynamicOffset = false,
-                    minBindingSize   = u64(block.read_resource_min_sizes[res_idx]),
+                    minBindingSize   = min_size,
                 },
+            }
+
+            size := r.total_capacity_bytes
+            if is_uniform {
+                size = max(size, uint(_state.uniform_offset_align))
             }
 
             bg_entries[count] = wgpu.BindGroupEntry{
                 binding = u32(count),
-                buffer  = res.buffer,
-                offset  = u64(res.byte_offset),
-                size    = u64(res.total_capacity_bytes),
+                buffer  = r.buffer,
+                offset  = u64(r.byte_offset),
+                size    = u64(size),
             }
 
             count += 1
+
         case Texture:
-            if res.native.texture == nil { continue }
+            if r.native.texture == nil { continue }
 
-            bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                binding = u32(count),
-                visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
-                texture = wgpu.TextureBindingLayout{
-                    sampleType    = _texture_sample_type_interop(wgpu.TextureGetFormat(res.native.texture), res.native.samples),
-                    viewDimension = res.native.view_dim,
-                    multisampled  = res.native.samples > 1,
-                },
-            }
+            if r.concrete.usage.storage_read || r.concrete.usage.storage_write {
+                storage_view := r.native.storage_view
+                storage_dim  := r.native.view_dim
+                if storage_view != nil {
+                    #partial switch r.native.view_dim {
+                    case .Cube, .CubeArray:
+                        storage_dim = ._2DArray
+                    }
+                } else {
+                    storage_view = r.native.view
+                }
 
-            bg_entries[count] = wgpu.BindGroupEntry{
-                binding = u32(count),
-                textureView = res.native.view,
-            }
+                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                    binding    = u32(count),
+                    visibility = visibility,
+                    storageTexture = wgpu.StorageTextureBindingLayout{
+                        access        = _storage_access_interop(r.native.access),
+                        format        = wgpu.TextureGetFormat(r.native.texture),
+                        viewDimension = storage_dim,
+                    },
+                }
 
-            count += 1
-        }
-    }
-
-    for RW in block.read_write_resources {
-        switch res in RW {
-        case ptr:
-            if res.native.buffer == nil { continue }
-
-            bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                binding    = u32(count),
-                visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
-                buffer = wgpu.BufferBindingLayout{
-                    type             = .Storage,
-                    hasDynamicOffset = false,
-                    minBindingSize   = 0,
-                },
-            }
-
-            bg_entries[count] = wgpu.BindGroupEntry{
-                binding = u32(count),
-                buffer  = res.buffer,
-                offset  = u64(res.byte_offset),
-                size    = u64(res.total_capacity_bytes),
-            }
-
-            count += 1
-        case Texture:
-            if res.native.texture == nil { continue }
-
-            storage_view := res.native.storage_view
-            storage_dim  := res.native.view_dim
-            if storage_view != nil {
-                #partial switch res.native.view_dim {
-                case .Cube, .CubeArray:
-                    storage_dim = ._2DArray
+                bg_entries[count] = wgpu.BindGroupEntry{
+                    binding     = u32(count),
+                    textureView = storage_view,
                 }
             } else {
-                storage_view = res.native.view
+                bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
+                    binding    = u32(count),
+                    visibility = visibility,
+                    texture = wgpu.TextureBindingLayout{
+                        sampleType    = _texture_sample_type_interop(wgpu.TextureGetFormat(r.native.texture), r.native.samples),
+                        viewDimension = r.native.view_dim,
+                        multisampled  = r.native.samples > 1,
+                    },
+                }
+
+                bg_entries[count] = wgpu.BindGroupEntry{
+                    binding     = u32(count),
+                    textureView = r.native.view,
+                }
             }
 
+            count += 1
+
+        case Sampler:
+            if r.native.s == nil { continue }
+
             bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-                binding = u32(count),
-                visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
-                storageTexture = wgpu.StorageTextureBindingLayout{
-                    access = res.native.access,
-                    format = wgpu.TextureGetFormat(res.native.texture),
-                    viewDimension = storage_dim,
+                binding    = u32(count),
+                visibility = visibility,
+                sampler = wgpu.SamplerBindingLayout{
+                    type = .Filtering,
                 },
             }
 
             bg_entries[count] = wgpu.BindGroupEntry{
                 binding = u32(count),
-                textureView = storage_view,
+                sampler = r.native.s,
             }
 
             count += 1
         }
-    }
-    
-    for S in block.samplers {
-        if S.native.s == nil { continue }
-
-        bg_layout_entries[count] = wgpu.BindGroupLayoutEntry{
-            binding = u32(count),
-            visibility = {.Vertex, .Fragment} if destination == .Graphics else {.Compute},
-            sampler = wgpu.SamplerBindingLayout{
-                type = .Filtering,
-            },
-        }
-
-        bg_entries[count] = wgpu.BindGroupEntry{
-            binding = u32(count),
-            sampler = S.native.s,
-        }
-
-        count += 1
     }
 
     _state.parameter_count = count
@@ -1340,13 +1310,13 @@ _texture_usage_interop :: proc(usage: Texture_Usage_Info) -> wgpu.TextureUsageFl
     return flags
 }
 
-_texture_access_interop :: proc(usage: Texture_Usage_Info) -> wgpu.StorageTextureAccess {
-    switch {
-    case usage.storage_read && usage.storage_write: return .ReadWrite
-    case usage.storage_write:                       return .WriteOnly
-    case usage.storage_read:                        return .ReadOnly
+_storage_access_interop :: proc(access: Texture_Access) -> wgpu.StorageTextureAccess {
+    switch access {
+    case .Read:       return .ReadOnly
+    case .Write:      return .WriteOnly
+    case .Read_Write: return .ReadWrite
     }
-    return .WriteOnly
+    unreachable()
 }
 
 _texture_sample_type_interop :: proc(format: wgpu.TextureFormat, samples: u32) -> wgpu.TextureSampleType {

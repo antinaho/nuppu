@@ -444,8 +444,8 @@ _set_shader :: proc(shader: ^Shader) {
     _state.curr_shader_valid = true
 
     _state.render_command_encoder->setRenderPipelineState(shader.pipeline)
-    for &block, I in shader.desc.binding_blocks {
-        _bind_parameter_block(&block, I)
+    for block, I in shader.desc.binding_blocks {
+        _bind_parameter_block(block, I)
     }
 }
 
@@ -506,7 +506,9 @@ _sampler_init :: proc(desc: Sampler_Descriptor) -> _Sampler {
     return _state.device->newSamplerState(sampler_desc)
 }
 
-_texture_init :: proc(concrete: Texture_Concrete, texture_descriptor: Texture_Descriptor) -> _Texture {
+_texture_init :: proc(concrete: Texture_Concrete, texture_descriptor: Texture_Descriptor, access: Texture_Access) -> _Texture {
+    _ = access
+
     desc := MTL.TextureDescriptor.alloc()->init()
     defer desc->release()
 
@@ -677,46 +679,25 @@ _min_alignment :: proc(flags: Buffer_Usage) -> uint {
 
 // Pure: builds the flat GPU-address table in binding order (constants, read,
 // read/write, samplers). No encoder required.
-_resource_table :: proc(block: Parameter_Block) -> ([MAX_LAYOUT_BINDINGS]uintptr, u32) {
+_resource_table :: proc(block: Resource_Block) -> ([MAX_LAYOUT_BINDINGS]uintptr, u32) {
     table: [MAX_LAYOUT_BINDINGS]uintptr
     n: u32
 
-    for C in block.constants {
-        if C.native.buffer == nil { continue }
-        table[n] = uintptr(C.gpu)
-        n += 1
-    }
-
-    for R in block.read_resources {
-        switch res in R {
+    for R in block.resources {
+        switch r in R {
         case ptr:
-            if res.native.buffer == nil { continue }
-            table[n] = uintptr(res.gpu)
+            if r.native.buffer == nil { continue }
+            table[n] = uintptr(r.gpu)
             n += 1
         case Texture:
-            if res.native.texture == nil { continue }
-            table[n] = uintptr(res.native.texture->gpuResourceID())
+            if r.native.texture == nil { continue }
+            table[n] = uintptr(r.native.texture->gpuResourceID())
+            n += 1
+        case Sampler:
+            if r.native == nil { continue }
+            table[n] = uintptr(r.native->gpuResourceID())
             n += 1
         }
-    }
-
-    for RW in block.read_write_resources {
-        switch res in RW {
-        case ptr:
-            if res.native.buffer == nil { continue }
-            table[n] = uintptr(res.gpu)
-            n += 1
-        case Texture:
-            if res.native.texture == nil { continue }
-            table[n] = uintptr(res.native.texture->gpuResourceID())
-            n += 1
-        }
-    }
-
-    for S in block.samplers {
-        if S.native == nil { continue }
-        table[n] = uintptr(S.native->gpuResourceID())
-        n += 1
     }
 
     assert(n <= MAX_LAYOUT_BINDINGS, "_resource_table: too many bindings")
@@ -725,37 +706,27 @@ _resource_table :: proc(block: Parameter_Block) -> ([MAX_LAYOUT_BINDINGS]uintptr
 
 // Marks every resource resident for the current render encoder and pushes the
 // block's address table at `buffer_index` with one call per stage.
-_bind_parameter_block :: proc(block: ^Parameter_Block, #any_int buffer_index: uint) {
+_bind_parameter_block :: proc(block: Resource_Block, #any_int buffer_index: uint) {
     assert(_state.render_command_encoder != nil, "_bind_parameter_block: no render pass is active")
-    if block == nil { return }
 
-    table, count := _resource_table(block^)
+    table, count := _resource_table(block)
     if count == 0 { return }
 
-    for C in block.constants {
-        if C.native.buffer == nil { continue }
-        _state.render_command_encoder->useResourceWithStages(C.native.buffer, {.Read}, {.Vertex, .Fragment})
-    }
-
-    for R in block.read_resources {
-        switch res in R {
+    for R in block.resources {
+        switch r in R {
         case ptr:
-            if res.native.buffer == nil { continue }
-            _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read}, {.Vertex, .Fragment})
+            if r.native.buffer == nil { continue }
+            switch r.access {
+            case .Read:
+                _state.render_command_encoder->useResourceWithStages(r.native.buffer, {.Read}, {.Vertex, .Fragment})
+            case .Read_Write:
+                _state.render_command_encoder->useResourceWithStages(r.native.buffer, {.Read, .Write}, {.Vertex, .Fragment})
+            }
         case Texture:
-            if res.native.texture == nil { continue }
-            _state.render_command_encoder->useResourceWithStages(res.native.texture, res.native.resource_usage, {.Vertex, .Fragment})
-        }
-    }
-
-    for RW in block.read_write_resources {
-        switch res in RW {
-        case ptr:
-            if res.native.buffer == nil { continue }
-            _state.render_command_encoder->useResourceWithStages(res.native.buffer, {.Read, .Write}, {.Vertex, .Fragment})
-        case Texture:
-            if res.native.texture == nil { continue }
-            _state.render_command_encoder->useResourceWithStages(res.native.texture, res.native.resource_usage, {.Vertex, .Fragment})
+            if r.native.texture == nil { continue }
+            _state.render_command_encoder->useResourceWithStages(r.native.texture, r.native.resource_usage, {.Vertex, .Fragment})
+        case Sampler:
+            /* no op */
         }
     }
 
@@ -766,38 +737,29 @@ _bind_parameter_block :: proc(block: ^Parameter_Block, #any_int buffer_index: ui
 
 // Low-level block bind used by the compute path. Graphics go through
 // _set_shader / _bind_parameter_block.
-_use_parameter_block :: proc(block: ^Parameter_Block, destination: Parameter_Block_Destination, slot: uint) {
-    table, count := _resource_table(block^)
+_use_parameter_block :: proc(block: Resource_Block, destination: Parameter_Block_Destination, slot: uint) {
+    table, count := _resource_table(block)
 
     if destination == .Graphics {
         _bind_parameter_block(block, slot)
         return
     }
 
-    for C in block.constants {
-        if C.native.buffer == nil { continue }
-        _compute_command_encoder()->useResource(C.native.buffer, {.Read})
-    }
-
-    for R in block.read_resources {
-        switch res in R {
+    for R in block.resources {
+        switch r in R {
         case ptr:
-            if res.native.buffer == nil { continue }
-            _compute_command_encoder()->useResource(res.native.buffer, {.Read})
+            if r.native.buffer == nil { continue }
+            switch r.access {
+            case .Read:
+                _compute_command_encoder()->useResource(r.native.buffer, {.Read})
+            case .Read_Write:
+                _compute_command_encoder()->useResource(r.native.buffer, {.Read, .Write})
+            }
         case Texture:
-            if res.native.texture == nil { continue }
-            _compute_command_encoder()->useResource(res.native.texture, res.native.resource_usage)
-        }
-    }
-
-    for RW in block.read_write_resources {
-        switch res in RW {
-        case ptr:
-            if res.native.buffer == nil { continue }
-            _compute_command_encoder()->useResource(res.native.buffer, {.Read, .Write})
-        case Texture:
-            if res.native.texture == nil { continue }
-            _compute_command_encoder()->useResource(res.native.texture, res.native.resource_usage)
+            if r.native.texture == nil { continue }
+            _compute_command_encoder()->useResource(r.native.texture, r.native.resource_usage)
+        case Sampler:
+            /* no op */
         }
     }
 

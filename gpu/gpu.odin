@@ -78,24 +78,16 @@ State :: struct #align(64) {
     name_arena: mem.Dynamic_Arena,
 }
 
-// Mimics ParameterBlock from slang. `dirty` marks array contents changed since
-// the last bind; set by `update_parameter_block`, cleared by `set_shader`.
-Parameter_Block :: struct {
-    constants           : [MAX_CONSTANT_BUFFERS]ptr,
-    read_resources      : [MAX_READ_RESOURCE]Parameter_Resource,
-    read_write_resources: [MAX_READ_WRITE_RESOURCES]Parameter_Resource,
-    samplers            : [MAX_SAMPLERS]Sampler,
-
-    // Minimum bytes a read resource must bind, per slot; 0 means unspecified.
-    // WGPU bakes this into the bind group layout's `minBindingSize`.
-    read_resource_min_sizes: [MAX_READ_RESOURCE]uint,
-
+Resource_Block :: struct {
+    resources: []Resource,
     dirty: bool,
+    _resource_size: []uint, // wgpu
 }
 
-Parameter_Resource :: union {
+Resource :: union {
     ptr,
     Texture,
+    Sampler,
 }
 
 Parameter_Block_Destination :: enum {
@@ -108,6 +100,7 @@ ptr :: struct #all_or_none {
     gpu                 : rawptr,
 
     flags               : Buffer_Usage,
+    access              : Buffer_Access,
     alignment           : uint,
     total_capacity_bytes: uint,
     byte_offset         : uint,
@@ -154,7 +147,7 @@ Shader_Desc :: struct {
     topology:    Primitive,
 
     // Parameter blocks bound at backend slots 0..N, in order.
-    binding_blocks: []Parameter_Block,
+    binding_blocks: []Resource_Block,
 }
 
 #assert(u16(Cull_Mode.Back) <= 0b11)
@@ -336,6 +329,15 @@ Texture_Descriptor :: struct {
 Storage_Mode :: enum u8 {
     Shared,
     Private,
+}
+
+// Storage access a texture is bound with. Only meaningful when the descriptor
+// usage contains Storage_Read/Storage_Write; sampled is implied by the usage
+// flag. Backends that do not need a bind-group layout (Metal) ignore it.
+Texture_Access :: enum u8 {
+    Read,
+    Write,
+    Read_Write,
 }
 
 // The dimension a texture is bound as, derived from its type.
@@ -669,29 +671,13 @@ set_shader :: proc(shader: ^Shader) {
 // untouched) and marks it so the next `set_shader` rebinds. No-ops when the
 // provided arrays already match.
 update_parameter_block :: proc(
-    block: ^Parameter_Block,
-    read_resources: []Parameter_Resource = nil,
-    constants: []ptr = nil,
-    read_write_resources: []Parameter_Resource = nil,
-    samplers: []Sampler = nil,
+    block: ^Resource_Block,
+    resources: []Resource,
 ) {
     changed := false
 
-    if read_resources != nil {
-        assert(len(read_resources) <= MAX_READ_RESOURCE, "update_parameter_block: too many read resources")
-        if _update_parameter_array(block.read_resources[:], read_resources) { changed = true }
-    }
-    if constants != nil {
-        assert(len(constants) <= MAX_CONSTANT_BUFFERS, "update_parameter_block: too many constants")
-        if _update_parameter_array(block.constants[:], constants) { changed = true }
-    }
-    if read_write_resources != nil {
-        assert(len(read_write_resources) <= MAX_READ_WRITE_RESOURCES, "update_parameter_block: too many read-write resources")
-        if _update_parameter_array(block.read_write_resources[:], read_write_resources) { changed = true }
-    }
-    if samplers != nil {
-        assert(len(samplers) <= MAX_SAMPLERS, "update_parameter_block: too many samplers")
-        if _update_parameter_array(block.samplers[:], samplers) { changed = true }
+    if _update_parameters(block.resources, resources) {
+        changed = true
     }
 
     if changed {
@@ -701,7 +687,7 @@ update_parameter_block :: proc(
 
 // Copies `src` over `dst` when they differ, clearing dst's tail. Returns whether
 // anything changed.
-_update_parameter_array :: proc(dst: []$T, src: []T) -> bool {
+_update_parameters :: proc(dst: []$T, src: []T) -> bool {
     for v, i in src {
         if dst[i] != v {
             for &d in dst { d = {} }
@@ -729,9 +715,9 @@ sampler_deinit :: proc(sampler: ^Sampler) {
     _release_sampler(sampler)
 }
 
-texture_init :: proc(desc: Texture_Descriptor) -> Texture {
+texture_init :: proc(desc: Texture_Descriptor, access: Texture_Access = .Read) -> Texture {
     concrete := texture_concrete(desc)
-    native := _texture_init(concrete, desc)
+    native := _texture_init(concrete, desc, access)
 
     return Texture {
         concrete = concrete,
@@ -765,10 +751,16 @@ draw_indexed :: proc(index_buffer: ptr, index_count: uint, index_offset: uint, i
     _draw_indexed(index_buffer, index_count, index_offset, instance_count, base_vertex, base_instance)
 }
 
+Buffer_Access :: enum u8 {
+    Read,
+    Read_Write,
+}
+
 malloc :: proc(
     #any_int bytes: uint,
     alignment:   uint,
     flag: Buffer_Usage,
+    access:      Buffer_Access = .Read,
     name:        string     = "",
     loc:                    = #caller_location,
 ) -> (ptr, bool) #optional_ok {
@@ -787,6 +779,7 @@ malloc :: proc(
         cpu    = _cpu_address(_ptr) if flag == .Staging else nil,
         gpu    = _gpu_address(_ptr),
         flags = flag,
+        access = access,
         alignment = alignment,
         total_capacity_bytes = capacity,
         byte_offset = 0,
@@ -804,7 +797,7 @@ copy :: _copy
 // compute dispatch path. `slot` is the backend buffer or
 // bind-group index to bind at.
 use_parameter_block :: proc(
-    block: ^Parameter_Block,
+    block: Resource_Block,
     destination: Parameter_Block_Destination = .Graphics,
     slot: uint = 0,
 ) {
