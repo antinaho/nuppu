@@ -292,7 +292,7 @@ _batcher_layout_buffer :: proc($I: typeid) -> gpu.ptr {
     if !found {
         capacity := uint(MAX_INSTANCES_PER_TYPE)
         bytes    := uint(FRAMES_IN_FLIGHT) * capacity * size_of(I)
-        buffer, ok := gpu.malloc(bytes, 256, .Default, "Instance")
+        buffer, ok := gpu.malloc(bytes, 256, .Default, .Read, "Instance")
         assert(ok, "_batcher_layout_buffer: failed to alloc instance buffer")
 
         submission = Submission {
@@ -334,10 +334,9 @@ _submit :: proc(instance: $I, key: Draw_Sort_Key) {
 
 // Builds the draw sort key for an entity's material + mesh.
 _entity_sort_key :: proc(e: ^Entity, position: [3]f32, extra_sort: u8) -> Draw_Sort_Key {
-    shader := material_shader_of(e.material)
-    queue := material_queue_of(e.material)
-    depth := queue == .Transparent ? _depth_sort_value(position) : 0
-    return draw_sort_key(queue, depth, shader, e.mesh, e.material, extra_sort)
+    record := material_record(e.material)
+    depth := record.queue == .Transparent ? _depth_sort_value(position) : 0
+    return draw_sort_key(record.queue, depth, record.shader, e.mesh, e.material, extra_sort)
 }
 
 // Public entry point for user-defined instance layouts. `instance` is any
@@ -524,15 +523,14 @@ flush_culled_instances :: proc(frame: Frame) {
         }
 
         if is_last || !same_run {
-            shader := material_shader_of(material)
-            draw_state := material_draw_state_of(material)
+            record := material_record(material)
             mesh_handle, mesh_ok := get_mesh_by_index(mesh_index)
             if mesh_ok {
                 append(&batcher.draw_commands, Draw_Command {
                     mesh           = mesh_handle,
-                    shader         = shader,
+                    shader         = record.shader,
                     material       = material,
-                    draw_state     = draw_state,
+                    draw_state     = record.state,
                     buffer         = submission.buffer,
                     base_instance  = uint(f) * submission.capacity + run_start_cursor,
                     instance_count = cursor - run_start_cursor + 1,
@@ -578,12 +576,28 @@ draw_all_instances :: proc(frame: Frame) {
         // Swap this draw's instance buffer into the shader's graphics block
         // (set 1) and bind the material's resources (set 3). The engine block
         // (set 0) is static; both setters no-op when unchanged.
-        graphics_resources := [2]gpu.Parameter_Resource {
+        graphics_resources := [2]gpu.Resource {
             cmd.buffer,
             _state.material_library.private_material_buffer,
         }
         gpu.update_parameter_block(&shader.desc.binding_blocks[SHADER_BLOCK_GRAPHICS], graphics_resources[:])
-        gpu.update_parameter_block(&shader.desc.binding_blocks[SHADER_BLOCK_MATERIAL], material_bindings_of(cmd.material))
+        r := material_bindings_of(cmd.material)
+        res := make([dynamic]gpu.Resource, 0, len(r), allocator = context.temp_allocator)
+        for H in r {
+            switch h in H {
+            case Texture_Handle:
+                tex, ok := get_texture(h)
+                assert(ok, "draw_all_instances: invalid texture handle")
+                append(&res, tex^)
+            case Sampler_Handle:
+                panic("Cant be in material")
+            case Buffer_Handle:
+                buf, ok := buffer_get(h)
+                assert(ok, "draw_all_instances: invalid buffer handle")
+                append(&res, buf^)
+            }
+        }
+        gpu.update_parameter_block(&shader.desc.binding_blocks[SHADER_BLOCK_MATERIAL], res[:])
         gpu.set_shader(shader)
 
         gpu.set_draw_state(cmd.draw_state)

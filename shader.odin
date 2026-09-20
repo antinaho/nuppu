@@ -32,6 +32,12 @@ Shader_Library :: struct {
     __shader_handles: [dynamic]Shader_Handle, // debug-only, for leak reports
 }
 
+Resource_Handle :: union {
+    Texture_Handle,
+    Sampler_Handle,
+    Buffer_Handle,
+}
+
 Shader_Desc :: struct {
     vertex_code:    string,
     vertex_entry:   string,
@@ -45,10 +51,7 @@ Shader_Desc :: struct {
     multisample: gpu.Multisample_State,
     topology:    gpu.Primitive,
 
-    shader_resources: struct {
-        textures: []Texture_Handle,
-        samplers: []Sampler_Handle,
-    },
+    shader_resources: []Resource_Handle,
 }
 
 
@@ -80,19 +83,24 @@ NUPPU_shader_lib_deinit :: proc(lib: ^Shader_Library) {
     lib^ = {}
 }
 
-material_binding_block :: proc(material: Material_Handle) -> gpu.Parameter_Block {
-    block: gpu.Parameter_Block
+material_binding_block :: proc(material: Material_Handle, allocator: runtime.Allocator) -> gpu.Resource_Block {
+    block: gpu.Resource_Block
+    handles := material_bindings_of(material)
+    
+    block.resources = make([]gpu.Resource, len(handles), allocator = allocator)
 
-    assert(is_base_material(material), "material_binding_block: material must be a base material")
-
-    res := material_bindings_of(material)
-
-    for r, i in res {
-        switch res_type in r {
-        case Texture:
-            block.read_resources[i] = res_type
-        case gpu.ptr:
-            block.read_resources[i] = res_type
+    for H, i in handles {
+        switch r in H {
+        case Texture_Handle:
+            tex, ok := get_texture(r)
+            assert(ok, "material_binding_block: invalid texture handle")
+            block.resources[i] = tex^
+        case Buffer_Handle:
+            buf, ok := buffer_get(r)
+            assert(ok, "material_binding_block: invalid buffer handle")
+            block.resources[i] = buf^
+        case Sampler_Handle:
+            panic("Cant be per material material")
         }
     }
 
@@ -101,23 +109,26 @@ material_binding_block :: proc(material: Material_Handle) -> gpu.Parameter_Block
 
 // Composes a shader's local block (set 1) must match the shader file
 shader_constant_block :: proc(
-    textures: []Texture_Handle,
-    samplers: []Sampler_Handle,
-) -> gpu.Parameter_Block {
-    block: gpu.Parameter_Block
+    resource_handles: []Resource_Handle,
+) -> gpu.Resource_Block {
+    block: gpu.Resource_Block
+    block.resources = make([]gpu.Resource, len(resource_handles), allocator = context.allocator)
 
-    assert(len(textures) <= gpu.MAX_READ_RESOURCE, "shader_local_block: too many textures")
-    for tex_handle, i in textures {
-        tex, ok := get_texture(tex_handle)
-        assert(ok, "shader_local_block: invalid texture handle")
-        block.read_resources[i] = tex^
-    }
-
-    assert(len(samplers) <= gpu.MAX_SAMPLERS, "shader_local_block: too many samplers")
-    for s_handle, i in samplers {
-        s, ok := sampler_get(s_handle)
-        assert(ok, "shader_local_block: invalid sampler handle")
-        block.samplers[i] = s^
+    for RH, i in resource_handles {
+        switch h in RH {
+        case Texture_Handle:
+            tex, ok := get_texture(h)
+            assert(ok, "shader_local_block: invalid texture handle")
+            block.resources[i] = tex^
+        case Sampler_Handle:
+            s, ok := sampler_get(h)
+            assert(ok, "shader_local_block: invalid sampler handle")
+            block.resources[i] = s^
+        case Buffer_Handle:
+            buf, ok := buffer_get(h)
+            assert(ok, "shader_local_block: invalid buffer handle")
+            block.resources[i] = buf^
+        }
     }
 
     return block
@@ -136,28 +147,34 @@ connect_materials_to_shader :: proc(mats: []Material_Handle, shader: Shader_Hand
 }
 
 @(require_results)
-shader_register :: proc(desc: Shader_Desc, $I: typeid, base_material: Material_Handle, name: string = "", loc := #caller_location) -> (Shader_Handle, bool) #optional_ok {
+shader_register :: proc(
+    desc: Shader_Desc, 
+    $I: typeid, 
+    base_material: Material_Handle, 
+    name: string = "", 
+    loc := #caller_location
+) -> (Shader_Handle, bool) #optional_ok {
     lib := &_state.shader_library
 
     // Base material used as a interface on creating the shaders bindings
     assert(is_base_material(base_material), "shader_register: material must be a base material")
     assert(size_of(I) % INSTANCE_SIZE_ALIGN == 0, "shader_register: instance layout must be a multiple of 16 bytes")
     
-    material_block := material_binding_block(base_material)
-    local_block := shader_constant_block(
-            desc.shader_resources.textures,
-            desc.shader_resources.samplers,
-        )
+    material_block := material_binding_block(base_material, context.allocator)
+    local_block := shader_constant_block(desc.shader_resources)
 
     // Instance + material block (set 1). The instance type registers this
     // layout's buffer so WGPU can build the block from a concrete resource,
     // the same way the material block is built from the base material.
-    graphics_block: gpu.Parameter_Block
-    graphics_block.read_resources[0] = _batcher_layout_buffer(I)
-    graphics_block.read_resources[1] = _state.material_library.private_material_buffer
-    graphics_block.read_resource_min_sizes[0] = uint(size_of(I))
+    resources := make([]gpu.Resource, 2, allocator = context.allocator)
+    resources[0] = _batcher_layout_buffer(I)
+    resources[1] = _state.material_library.private_material_buffer
+    graphics_block := gpu.Resource_Block {
+        resources = resources,
+        _resource_size = { uint(size_of(I)) },
+    }
 
-    binding_blocks := make([dynamic]gpu.Parameter_Block, allocator = lib.table.allocator)
+    binding_blocks := make([dynamic]gpu.Resource_Block, allocator = context.allocator)
     append(&binding_blocks, _state.engine_block, graphics_block, local_block, material_block)
 
     shader := gpu.shader_init(gpu.Shader_Desc {

@@ -88,13 +88,14 @@ State :: struct #align(64) {
 
     mesh_library: Mesh_Library,
     frame_uniform: gpu.ptr,
-    engine_block: gpu.Parameter_Block,
+    engine_block: gpu.Resource_Block,
 
     draw_batcher: Draw_Batcher,
     material_library: Material_Library,
     shader_library: Shader_Library,
     texture_library: Texture_Library,
     sampler_library: Sampler_Library,
+    buffer_library: Buffer_Library,
 
     frame_semaphore: gpu.Timeline_Semaphore,
     frame_arenas: [FRAMES_IN_FLIGHT]gpu.Arena,
@@ -275,6 +276,7 @@ deinit :: proc() {
     NUPPU_sampler_library_deinit(&_state.sampler_library)
     NUPPU_mesh_library_deinit(&_state.mesh_library)
     NUPPU_texture_library_deinit(&_state.texture_library)
+    NUPPU_buffer_lib_deinit(&_state.buffer_library)
 
     for i in 0 ..< FRAMES_IN_FLIGHT {
         gpu.release_ptr(&_state.frame_arenas[i].ptr)
@@ -694,6 +696,16 @@ _ready_up :: proc() {
     _state.window_size = platform.window_size_pixel()
     gpu.resize_swapchain(u32(_state.window_size.x), u32(_state.window_size.y))
 
+    buff_err := NUPPU_buffer_lib_init(&_state.buffer_library)
+    switch buff_err {
+    case .Out_Of_Memory:
+        panic("Failed to allocate required resources for buffer library")
+    case .Invalid_Pointer, .Invalid_Argument, .Mode_Not_Implemented:
+        panic("Failed to allocate required resources for buffer library")
+    case .None:
+        log.info("buffer library init ok")
+    }
+
     texture_err := NUPPU_texture_library_init(&_state.texture_library)
     switch texture_err {
     case .Out_Of_Memory:
@@ -735,7 +747,7 @@ _ready_up :: proc() {
         log.info("mesh library init ok")
     }
 
-    _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), 256, .Constant, "Frame Uniform")
+    _state.frame_uniform, _ = gpu.malloc(size_of(Engine_Uniform), 256, .Constant, .Read, "Frame Uniform")
 
     sampler_err := NUPPU_sampler_library_init(&_state.sampler_library)
     switch sampler_err {
@@ -770,9 +782,10 @@ _ready_up :: proc() {
     }
 
     // Shared engine block (slot 0) every shader reads from.
+    _state.engine_block.resources = make([]gpu.Resource, 2, allocator = context.allocator)
     {
-        _state.engine_block.constants[0] = _state.frame_uniform
-        _state.engine_block.read_resources[0] = _state.mesh_library.vertex_arena.ptr
+        _state.engine_block.resources[0] = _state.frame_uniform
+        _state.engine_block.resources[1] = _state.mesh_library.vertex_arena.ptr
     }
 
     create_built_in_shaders_and_materials()
@@ -810,12 +823,12 @@ create_built_in_shaders_and_materials :: proc() {
     mat_scope := material_upload_scope()
     mat, mat_ok := material_upload(
         &mat_scope, DEFAULT_DRAW_STATE, &params,
-        .Opaque, { material_texture(white_2x2) }, "sprite",
+        .Opaque, { white_2x2 }, "sprite",
     )
     assert(mat_ok, "8-Sprite: failed to upload material")
     material_upload_scope_end(&mat_scope)
 
-    shader, shader_ok := shader_register({
+    shader, shader_ok := shader_register(Shader_Desc {
         vertex_code    = string(vertex_code),
         vertex_entry   = "vertexMain",
         fragment_code  = string(fragment_code),
@@ -825,9 +838,7 @@ create_built_in_shaders_and_materials :: proc() {
         blend          = gpu.ALPHA_BLEND,
         multisample    = { count = 1, mask = 0xFFFFFFFF },
         topology       = .Triangle,
-        shader_resources = {
-            samplers = { default_sampler() },
-        },
+        shader_resources = { default_sampler() },
     }, Sprite_Instance, mat, "sprite_shader")
     assert(shader_ok, "8-Sprite: failed to register shader")
     connect_materials_to_shader({mat}, shader)

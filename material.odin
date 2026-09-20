@@ -28,13 +28,6 @@ Material_Constant :: struct #align(16) {
 Material_Handle :: distinct Handle(MATERIAL_HANDLE_RAW)
 MATERIAL_NIL    :: Material_Handle{}
 
-// Resolves an engine texture handle into a material resource.
-material_texture :: proc(handle: Texture_Handle) -> gpu.Parameter_Resource {
-    tex, ok := get_texture(handle)
-    assert(ok, "material_texture: invalid texture handle")
-    return tex^
-}
-
 // Render order bucket a material belongs to. Opaque draws are batched purely by
 // pipeline; Transparent draws are depth-sorted back-to-front.
 Render_Queue :: enum u8 {
@@ -51,7 +44,7 @@ Material_Record :: struct {
     shader:   Shader_Handle,
     state:    Draw_State,
     queue:    Render_Queue,
-    bindings: [dynamic]gpu.Parameter_Resource,
+    bindings: [dynamic]Resource_Handle,
 }
 
 get_built_in_material :: proc(mat: Built_In_Material) -> Material_Handle {
@@ -72,7 +65,7 @@ NUPPU_material_lib_init :: proc(lib: ^Material_Library, allocator := context.all
     ok: bool
     lib.private_material_buffer, ok = gpu.malloc(
         u32(MAX_MATERIALS * size_of(Material_Constant)),
-        256, .Default, "Material Buffer",
+        256, .Default, .Read, "Material Buffer",
     )
     assert(ok, "material_lib_init: failed to alloc material buffer")
 
@@ -139,7 +132,7 @@ material_upload :: proc(
     state: Draw_State,
     data: ^$M,
     queue: Render_Queue = .Opaque,
-    bindings: []gpu.Parameter_Resource = nil,
+    bindings: []Resource_Handle,
     name: string = "",
     loc := #caller_location,
 ) -> (Material_Handle, bool) #optional_ok {
@@ -268,8 +261,14 @@ material_queue_of      :: proc "contextless" (handle: Material_Handle) -> Render
     return _state.material_library.table.items[int(idx)].queue
 }
 
-material_bindings_of :: proc "contextless" (handle: Material_Handle) -> []gpu.Parameter_Resource {
+material_bindings_of :: proc "contextless" (handle: Material_Handle) -> []Resource_Handle {
     idx, ok := material_handle_unpack(handle)
     if !ok { return nil }
     return _state.material_library.table.items[int(idx)].bindings[:]
+}
+
+material_record :: proc "contextless" (handle: Material_Handle) -> ^Material_Record {
+    idx, ok := material_handle_unpack(handle)
+    if !ok { return {} }
+    return &_state.material_library.table.items[int(idx)]
 }

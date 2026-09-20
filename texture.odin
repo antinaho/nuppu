@@ -353,9 +353,10 @@ texture_init :: proc(
     descriptor: Texture_Descriptor,
     data: rawptr = nil,
     name: string = "",
+    access: gpu.Texture_Access = .Write,
     loc: = #caller_location,
 ) -> Texture_Handle {
-    texture := gpu.texture_init(descriptor)
+    texture := gpu.texture_init(descriptor, access)
 
     handle := _register_tex_handle(texture, name, loc)
 
@@ -403,6 +404,7 @@ texture_1D :: proc(
     name: string = "",
     mip_levels: uint = 0,
     storage: gpu.Storage_Mode = .Shared,
+    access: gpu.Texture_Access = .Write,
     loc: = #caller_location,
 ) -> Texture_Handle {
     descriptor := Texture_Descriptor {
@@ -414,7 +416,7 @@ texture_1D :: proc(
         mip_levels = mip_levels,
         storage    = storage,
     }
-    return texture_init(descriptor, data, name, loc)
+    return texture_init(descriptor, data, name, access, loc)
 }
 
 texture_2D :: proc(
@@ -426,6 +428,7 @@ texture_2D :: proc(
     sample_count: uint = 0,
     mip_levels: uint = 0,
     storage: gpu.Storage_Mode = .Shared,
+    access: gpu.Texture_Access = .Write,
     loc: = #caller_location,
 ) -> Texture_Handle {
     descriptor := Texture_Descriptor {
@@ -438,7 +441,7 @@ texture_2D :: proc(
         mip_levels = mip_levels,
         storage    = storage,
     }
-    return texture_init(descriptor, data, name, loc)
+    return texture_init(descriptor, data, name, access, loc)
 }
 
 texture_2D_array :: proc(
@@ -450,6 +453,7 @@ texture_2D_array :: proc(
     name: string = "",
     mip_levels: uint = 0,
     storage: gpu.Storage_Mode = .Shared,
+    access: gpu.Texture_Access = .Write,
     loc: = #caller_location,
 ) -> Texture_Handle {
     descriptor := Texture_Descriptor {
@@ -462,7 +466,7 @@ texture_2D_array :: proc(
         mip_levels = mip_levels,
         storage    = storage,
     }
-    return texture_init(descriptor, data, name, loc)
+    return texture_init(descriptor, data, name, access, loc)
 }
 
 texture_3D :: proc(
@@ -473,6 +477,7 @@ texture_3D :: proc(
     name: string = "",
     mip_levels: uint = 0,
     storage: gpu.Storage_Mode = .Shared,
+    access: gpu.Texture_Access = .Write,
     loc: = #caller_location,
 ) -> Texture_Handle {
     descriptor := Texture_Descriptor {
@@ -484,7 +489,7 @@ texture_3D :: proc(
         mip_levels = mip_levels,
         storage    = storage,
     }
-    return texture_init(descriptor, data, name, loc)
+    return texture_init(descriptor, data, name, access, loc)
 }
 
 texture_cube :: proc(
@@ -495,6 +500,7 @@ texture_cube :: proc(
     name: string = "",
     mip_levels: uint = 0,
     storage: gpu.Storage_Mode = .Shared,
+    access: gpu.Texture_Access = .Write,
     loc: = #caller_location,
 ) -> Texture_Handle {
     descriptor := Texture_Descriptor {
@@ -506,7 +512,7 @@ texture_cube :: proc(
         mip_levels = mip_levels,
         storage    = storage,
     }
-    return texture_init(descriptor, data, name, loc)
+    return texture_init(descriptor, data, name, access, loc)
 }
 
 texture_cube_array :: proc(
@@ -518,6 +524,7 @@ texture_cube_array :: proc(
     name: string = "",
     mip_levels: uint = 0,
     storage: gpu.Storage_Mode = .Shared,
+    access: gpu.Texture_Access = .Write,
     loc: = #caller_location,
 ) -> Texture_Handle {
     descriptor := Texture_Descriptor {
@@ -530,5 +537,5 @@ texture_cube_array :: proc(
         mip_levels = mip_levels,
         storage    = storage,
     }
-    return texture_init(descriptor, data, name, loc)
+    return texture_init(descriptor, data, name, access, loc)
 }
